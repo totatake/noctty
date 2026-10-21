@@ -842,3 +842,42 @@ test "kittygfx retransmit same id removes existing placements" {
     try testing.expectEqual(@as(usize, 1), storage.placements.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
 }
+
+test "kittygfx jpeg format f=101 transmit and display" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AP7//2Q==";
+    const cmd_str = "a=T,t=d,f=101,i=1,q=0;" ++ b64;
+    const cmd = try command.Parser.parseString(alloc, cmd_str);
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+
+    const storage = &t.screens.active.kitty_images;
+    const img = storage.imageById(1).?;
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+    try testing.expectEqual(@as(u32, 1), img.width);
+    try testing.expectEqual(@as(u32, 1), img.height);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, img.data);
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+}
+
+test "kittygfx jpeg format f=101 query" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=q,t=d,f=101,i=42,q=0;AAAA");
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(u32, 42), resp.id);
+}
