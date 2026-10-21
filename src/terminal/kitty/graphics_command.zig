@@ -461,6 +461,7 @@ pub const Transmission = struct {
         rgb, // 24
         rgba, // 32
         png, // 100
+        jpeg, // 101
 
         // The following are not supported directly via the protocol
         // but they are formats that a png may decode to that we
@@ -474,7 +475,7 @@ pub const Transmission = struct {
                 .gray_alpha => 2,
                 .rgb => 3,
                 .rgba => 4,
-                .png => unreachable, // Must be validated before
+                .png, .jpeg => unreachable, // Must be validated before
             };
         }
     };
@@ -511,6 +512,7 @@ pub const Transmission = struct {
                 24 => .rgb,
                 0, 32 => .rgba,
                 100 => .png,
+                101 => .jpeg,
                 else => unknown: {
                     // Defer returning an error until the image is processed.
                     result.format_unknown = true;
@@ -1135,6 +1137,23 @@ test "transmission command with transient hint" {
     try testing.expectEqual(true, v.usage.transient);
 }
 
+test "transmission command: jpeg format" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var p = Parser.init(alloc, 1024 * 1024);
+    defer p.deinit();
+
+    const input = "f=101,i=42";
+    for (input) |c| try p.feed(c);
+    const command = try p.complete(alloc);
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .transmit);
+    const v = command.control.transmit;
+    try testing.expectEqual(Transmission.Format.jpeg, v.format);
+    try testing.expectEqual(@as(u32, 42), v.image_id);
+}
+
 test "transmission ignores 'm' if medium is not direct" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1571,6 +1590,7 @@ test "known format values are not unknown" {
         .{ "f=24", .rgb },
         .{ "f=32", .rgba },
         .{ "f=100", .png },
+        .{ "f=101", .jpeg },
     }) |entry| {
         const command = try Parser.parseString(alloc, entry[0]);
         defer command.deinit(alloc);
