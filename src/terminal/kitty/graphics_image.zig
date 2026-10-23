@@ -422,6 +422,24 @@ pub const LoadingImage = struct {
         // Write it to an array list
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(alloc);
+
+        // Pre-allocate output buffer when dimensions and format are known
+        // (common for video frames with o=z, f=24 or f=32) to avoid multiple
+        // incremental reallocations during decompression.
+        if (self.image.width > 0 and self.image.height > 0) {
+            const bpp = self.image.format.bpp();
+            if (bpp > 0) {
+                const expected_len = std.math.mul(usize, self.image.width, self.image.height) catch null;
+                if (expected_len) |base_len| {
+                    if (std.math.mul(usize, base_len, bpp)) |total_len| {
+                        if (total_len <= max_size) {
+                            try list.ensureTotalCapacity(alloc, total_len);
+                        }
+                    } else |_| {}
+                }
+            }
+        }
+
         stream.reader.appendRemaining(alloc, &list, .limited(max_size)) catch {
             log.warn("failed to read decompressed data: {?}", .{stream.err});
             return error.DecompressionFailed;
@@ -447,18 +465,16 @@ pub const LoadingImage = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Overflow => return error.InvalidData,
         };
-        defer alloc.free(result.data);
 
         if (result.data.len > max_size) {
+            alloc.free(result.data);
             log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
             return error.InvalidData;
         }
 
-        // Replace our data
+        // Replace our data by taking direct ownership of the decoded slice
         self.data.deinit(alloc);
-        self.data = .{};
-        try self.data.ensureUnusedCapacity(alloc, result.data.len);
-        try self.data.appendSlice(alloc, result.data[0..result.data.len]);
+        self.data = std.ArrayList(u8).fromOwnedSlice(alloc, result.data);
 
         // Store updated image dimensions
         self.image.width = result.width;
