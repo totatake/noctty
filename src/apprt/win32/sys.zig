@@ -11,7 +11,6 @@ const LPCWSTR = win32_types.LPCWSTR;
 const HBRUSH = win32_types.HBRUSH;
 const HCURSOR = win32_types.HCURSOR;
 const HDC = win32_types.HDC;
-const HGLRC = win32_types.HGLRC;
 const HGDIOBJ = win32_types.HGDIOBJ;
 const HPEN = win32_types.HPEN;
 const HMODULE = win32_types.HMODULE;
@@ -445,7 +444,6 @@ pub extern "ole32" fn OleInitialize(pvReserved: ?*anyopaque) callconv(.winapi) i
 pub extern "ole32" fn OleUninitialize() callconv(.winapi) void;
 pub extern "ole32" fn RegisterDragDrop(hwnd: HWND, target: *anyopaque) callconv(.winapi) i32;
 pub extern "ole32" fn RevokeDragDrop(hwnd: HWND) callconv(.winapi) i32;
-pub extern "ole32" fn DoDragDrop(data: *anyopaque, source: *anyopaque, effects: DWORD, effect: *DWORD) callconv(.winapi) i32;
 pub extern "ole32" fn ReleaseStgMedium(medium: *ole.STGMEDIUM) callconv(.winapi) void;
 
 pub extern "ntdll" fn RtlGetVersion(lpVersionInformation: *RTL_OSVERSIONINFOW) callconv(.winapi) i32;
@@ -468,6 +466,13 @@ pub extern "kernel32" fn MoveFileExW(
     lpNewFileName: ?LPCWSTR,
     dwFlags: u32,
 ) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetFinalPathNameByHandleW(
+    hFile: HANDLE,
+    lpszFilePath: [*]u16,
+    cchFilePath: DWORD,
+    dwFlags: DWORD,
+) callconv(.winapi) DWORD;
 
 pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 
@@ -637,6 +642,7 @@ pub extern "gdi32" fn TextOutW(hdc: HDC, x: i32, y: i32, lpString: LPCWSTR, c: i
 pub extern "gdi32" fn CreateFontIndirectW(lplf: *const LOGFONTW) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn AddFontMemResourceEx(pFileView: *anyopaque, cjSize: DWORD, pvReserved: ?*anyopaque, pNumFonts: *DWORD) callconv(.winapi) ?HANDLE;
 pub extern "gdi32" fn GetGlyphIndicesW(hdc: HDC, lpstr: [*]const u16, c: i32, pgi: [*]u16, fl: DWORD) callconv(.winapi) DWORD;
+pub extern "gdi32" fn GetTextFaceW(hdc: HDC, c: i32, lpName: ?[*]u16) callconv(.winapi) i32;
 pub extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.winapi) HDC;
 pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
 
@@ -656,12 +662,13 @@ pub extern "advapi32" fn RegQueryValueExW(hKey: HKEY, lpValueName: LPCWSTR, lpRe
 
 pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) i32;
 
-pub const wglCreateContext = @import("wgl.zig").wglCreateContext;
-pub const wglDeleteContext = @import("wgl.zig").wglDeleteContext;
-pub const wglGetCurrentContext = @import("wgl.zig").wglGetCurrentContext;
-pub const wglGetCurrentDC = @import("wgl.zig").wglGetCurrentDC;
-pub const wglGetProcAddress = @import("wgl.zig").wglGetProcAddress;
-pub const wglMakeCurrent = @import("wgl.zig").wglMakeCurrent;
+const wgl = @import("wgl.zig");
+pub const wglCreateContext = wgl.wglCreateContext;
+pub const wglDeleteContext = wgl.wglDeleteContext;
+pub const wglGetCurrentContext = wgl.wglGetCurrentContext;
+pub const wglGetCurrentDC = wgl.wglGetCurrentDC;
+pub const wglGetProcAddress = wgl.wglGetProcAddress;
+pub const wglMakeCurrent = wgl.wglMakeCurrent;
 
 pub extern "dwmapi" fn DwmDefWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM, plResult: *LRESULT) callconv(.winapi) BOOL;
 

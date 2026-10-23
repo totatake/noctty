@@ -35,7 +35,7 @@ $trackedSet = [System.Collections.Generic.HashSet[string]]::new([string[]] $trac
 # --- Fixed cases ------------------------------------------------------------
 $allFlags = 'arm64_build,arm64_tests,bench,build,conpty_probes,cross_arm64,lib_vt,portable_smoke,renderer_smoke,tests'
 $cases = @(
-    @{ Name = 'docs only'; Paths = @('docs/status.md', 'AGENTS.md', 'CONTRIBUTING.md', 'plans/x.md'); Expect = '' }
+    @{ Name = 'docs only'; Paths = @('docs/status.md', 'AGENTS.md', 'docs/agents/log/conpty.md', 'CONTRIBUTING.md', 'plans/x.md'); Expect = '' }
     @{ Name = 'site only'; Paths = @('site/index.html', 'site/tests/a.test.mjs'); Expect = '' }
     @{ Name = 'release script only'; Paths = @('scripts/release-publish-github.ps1', 'scripts/verify-published-release.ps1'); Expect = '' }
     @{ Name = 'check script only'; Paths = @('scripts/check-site-copy.ps1'); Expect = '' }

@@ -197,10 +197,11 @@ dumps, and SSH host cache go there.
   (always in `%LOCALAPPDATA%\noctty`), and the `NOCTTY_*_TRACE_FILE`
   environment variables write diagnostic traces to the files you name.
 - **Housekeeping:** `.lock` files beside some of these, a `.corrupt` copy of
-  any session or layout file Noctty could not read, and a `.restore-failed`
-  copy of a saved session that repeatedly stopped Noctty while restoring it
-  (up to five copies of each; older `.restore-failed` copies are never
-  replaced).
+  any session or layout file Noctty could not read, a `.restore-failed`
+  copy of a saved session that repeatedly stopped Noctty while restoring it,
+  and a `.restore-ended` copy of a restored session whose programs all ended
+  by themselves before anyone used it (up to five copies of each; older
+  `.restore-failed` and `.restore-ended` copies are never replaced).
 
 Noctty writes these registry entries:
 

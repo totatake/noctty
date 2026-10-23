@@ -192,23 +192,30 @@ pub const TypedChars = struct {
 pub fn takeTypedChars(hwnd: sys.HWND) TypedChars {
     var typed: TypedChars = .{};
     var msg: sys.MSG = undefined;
-    while (sys.PeekMessageW(&msg, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) != 0) {
+    while (takeCharMessage(hwnd, &msg)) {
         switch (msg.message) {
             c.WM_CHAR => if (typed.len < typed.units.len) {
                 typed.units[typed.len] = @truncate(msg.wParam);
                 typed.len += 1;
             },
             c.WM_DEADCHAR => typed.dead = true,
-            c.WM_QUIT => {
-                // A filtered PeekMessage still returns WM_QUIT, and removes
-                // it (measured). Put it back for the pump.
-                sys.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
-                break;
-            },
             else => {},
         }
     }
     return typed;
+}
+
+/// Remove the next `WM_CHAR` .. `WM_DEADCHAR` message queued for `hwnd` into
+/// `msg`; false when there is none, or when a quit ends the drain.
+fn takeCharMessage(hwnd: sys.HWND, msg: *sys.MSG) bool {
+    if (sys.PeekMessageW(msg, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) == 0) return false;
+    if (msg.message == c.WM_QUIT) {
+        // A filtered PeekMessage still returns WM_QUIT, and removes
+        // it (measured). Put it back for the pump.
+        sys.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
+        return false;
+    }
+    return true;
 }
 
 const KeyText = struct {
@@ -1303,22 +1310,10 @@ const FAKE_KEYSTROKE: usize = 0x02000000;
 /// exactly that pair.
 fn controlKeyStateFromState(state: *const [256]u8, lParam: LPARAM) u16 {
     var cs: u16 = 0;
-    const pressed = [_]struct { vk: usize, bit: u16 }{
-        .{ .vk = c.VK_LMENU, .bit = ControlKeyState.left_alt },
-        .{ .vk = c.VK_RMENU, .bit = ControlKeyState.right_alt },
-        .{ .vk = c.VK_LCONTROL, .bit = ControlKeyState.left_ctrl },
-        .{ .vk = c.VK_RCONTROL, .bit = ControlKeyState.right_ctrl },
-        .{ .vk = c.VK_SHIFT, .bit = ControlKeyState.shift },
-    };
-    for (pressed) |key| {
+    for (control_keys_pressed) |key| {
         if ((state[key.vk] & 0x80) != 0) cs |= key.bit;
     }
-    const toggled = [_]struct { vk: usize, bit: u16 }{
-        .{ .vk = c.VK_NUMLOCK, .bit = ControlKeyState.numlock_on },
-        .{ .vk = c.VK_SCROLL, .bit = ControlKeyState.scrolllock_on },
-        .{ .vk = c.VK_CAPITAL, .bit = ControlKeyState.capslock_on },
-    };
-    for (toggled) |key| {
+    for (control_keys_toggled) |key| {
         if ((state[key.vk] & 1) != 0) cs |= key.bit;
     }
     if (isExtendedKey(lParam)) cs |= ControlKeyState.enhanced_key;
@@ -1330,14 +1325,32 @@ fn controlKeyStateFromState(state: *const [256]u8, lParam: LPARAM) u16 {
 fn controlKeyState(keyboard_state: ?*const [256]u8, lParam: LPARAM) u16 {
     if (keyboard_state) |state| return controlKeyStateFromState(state, lParam);
     var state: [256]u8 = [_]u8{0} ** 256;
-    for ([_]i32{ c.VK_LMENU, c.VK_RMENU, c.VK_LCONTROL, c.VK_RCONTROL, c.VK_SHIFT }) |vk| {
-        if (keyPressed(vk)) state[@intCast(vk)] = 0x80;
+    for (control_keys_pressed) |key| {
+        if (keyPressed(key.vk)) state[key.vk] = 0x80;
     }
-    for ([_]i32{ c.VK_NUMLOCK, c.VK_SCROLL, c.VK_CAPITAL }) |vk| {
-        if (keyToggled(vk)) state[@intCast(vk)] = 1;
+    for (control_keys_toggled) |key| {
+        if (keyToggled(key.vk)) state[key.vk] = 1;
     }
     return controlKeyStateFromState(&state, lParam);
 }
+
+const ControlKey = struct { vk: u8, bit: u16 };
+
+/// The keys `controlKeyStateFromState` reads as held.
+const control_keys_pressed = [_]ControlKey{
+    .{ .vk = c.VK_LMENU, .bit = ControlKeyState.left_alt },
+    .{ .vk = c.VK_RMENU, .bit = ControlKeyState.right_alt },
+    .{ .vk = c.VK_LCONTROL, .bit = ControlKeyState.left_ctrl },
+    .{ .vk = c.VK_RCONTROL, .bit = ControlKeyState.right_ctrl },
+    .{ .vk = c.VK_SHIFT, .bit = ControlKeyState.shift },
+};
+
+/// The locks `controlKeyStateFromState` reads as toggled on.
+const control_keys_toggled = [_]ControlKey{
+    .{ .vk = c.VK_NUMLOCK, .bit = ControlKeyState.numlock_on },
+    .{ .vk = c.VK_SCROLL, .bit = ControlKeyState.scrolllock_on },
+    .{ .vk = c.VK_CAPITAL, .bit = ControlKeyState.capslock_on },
+};
 
 /// How a key release is translated for its record, following what the
 /// console host's `TranslateMessageEx(TM_POSTCHARBREAKS)` produces: a
@@ -1447,10 +1460,14 @@ fn keyMessage(
             .win32 = if (win32_records and
                 (lParamBits(lParam) & FAKE_KEYSTROKE) == 0 and
                 vk != c.VK_PROCESSKEY)
-                win32KeyRecord(vk, lParam, action, keyboard_state, typed, release: {
-                    if (latched_dead_key) break :release .first_unit;
-                    break :release if (msg == c.WM_SYSKEYUP) .none else .full;
-                })
+                win32KeyRecord(
+                    vk,
+                    lParam,
+                    action,
+                    keyboard_state,
+                    typed,
+                    if (latched_dead_key) .first_unit else if (msg == c.WM_SYSKEYUP) .none else .full,
+                )
             else
                 null,
         },
@@ -2702,24 +2719,27 @@ fn testingDeliverKeyMessage(
     // The thread's live state moves once the key is translated, as drift in
     // the live keyboard would (a held Ctrl, NumLock on): the dispatch has to
     // report the state the test pinned.
-    var resynced: [256]u8 = [_]u8{0} ** 256;
-    resynced[c.VK_CONTROL] = 0x80;
-    resynced[c.VK_LCONTROL] = 0x80;
-    resynced[c.VK_NUMLOCK] = 1;
-    resynced[c.VK_CAPITAL] = 1;
-    resynced[c.VK_SCROLL] = 1;
+    const resynced = testingDriftedKeyboardState();
     _ = sys.SetKeyboardState(&resynced);
     const typed: TypedChars = if (msg == c.WM_KEYDOWN) takeTypedChars(hwnd) else .{};
     dispatchKeyMessage(terminal, chars, msg, vk, lParam, defer_plain_text, false, terminal.opts.win32InputRecords(), &typed);
 
     var queued: sys.MSG = undefined;
-    while (sys.PeekMessageW(&queued, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) != 0) {
-        if (queued.message == c.WM_QUIT) {
-            sys.PostQuitMessage(@bitCast(@as(u32, @truncate(queued.wParam))));
-            break;
-        }
+    while (takeCharMessage(hwnd, &queued)) {
         dispatchCharMessage(terminal, chars, queued.message, queued.wParam, queued.lParam, false);
     }
+}
+
+/// A live keyboard that drifted from what a test pinned: Ctrl held and every
+/// lock on.
+fn testingDriftedKeyboardState() [256]u8 {
+    var state: [256]u8 = [_]u8{0} ** 256;
+    state[c.VK_CONTROL] = 0x80;
+    state[c.VK_LCONTROL] = 0x80;
+    state[c.VK_NUMLOCK] = 1;
+    state[c.VK_CAPITAL] = 1;
+    state[c.VK_SCROLL] = 1;
+    return state;
 }
 
 const TestingKey = struct {
@@ -2881,12 +2901,7 @@ test "win32 key messages report the keyboard state a test pinned, not the live k
     defer keyboard.release();
 
     // The thread's own state now says Ctrl is down and every toggle is on.
-    var live: [256]u8 = [_]u8{0} ** 256;
-    live[c.VK_CONTROL] = 0x80;
-    live[c.VK_LCONTROL] = 0x80;
-    live[c.VK_NUMLOCK] = 1;
-    live[c.VK_CAPITAL] = 1;
-    live[c.VK_SCROLL] = 1;
+    const live = testingDriftedKeyboardState();
     _ = sys.SetKeyboardState(&live);
 
     const lParam: LPARAM = @bitCast(@as(usize, 1 | (30 << 16)));

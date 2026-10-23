@@ -99,16 +99,7 @@ pub const CaptionButtonsState = struct {
 };
 
 pub const RootProvider = struct {
-    const Object = object.ComObject(RootProvider, query, releaseObject);
-
-    fn releaseObject(self: *RootProvider) u32 {
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
-    }
+    const Object = object.ComObject(RootProvider, query, object.destroyOnLastRelease(RootProvider));
 
     // COM interface shape MUST be first so &self.base == &self (COM layout).
     base: com.IRawElementProviderSimple,
@@ -489,7 +480,7 @@ pub const RootProvider = struct {
         if (!self.captionPainted()) return com.S_OK;
         for (caption_button_order) |kind| {
             const rect = self.captionBounds(kind) orelse continue;
-            if (!rectContains(rect, x, y)) continue;
+            if (!rect.contains(x, y)) continue;
             const child = self.createCaptionButton(kind) orelse return com.E_OUTOFMEMORY;
             out.* = &child.fragment;
             return com.S_OK;
@@ -512,11 +503,6 @@ pub const RootProvider = struct {
 fn comThreadingOption(caption: ?CaptionButtonsState) i32 {
     const state = caption orelse return 0;
     return if (state.use_com_threading) com.ProviderOptions_UseComThreading else 0;
-}
-
-fn rectContains(rect: com.UiaRect, x: f64, y: f64) bool {
-    return x >= rect.left and x < rect.left + rect.width and
-        y >= rect.top and y < rect.top + rect.height;
 }
 
 /// One custom-painted caption button, exposed as a fragment child of the

@@ -8,6 +8,9 @@ $sessionAst = [System.Management.Automation.Language.Parser]::ParseInput(
 if ($sessionErrors.Count -ne 0) {
     throw "Session restore harness does not parse: $($sessionErrors[0].Message)"
 }
+$sessionBody = Get-HistoryGuardedScriptBody `
+    -Ast $sessionAst `
+    -Harness 'interactive-win11-session-restore.ps1'
 if (@($sessionAst.FindAll({
             param($node)
             $node -is [System.Management.Automation.Language.TrapStatementAst]
@@ -31,7 +34,7 @@ if ($sessionForbiddenMutations.Count -ne 0) {
 
 $sessionBootstrapCalls = @(
     Get-NamedCommands `
-        -Ast $sessionAst.EndBlock `
+        -Ast $sessionBody `
         -Name 'Invoke-InteractiveWin11HarnessMain'
 )
 # Exact-one is the bootstrap ownership invariant, not an incidental call count.
@@ -50,7 +53,7 @@ $sessionSnapshotFunctions = @(
 # Exact-one is a real single-source-of-truth invariant: every automation query
 # must share the same retry, deadline, cleanup, and JSON parsing behavior.
 if ($sessionSnapshotFunctions.Count -ne 1 -or
-    -not [object]::ReferenceEquals($sessionSnapshotFunctions[0].Parent, $sessionAst.EndBlock)) {
+    -not [object]::ReferenceEquals($sessionSnapshotFunctions[0].Parent, $sessionBody)) {
     throw 'Session restore must own one top-level automation snapshot helper.'
 }
 Assert-NoUnreachableStatements `
@@ -237,7 +240,7 @@ $sessionRunNames = @(
 )
 $sessionStartCalls = @(
     Get-NamedCommands `
-        -Ast $sessionAst.EndBlock `
+        -Ast $sessionBody `
         -Name 'Start-StatefulApp'
 )
 $sessionStartAssignments = @($sessionAst.FindAll({
@@ -322,7 +325,7 @@ if (@($requiredSessionDiagnostics | Where-Object {
 
 $sessionPassCommands = @(
     Get-NamedCommands `
-        -Ast $sessionAst.EndBlock `
+        -Ast $sessionBody `
         -Name 'Write-Host' |
         Where-Object {
             $_.CommandElements.Count -ge 2 -and
@@ -333,7 +336,7 @@ $sessionPassCommands = @(
                 )
         }
 )
-$sessionInvariantLoops = @($sessionAst.EndBlock.Statements | Where-Object {
+$sessionInvariantLoops = @($sessionBody.Statements | Where-Object {
     if ($_ -isnot [System.Management.Automation.Language.ForEachStatementAst] -or
         (Get-VariableExpressionName -Node $_.Variable) -ne 'run' -or
         $_.Condition.Extent.Text.Trim() -cne '$runs') {
@@ -369,7 +372,7 @@ $passStatement = if ($sessionPassCommands.Count -eq 1) {
 } else {
     $null
 }
-$topLevelStatements = @($sessionAst.EndBlock.Statements)
+$topLevelStatements = @($sessionBody.Statements)
 $invariantIndex = if ($sessionInvariantLoops.Count -eq 1) {
     [Array]::IndexOf($topLevelStatements, $sessionInvariantLoops[0])
 } else {

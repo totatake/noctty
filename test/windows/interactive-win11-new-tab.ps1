@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 15
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-new-tab.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Tight poll cadence for maximize-state drift observation.
 $script:NEW_TAB_STATE_POLL_MS = 10
@@ -230,6 +235,7 @@ function Invoke-NewTabScenario {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=noctty-new-tab-$Name-$($Layout.SandboxId)"
+        '--command=cmd.exe'
     )
 
     $process = Start-Process `
@@ -390,3 +396,7 @@ Write-Host (
     "(titlebar_stdout=$($titlebarRun.Stdout), titlebar_stderr=$($titlebarRun.Stderr), " +
     "command_stdout=$($commandRun.Stdout), command_stderr=$($commandRun.Stderr))"
 )
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

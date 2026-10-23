@@ -3,6 +3,11 @@ param(
     [string]$UncPath = ''
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'powershell-shell-integration.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $script:AssertionCount = 0
 
@@ -38,19 +43,25 @@ $script:OriginalHistoryOptions = $null
 $script:IntegrationPath = Join-Path $RepoRoot 'src\shell-integration\powershell\integration.ps1'
 $script:TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ps-si-" + [guid]::NewGuid().ToString('n'))
 
-try {
-    New-Item -ItemType Directory -Force -Path $script:TempDir | Out-Null
-    # APPDATA does not redirect PSReadLine history. Isolate an already loaded
-    # module too, so invoking this harness from an interactive host is safe.
-    if (Get-Module PSReadLine) {
+# APPDATA does not redirect PSReadLine history: point this host's history at the scratch folder
+# and stop it saving. The options it had first are kept, so cleanup can put them back.
+function Disable-ParentPSReadLineHistory {
+    if ($null -eq $script:OriginalHistoryOptions) {
         $options = Get-PSReadLineOption
         $script:OriginalHistoryOptions = @{
             HistorySavePath = $options.HistorySavePath
             HistorySaveStyle = $options.HistorySaveStyle
         }
-        Set-PSReadLineOption -HistorySaveStyle SaveNothing
-        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
     }
+    Set-PSReadLineOption -HistorySaveStyle SaveNothing
+    Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+}
+
+try {
+    New-Item -ItemType Directory -Force -Path $script:TempDir | Out-Null
+    # Isolate an already loaded module too, so invoking this harness from an
+    # interactive host is safe.
+    if (Get-Module PSReadLine) { Disable-ParentPSReadLineHistory }
     $specialDir = Join-Path $script:TempDir 'a b#c%d&e+f'
     New-Item -ItemType Directory -Force -Path $specialDir | Out-Null
     Push-Location $specialDir
@@ -502,15 +513,7 @@ try {
     # integration must leave it, or any handler a profile set, as it was.
     if ($null -ne (Get-Module PSReadLine -ListAvailable | Select-Object -First 1)) {
         Import-Module PSReadLine -ErrorAction Stop
-        if ($null -eq $script:OriginalHistoryOptions) {
-            $options = Get-PSReadLineOption
-            $script:OriginalHistoryOptions = @{
-                HistorySavePath = $options.HistorySavePath
-                HistorySaveStyle = $options.HistorySaveStyle
-            }
-        }
-        Set-PSReadLineOption -HistorySaveStyle SaveNothing
-        Set-PSReadLineOption -HistorySavePath (Join-Path $script:TempDir 'parent-history.txt')
+        Disable-ParentPSReadLineHistory
         Assert-True ((Get-PSReadLineOption).HistorySaveStyle -eq 'SaveNothing') "Parent PSReadLine history writes are not disabled"
         Assert-True ((Get-PSReadLineOption).HistorySavePath -eq (Join-Path $script:TempDir 'parent-history.txt')) "Parent PSReadLine history is not isolated"
         $script:PSReadLineImported = $true
@@ -577,7 +580,6 @@ try {
     $psHost = (Get-Process -Id $PID).Path
     Assert-True (-not [string]::IsNullOrEmpty($psHost)) "Could not resolve the current PowerShell host path"
 
-    $childQuotedPath = ConvertTo-PowerShellLiteralContent $script:IntegrationPath
     # The child echoes each stdin line back, so the success token must be
     # assembled at runtime; a literal would match its own echo and the
     # assertion would pass even when the helper is gone.
@@ -1195,4 +1197,8 @@ public sealed class NocttyInjectedChildOutput {
         $env:GHOSTTY_SHELL_FEATURES = $script:OriginalFeatures
     }
     Remove-Item -LiteralPath $script:TempDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

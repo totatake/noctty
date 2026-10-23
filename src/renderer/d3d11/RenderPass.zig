@@ -47,9 +47,15 @@ pub fn step(self: *Self, s: Step) !void {
     }
     const text = if (s.buffers.len > 0) s.buffers[0] else null;
     const bg = if (s.buffers.len > 1) s.buffers[1] else null;
-    const gray = if (s.textures.len > 0) if (s.textures[0]) |t| t.handle else null else null;
-    const color = if (s.textures.len > 1) if (s.textures[1]) |t| t.handle else null else null;
+    const gray = textureHandle(s.textures, 0);
+    const color = textureHandle(s.textures, 1);
     try api.check(api.noctty_d3d11_draw(target.handle, @intFromEnum(s.pipeline.kind), s.uniforms, text, bg, gray, color, @intCast(s.draw.vertex_count), @intCast(s.draw.instance_count)));
     self.step_number += 1;
 }
 pub fn complete(_: *const Self) void {}
+
+fn textureHandle(textures: []const ?Texture, index: usize) ?*api.Texture {
+    if (index >= textures.len) return null;
+    const texture = textures[index] orelse return null;
+    return texture.handle;
+}

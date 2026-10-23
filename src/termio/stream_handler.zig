@@ -1930,48 +1930,9 @@ test "semantic output capture follows real stream handler parser" {
 }
 
 test "semantic output capture asks the consumer to forget typed input on a screen switch" {
-    var term = try terminal.Terminal.init(std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(std.testing.allocator);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(std.testing.allocator);
-    defer termio_mailbox.deinit(std.testing.allocator);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
-    defer app_queue.destroy(std.testing.allocator);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(std.testing.allocator, .{
-        .alloc = std.testing.allocator,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(std.testing.allocator, .{ .seen_title = false });
+    defer h.deinit(std.testing.allocator);
 
     // Typed input that the print stream was still waiting to see echoed is
     // stale once the screen changes: a full-screen program's own redraws no
@@ -1981,41 +1942,41 @@ test "semantic output capture asks the consumer to forget typed input on a scree
     // at that point of the stream, so what was printed before the switch in
     // the same batch (the echo of what was typed) is still matched against it.
     inline for (.{ "47", "1047", "1049" }) |mode| {
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("ls\x1b[?" ++ mode ++ "h");
-        const enter = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("ls\x1b[?" ++ mode ++ "h");
+        const enter = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, 2), enter.reset_at);
         try std.testing.expectEqualStrings("ls", enter.slice());
 
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("\x1b[2J\x1b[1;1Hredraw");
-        const redraw = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("\x1b[2J\x1b[1;1Hredraw");
+        const redraw = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, null), redraw.reset_at);
 
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("\x1b[?" ++ mode ++ "lls foo");
-        const leave = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("\x1b[?" ++ mode ++ "lls foo");
+        const leave = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, 0), leave.reset_at);
         try std.testing.expectEqualStrings("ls foo", leave.slice());
 
         // Leaving the screen the program is not on switches nothing.
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("x\x1b[?" ++ mode ++ "ly");
-        const unchanged = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("x\x1b[?" ++ mode ++ "ly");
+        const unchanged = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, null), unchanged.reset_at);
         try std.testing.expectEqualStrings("xy", unchanged.slice());
     }
 
     // Both switches of a batch, with output on each side of them.
-    stream.handler.semantic_output.begin(true);
-    stream.nextSlice("a\x1b[?1049hhidden\x1b[?1049lb");
-    const round_trip = stream.handler.semantic_output.finish();
+    h.stream.handler.semantic_output.begin(true);
+    h.stream.nextSlice("a\x1b[?1049hhidden\x1b[?1049lb");
+    const round_trip = h.stream.handler.semantic_output.finish();
     try std.testing.expectEqual(@as(?usize, 1), round_trip.reset_at);
     try std.testing.expectEqualStrings("ab", round_trip.slice());
 
-    stream.handler.semantic_output.begin(true);
-    stream.nextSlice("\x1b[?25h\x1b[?2004hplain\x1b[?25l");
-    const other_modes = stream.handler.semantic_output.finish();
+    h.stream.handler.semantic_output.begin(true);
+    h.stream.nextSlice("\x1b[?25h\x1b[?2004hplain\x1b[?25l");
+    const other_modes = h.stream.handler.semantic_output.finish();
     try std.testing.expectEqual(@as(?usize, null), other_modes.reset_at);
     try std.testing.expectEqualStrings("plain", other_modes.slice());
 }
@@ -2184,57 +2145,22 @@ test "issue149 OSC 10 and 11 queries format replies and preserve terminators" {
 }
 
 test "a stopped reader gives up waiting on a full mailbox and sends nothing after" {
-    var term = try terminal.Terminal.init(std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(std.testing.allocator);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(std.testing.allocator);
-    defer termio_mailbox.deinit(std.testing.allocator);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
-    defer app_queue.destroy(std.testing.allocator);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
     // Set when the IO thread tears the terminal down. By then nothing drains
     // either mailbox: the IO thread is joining the reader, and the app thread
     // is joining the IO thread.
     var stop: std.atomic.Value(bool) = .init(false);
-    var stream = StreamHandler.Stream.initAlloc(std.testing.allocator, .{
-        .alloc = std.testing.allocator,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
+    var h: TestStream = undefined;
+    try h.init(std.testing.allocator, .{
         .stopping = &stop,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
         // Longer than a small write, so the reply owns its bytes.
         .enquiry_response = "x" ** 60,
         .osc_color_report_format = .@"16-bit",
-        .clipboard_write = .allow,
+        .seen_title = false,
     });
-    defer stream.deinit();
+    defer h.deinit(std.testing.allocator);
 
-    while (app_queue.push(.{ .quit = {} }, .{ .instant = {} }) != 0) {}
-    const termio_queue = termio_mailbox.spsc.queue;
+    while (h.app_queue.push(.{ .quit = {} }, .{ .instant = {} }) != 0) {}
+    const termio_queue = h.termio_mailbox.spsc.queue;
     while (termio_queue.push(.{ .linefeed_mode = false }, .{ .instant = {} }) != 0) {}
 
     // An OSC 52 write longer than a small surface message, so it owns its
@@ -2280,20 +2206,20 @@ test "a stopped reader gives up waiting on a full mailbox and sends nothing afte
         }
     };
 
-    var to_surface: Feed = .{ .stream = &stream, .mutex = &renderer_mutex, .input = clipboard };
-    try to_surface.stoppedWhileWaiting(app_queue, &stop);
-    var to_termio: Feed = .{ .stream = &stream, .mutex = &renderer_mutex, .input = "\x05" };
+    var to_surface: Feed = .{ .stream = &h.stream, .mutex = &h.renderer_mutex, .input = clipboard };
+    try to_surface.stoppedWhileWaiting(h.app_queue, &stop);
+    var to_termio: Feed = .{ .stream = &h.stream, .mutex = &h.renderer_mutex, .input = "\x05" };
     try to_termio.stoppedWhileWaiting(termio_queue, &stop);
 
     // Once stopped, a title, a status report, a clipboard write and an
     // answerback are all dropped at once, and both queues keep what they held.
     var after: Feed = .{
-        .stream = &stream,
-        .mutex = &renderer_mutex,
+        .stream = &h.stream,
+        .mutex = &h.renderer_mutex,
         .input = "\x1b]2;closing\x07\x1b[5n" ++ clipboard ++ "\x05",
     };
     after.run();
-    try std.testing.expectEqual(@as(AppMailbox.Queue.Size, 64), app_queue.len);
+    try std.testing.expectEqual(@as(TestStream.AppMailbox.Queue.Size, 64), h.app_queue.len);
     try std.testing.expectEqual(@as(@TypeOf(termio_queue.len), 64), termio_queue.len);
 }
 
@@ -2334,48 +2260,9 @@ test "PKG16 integrated cmd prompt clears stale keyboard modes" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(alloc);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
 
     // Use the production integration to construct PROMPT, then expand the
     // default cmd prompt codes into the bytes ConPTY forwards to this handler.
@@ -2408,21 +2295,16 @@ test "PKG16 integrated cmd prompt clears stale keyboard modes" {
             else => return error.UnexpectedPromptCode,
         }
     }
-    stream.handler.seen_title = true;
     // A generic prompt mark must leave a Kitty-aware shell's modes alone.
-    stream.nextSlice("\x1b[>1u\x1b[>31u\x1b[>4;2m\x1b]133;A\x07");
-    try std.testing.expectEqual(@as(u5, 31), term.screens.active.kitty_keyboard.current().int());
-    try std.testing.expect(term.flags.modify_other_keys_2);
-    stream.nextSlice(drawn.items);
-    try std.testing.expectEqual(@as(u5, 0), term.screens.active.kitty_keyboard.current().int());
-    try std.testing.expect(!term.flags.modify_other_keys_2);
+    h.stream.nextSlice("\x1b[>1u\x1b[>31u\x1b[>4;2m\x1b]133;A\x07");
+    try std.testing.expectEqual(@as(u5, 31), h.term.screens.active.kitty_keyboard.current().int());
+    try std.testing.expect(h.term.flags.modify_other_keys_2);
+    h.stream.nextSlice(drawn.items);
+    try std.testing.expectEqual(@as(u5, 0), h.term.screens.active.kitty_keyboard.current().int());
+    try std.testing.expect(!h.term.flags.modify_other_keys_2);
     // Pop every entry, not just the most recent pushed flags.
-    term.screens.active.kitty_keyboard.pop(1);
-    try std.testing.expectEqual(@as(u5, 0), term.screens.active.kitty_keyboard.current().int());
-    while (app_queue.pop()) |value| {
-        var message = value;
-        message.deinit(alloc);
-    }
+    h.term.screens.active.kitty_keyboard.pop(1);
+    try std.testing.expectEqual(@as(u5, 0), h.term.screens.active.kitty_keyboard.current().int());
 }
 
 test "cmd OSC 9;9 URI updates terminal pwd" {
@@ -2560,8 +2442,18 @@ const TestStream = struct {
 
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
 
+    /// The handler settings a test can change; the rest are the same for all.
+    const Options = struct {
+        stopping: *const std.atomic.Value(bool) = &never_stopped,
+        enquiry_response: []const u8 = "",
+        osc_color_report_format: configpkg.Config.OSCColorReportFormat = .none,
+        /// As if a program had set a title, so a reported pwd does not
+        /// become one.
+        seen_title: bool = true,
+    };
+
     /// `self` holds pointers into itself, so it must not move after this.
-    fn init(self: *TestStream, alloc: Allocator) !void {
+    fn init(self: *TestStream, alloc: Allocator, options: Options) !void {
         self.term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
         errdefer self.term.deinit(alloc);
         self.termio_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -2581,6 +2473,7 @@ const TestStream = struct {
             .size = undefined,
             .terminal = &self.term,
             .termio_mailbox = &self.termio_mailbox,
+            .stopping = options.stopping,
             .surface_mailbox = .{
                 .surface = undefined,
                 .app = .{ .rt_app = &self.rt_app, .mailbox = self.app_queue },
@@ -2590,11 +2483,11 @@ const TestStream = struct {
             .renderer_wakeup = undefined,
             .default_cursor_style = .block,
             .default_cursor_blink = true,
-            .enquiry_response = "",
-            .osc_color_report_format = .none,
+            .enquiry_response = options.enquiry_response,
+            .osc_color_report_format = options.osc_color_report_format,
             .clipboard_write = .allow,
         });
-        self.stream.handler.seen_title = true;
+        self.stream.handler.seen_title = options.seen_title;
     }
 
     fn deinit(self: *TestStream, alloc: Allocator) void {
@@ -2608,9 +2501,15 @@ const TestStream = struct {
         self.term.deinit(alloc);
     }
 
-    /// The next surface message, or null when none is left.
+    /// The next surface message, or null when none is left. Skips the mouse
+    /// shape a full reset sends.
     fn nextSurfaceMessage(self: *TestStream) ?apprt.surface.Message {
-        return popProgramStatusTestSurfaceMessage(self.app_queue);
+        while (self.app_queue.pop()) |message| {
+            const payload = message.surface_message.message;
+            if (payload == .set_mouse_shape) continue;
+            return payload;
+        }
+        return null;
     }
 
     /// Like `nextSurfaceMessage`, but a missing message fails the test
@@ -2628,7 +2527,7 @@ const TestStream = struct {
 
 test "ConPTY window visibility reaches the surface mailbox in order" {
     var fixture: TestStream = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .{});
     defer fixture.deinit(std.testing.allocator);
     fixture.stream.nextSlice("\x1b[2t\x1b[1t");
     try std.testing.expectEqual(false, (try fixture.expectSurfaceMessage()).window_visibility);
@@ -2638,7 +2537,7 @@ test "ConPTY window visibility reaches the surface mailbox in order" {
 
 test "OSC 133 D carries the whole 32-bit exit code to the surface" {
     var fixture: TestStream = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .{});
     defer fixture.deinit(std.testing.allocator);
 
     // A code past a byte (msiexec's 1603), an NTSTATUS crash and the extremes
@@ -2668,7 +2567,7 @@ test "OSC 9;9 sets the pwd from a plain Windows path" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     // The forms Windows Terminal's docs, oh-my-posh's `osc99` and nushell send:
@@ -2711,7 +2610,7 @@ test "OSC 9;9 pwd keeps the network and device screening" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     h.stream.nextSlice("\x1b]9;9;C:\\Users\\test\x1b\\");
@@ -2767,7 +2666,7 @@ test "OSC 7 stays strict: a plain path or a host that is not this machine" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     h.stream.nextSlice("\x1b]7;file://localhost/C:/Users/test\x1b\\");
@@ -2792,7 +2691,7 @@ test "OSC 7 accepts this machine's name in any letter case" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     // Git Bash, WSL, fish and nushell send the real-case DNS name where the
@@ -2861,7 +2760,7 @@ test "desktop notifications are cut on a code point boundary" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     // A 63-byte title and 255-byte body cannot end inside a two-byte letter.
@@ -2899,86 +2798,38 @@ fn popProgramStatusTestWrite(mailbox: *termio.Mailbox) ?[]const u8 {
     }
 }
 
-/// The next surface message, skipping the mouse shape a full reset sends.
-fn popProgramStatusTestSurfaceMessage(
-    queue: anytype,
-) ?apprt.surface.Message {
-    while (queue.pop()) |message| {
-        const payload = message.surface_message.message;
-        if (payload == .set_mouse_shape) continue;
-        return payload;
-    }
-    return null;
-}
-
 test "OSC 7501 answers the query once and forwards reports, prompts and resets" {
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
-    defer term.deinit(alloc);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{ .seen_title = false });
+    defer h.deinit(alloc);
 
     // The query gets exactly one fixed reply, ended the way it was, and
     // the surface hears nothing.
-    stream.nextSlice("\x1b]7501;?\x1b\\");
-    try std.testing.expectEqualStrings("\x1b]7501;?\x1b\\", popProgramStatusTestWrite(&termio_mailbox).?);
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
-    stream.nextSlice("\x1b]7501;?\x07");
-    try std.testing.expectEqualStrings("\x1b]7501;?\x07", popProgramStatusTestWrite(&termio_mailbox).?);
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]7501;?\x1b\\");
+    try std.testing.expectEqualStrings("\x1b]7501;?\x1b\\", popProgramStatusTestWrite(&h.termio_mailbox).?);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
+    h.stream.nextSlice("\x1b]7501;?\x07");
+    try std.testing.expectEqualStrings("\x1b]7501;?\x07", popProgramStatusTestWrite(&h.termio_mailbox).?);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // Before any report, OSC 9;4 reaches the surface and a prompt has no
     // records to end.
-    stream.nextSlice("\x1b]9;4;1;20\x1b\\");
+    h.stream.nextSlice("\x1b]9;4;1;20\x1b\\");
     {
-        const message = popProgramStatusTestSurfaceMessage(app_queue).?;
+        const message = h.nextSurfaceMessage().?;
         try std.testing.expectEqual(@as(?u8, 20), message.progress_report.progress);
     }
-    stream.nextSlice("\x1b]133;A\x07");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]133;A\x07");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A report reaches the surface with its body. One longer than a small
     // message is allocated and freed with the message.
     const long_msg = "QUFB" ** 80;
-    stream.nextSlice("\x1b]7501;state=working:progress=40:msg=" ++ long_msg ++ "\x1b\\");
+    h.stream.nextSlice("\x1b]7501;state=working:progress=40:msg=" ++ long_msg ++ "\x1b\\");
     {
-        var message = popProgramStatusTestSurfaceMessage(app_queue).?;
+        var message = h.nextSurfaceMessage().?;
         defer message.deinit();
         const report = message.program_status.report;
         try std.testing.expectEqual(.working, report.state);
@@ -2986,74 +2837,38 @@ test "OSC 7501 answers the query once and forwards reports, prompts and resets" 
     }
 
     // A report that breaks the specification never leaves the IO thread.
-    stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
-    stream.nextSlice("\x1b]7501;state=done:msg=YQpi\x1b\\");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
+    h.stream.nextSlice("\x1b]7501;state=done:msg=YQpi\x1b\\");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // From the first report on, OSC 9;4 is no longer mapped.
-    stream.nextSlice("\x1b]9;4;1;50\x1b\\");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]9;4;1;50\x1b\\");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A new prompt, OSC 133 A or N, ends the program's records.
-    stream.nextSlice("\x1b]133;A\x07\x1b]133;N\x07");
-    try std.testing.expectEqual(.prompt, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expectEqual(.prompt, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]133;A\x07\x1b]133;N\x07");
+    try std.testing.expectEqual(.prompt, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expectEqual(.prompt, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A full reset clears the records before the progress bar, and OSC
     // 9;4 drives the progress bar again.
-    stream.nextSlice("\x1bc");
-    try std.testing.expectEqual(.reset, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expectEqual(.remove, popProgramStatusTestSurfaceMessage(app_queue).?.progress_report.state);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
-    stream.nextSlice("\x1b]9;4;1;60\x1b\\");
-    try std.testing.expectEqual(@as(?u8, 60), popProgramStatusTestSurfaceMessage(app_queue).?.progress_report.progress);
+    h.stream.nextSlice("\x1bc");
+    try std.testing.expectEqual(.reset, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expectEqual(.remove, h.nextSurfaceMessage().?.progress_report.state);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
+    h.stream.nextSlice("\x1b]9;4;1;60\x1b\\");
+    try std.testing.expectEqual(@as(?u8, 60), h.nextSurfaceMessage().?.progress_report.progress);
 
     // Nothing a program reported was written back to it.
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
 }
 
 test "OSC 22 with an empty shape gives the pointer back" {
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
-    defer term.deinit(alloc);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{ .seen_title = false });
+    defer h.deinit(alloc);
 
     const S = struct {
         fn nextShape(queue: anytype) ?terminal.MouseShape {
@@ -3066,18 +2881,18 @@ test "OSC 22 with an empty shape gives the pointer back" {
     };
 
     // Without mouse tracking the pointer goes back to the text shape.
-    stream.nextSlice("\x1b]22;crosshair\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .text), S.nextShape(app_queue));
+    h.stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .text), S.nextShape(h.app_queue));
 
     // While a program tracks the mouse it goes back to the shape that
     // turning tracking on set.
-    stream.nextSlice("\x1b[?1000h");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;crosshair\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
-    try std.testing.expect(S.nextShape(app_queue) == null);
+    h.stream.nextSlice("\x1b[?1000h");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(h.app_queue));
+    try std.testing.expect(S.nextShape(h.app_queue) == null);
 }

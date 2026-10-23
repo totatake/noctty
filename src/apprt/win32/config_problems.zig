@@ -187,17 +187,13 @@ fn sanitize(text: []u8) void {
 pub fn replaceInvalidUtf8(text: []u8) void {
     var i: usize = 0;
     while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (len == 0 or i + len > text.len or !std.unicode.utf8ValidateSlice(text[i..][0..len])) {
             text[i] = '?';
             i += 1;
-            continue;
-        };
-        if (i + len > text.len or !std.unicode.utf8ValidateSlice(text[i..][0..len])) {
-            text[i] = '?';
-            i += 1;
-            continue;
+        } else {
+            i += len;
         }
-        i += len;
     }
 }
 

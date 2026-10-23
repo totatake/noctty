@@ -13,6 +13,11 @@ param(
     [string]$Bin,
     [string]$IntegrationScript = (Join-Path $PSScriptRoot '../../src/shell-integration/cmd/noctty-shell-integration.lua')
 )
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cmd-clink.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 Add-Type @'
 using System;
@@ -137,3 +142,7 @@ if (-not (Test-Path -LiteralPath $result)) { throw 'Clink produced no results.' 
 $lines = Get-Content -LiteralPath $result
 $lines | Write-Output
 if ('PASS ALL' -notin $lines) { throw 'Clink smoke failed.' }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

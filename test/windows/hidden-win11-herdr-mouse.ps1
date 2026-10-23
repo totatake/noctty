@@ -27,6 +27,7 @@ param(
     [ValidateRange(60,900)] [int] $DriverTimeoutSeconds = 600
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -60,12 +61,14 @@ public static class HerdrMouse {
     // with stdout and stderr in outFile. A console program started from a
     // console-less driver would otherwise get a new console window, and on a
     // machine whose default terminal is delegated that allocation hands off.
-    public static int RunCapture(string app,string command,string cwd,string outFile,IntPtr job,int timeoutMs) {
+    // The desktop is named too: a null one from a private-desktop driver can
+    // put the child on the interactive desktop.
+    public static int RunCapture(string app,string command,string cwd,string desktop,string outFile,IntPtr job,int timeoutMs) {
         var sa=new SecurityAttributes { length=Marshal.SizeOf<SecurityAttributes>(),inherit=1 };
         var file=CreateFileW(outFile,0x40000000,3,ref sa,2,0x80,IntPtr.Zero);
         if(file==new IntPtr(-1)) throw new Exception("Capture file failed: "+Marshal.GetLastWin32Error());
         try {
-            var s=new Startup { cb=Marshal.SizeOf<Startup>(),flags=0x101,show=0,output=file,error=file,input=IntPtr.Zero }; ProcessInfo p;
+            var s=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=0x101,show=0,output=file,error=file,input=IntPtr.Zero }; ProcessInfo p;
             if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,true,0x08004004,IntPtr.Zero,cwd,ref s,out p))
                 throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
             try {
@@ -211,6 +214,7 @@ if(-not $Driver) {
         Compile-Helper (Join-Path $PSScriptRoot 'console-attach-info.c') (Join-Path $Run 'console-attach-info.exe') $compileJob $root
     } finally { [void][HerdrMouse]::StopOwnedJob($compileJob) }
     $before=Startup-Fingerprint
+    $historyGuard=Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-herdr-mouse.ps1'
     if($BaselineHash -and $before.Hash -ne $BaselineHash.ToLowerInvariant()) { throw 'Real startup state differs from the adopted baseline; stop launches.' }
     $portable=Join-Path $Run 'source\bin'; [void](New-Item -ItemType Directory -Path $portable)
     Get-ChildItem -LiteralPath $Bin -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $portable }
@@ -245,8 +249,11 @@ if(-not $Driver) {
         [void][HerdrMouse]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{Before=$before;After=$after;Unchanged=$unchanged;OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryUnchanged=($null -eq $historyFailure);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if($historyFailure) { throw $historyFailure }
         if(-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if($cleanupError) { throw $cleanupError }
     }
@@ -322,7 +329,7 @@ function Herdr-Api([string[]]$Arguments,[string]$Socket) {
     $old=$env:HERDR_SOCKET_PATH; $env:HERDR_SOCKET_PATH=$Socket
     $script:apiCalls++; $out=Join-Path $Run ("api-{0:D3}.txt" -f $script:apiCalls)
     try {
-        $code=[HerdrMouse]::RunCapture($Herdr,('"{0}" {1}' -f $Herdr,($Arguments -join ' ')),$Run,$out,$job,15000)
+        $code=[HerdrMouse]::RunCapture($Herdr,('"{0}" {1}' -f $Herdr,($Arguments -join ' ')),$Run,"WinSta0\$driverDesktop",$out,$job,15000)
         $raw=if(Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw } else { $null }
         $text=if($null -eq $raw) { '' } else { ([string]$raw).TrimEnd() }
         $flat=[string]($text -replace '\s+',' ')

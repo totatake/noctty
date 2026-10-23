@@ -212,9 +212,14 @@ function Invoke-PrivateDesktopControlParent([string] $Run) {
     Write-Host 'Private desktop self-receipt and window-enumeration control: PASS'
 }
 
+# Only the parent starts anything (non-interactive pwsh -File helpers, no noctty and no typed input);
+# its history check also runs when the control fails.
+$historyGuard = if ($Mode -eq 'Parent') { Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-desktop-control.ps1' }
+try {
 switch ($Mode) {
     'Parent' { Invoke-DesktopControlParent -Run $Run; Invoke-PrivateDesktopControlParent -Run (Join-Path $Run 'private-desktop') }
     'Nested' { Invoke-DesktopControlNested -Run $Run }
     'Window' { Invoke-DesktopControlWindow }
     'PrivateDriver' { Invoke-PrivateDesktopControlDriver -Run $Run -DesktopName $DesktopName }
 }
+} finally { if ($historyGuard) { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } }

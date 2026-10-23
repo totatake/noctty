@@ -8,6 +8,80 @@ $paletteThemeAst = [System.Management.Automation.Language.Parser]::ParseInput(
 if ($paletteThemeErrors.Count -ne 0) {
     throw "Palette theme harness does not parse: $($paletteThemeErrors[0].Message)"
 }
+$paletteThemeBody = Get-HistoryGuardedScriptBody `
+    -Ast $paletteThemeAst `
+    -Harness 'interactive-win11-palette-theme.ps1'
+
+# Exercise the envelope validator with source only; none of these probes runs
+# a guard, reads history, or launches a harness. Nested scenario code remains
+# nested after unwrapping, so it cannot acquire direct body ownership.
+$historyGuardProbeText = @'
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'history-contract.ps1'
+try {
+    if ($false) { function Nested-Probe {} }
+    function Direct-Probe {}
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}
+'@
+$historyGuardProbeTokens = $null
+$historyGuardProbeErrors = $null
+$historyGuardProbeAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $historyGuardProbeText, [ref]$historyGuardProbeTokens, [ref]$historyGuardProbeErrors
+)
+if ($historyGuardProbeErrors.Count -ne 0) { throw 'History guard positive probe must parse.' }
+$historyGuardProbeBody = Get-HistoryGuardedScriptBody -Ast $historyGuardProbeAst -Harness 'history-contract.ps1'
+$historyGuardDirectProbe = @(Get-NamedFunctionDefinitions -Ast $historyGuardProbeAst -Name 'Direct-Probe')
+$historyGuardNestedProbe = @(Get-NamedFunctionDefinitions -Ast $historyGuardProbeAst -Name 'Nested-Probe')
+if (-not [object]::ReferenceEquals($historyGuardProbeBody, $historyGuardProbeAst.EndBlock.Statements[2].Body) -or
+    -not [object]::ReferenceEquals($historyGuardDirectProbe[0].Parent, $historyGuardProbeBody) -or
+    [object]::ReferenceEquals($historyGuardNestedProbe[0].Parent, $historyGuardProbeBody)) {
+    throw 'History guard unwrapping must return only the direct outer try body without flattening nested code.'
+}
+$historyGuardAssertion = 'Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard'
+$historyGuardStart = '$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness ''history-contract.ps1'''
+$historyGuardRejectionProbes = [ordered]@{
+    'missing envelope' = 'function Direct-Probe {}'
+    'nested envelope' = 'if ($true) {' + "`n" + $historyGuardProbeText + "`n}"
+    'wrong import' = $historyGuardProbeText.Replace('windows-harness-history.ps1', 'other.ps1')
+    'missing start' = $historyGuardProbeText.Replace($historyGuardStart, '')
+    'nested start' = $historyGuardProbeText.Replace($historyGuardStart, '').Replace('try {', ('try { ' + $historyGuardStart))
+    'wrong start variable' = $historyGuardProbeText.Replace($historyGuardStart, $historyGuardStart.Replace('$windowsHarnessHistoryGuard =', '$other ='))
+    'scoped start variable' = $historyGuardProbeText.Replace($historyGuardStart, $historyGuardStart.Replace('$windowsHarnessHistoryGuard =', '$script:windowsHarnessHistoryGuard ='))
+    'wrong harness' = $historyGuardProbeText.Replace('history-contract.ps1', 'other.ps1')
+    'extra start arguments' = $historyGuardProbeText.Replace($historyGuardStart, ($historyGuardStart + ' -Paths fake'))
+    'start pipeline' = $historyGuardProbeText.Replace($historyGuardStart, ($historyGuardStart + ' | Out-Null'))
+    'outer catch' = $historyGuardProbeText.Replace('} finally {', '} catch {} finally {')
+    'missing finally' = $historyGuardProbeText.Replace(('finally {' + "`n    " + $historyGuardAssertion), 'catch {')
+    'conditional assertion' = $historyGuardProbeText.Replace($historyGuardAssertion, ('if ($false) { ' + $historyGuardAssertion + ' }'))
+    'wrong assertion variable' = $historyGuardProbeText.Replace($historyGuardAssertion, 'Assert-WindowsHarnessHistoryGuard -Guard $other')
+    'scoped assertion variable' = $historyGuardProbeText.Replace($historyGuardAssertion, 'Assert-WindowsHarnessHistoryGuard -Guard $script:windowsHarnessHistoryGuard')
+    'extra assertion argument' = $historyGuardProbeText.Replace($historyGuardAssertion, ($historyGuardAssertion + ' -ErrorAction SilentlyContinue'))
+    'redirected assertion' = $historyGuardProbeText.Replace($historyGuardAssertion, ($historyGuardAssertion + ' 2>$null'))
+    'additional finally statement' = $historyGuardProbeText.Replace($historyGuardAssertion, ($historyGuardAssertion + '; Write-Host extra'))
+    'finally trap' = $historyGuardProbeText.Replace($historyGuardAssertion, ('trap { continue }; ' + $historyGuardAssertion))
+    'additional root try' = $historyGuardProbeText + "`ntry {} finally {}"
+    'work before guard' = 'Write-Host before' + "`n" + $historyGuardProbeText
+    'work after guard' = $historyGuardProbeText + "`nWrite-Host after"
+    'root trap' = 'trap { continue }' + "`n" + $historyGuardProbeText
+    'named end block' = 'end {' + "`n" + $historyGuardProbeText + "`n}"
+    'duplicate start' = $historyGuardProbeText.Replace('try {', ('try { ' + $historyGuardStart))
+    'duplicate assertion' = $historyGuardProbeText.Replace('try {', ('try { ' + $historyGuardAssertion))
+}
+foreach ($historyGuardProbe in $historyGuardRejectionProbes.GetEnumerator()) {
+    $historyGuardProbeAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $historyGuardProbe.Value, [ref]$historyGuardProbeTokens, [ref]$historyGuardProbeErrors
+    )
+    if ($historyGuardProbeErrors.Count -ne 0) { throw "History guard negative probe must parse: $($historyGuardProbe.Key)" }
+    $historyGuardProbeRejected = $false
+    try {
+        [void](Get-HistoryGuardedScriptBody -Ast $historyGuardProbeAst -Harness 'history-contract.ps1')
+    } catch {
+        $historyGuardProbeRejected = $true
+    }
+    if (-not $historyGuardProbeRejected) { throw "History guard envelope accepted mutation: $($historyGuardProbe.Key)" }
+}
 
 $paletteThemeHelperNames = @(
     'Open-ThemeQuery',
@@ -27,7 +101,7 @@ $paletteThemeFunctions = @(
 foreach ($helperName in $paletteThemeHelperNames) {
     $definitions = @($paletteThemeFunctions | Where-Object { $_.Name -eq $helperName })
     if ($definitions.Count -ne 1 -or
-        -not [object]::ReferenceEquals($definitions[0].Parent, $paletteThemeAst.EndBlock)) {
+        -not [object]::ReferenceEquals($definitions[0].Parent, $paletteThemeBody)) {
         throw "Palette theme harness must own one top-level $helperName helper."
     }
     Assert-NoUnreachableStatements `
@@ -358,7 +432,7 @@ finally {
     $runs = $paletteOriginalRuns
 }
 
-$paletteMainTries = @($paletteThemeAst.EndBlock.Statements | Where-Object {
+$paletteMainTries = @($paletteThemeBody.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.TryStatementAst] -and
         $null -ne $_.Finally
 })
@@ -519,6 +593,29 @@ if ($recoveryCanaryCalls.Count -ne 1 -or
     throw 'Interrupted High Contrast recovery must retain its marker until the fresh-process presentation canary succeeds.'
 }
 
+# The accessibility harness restores High Contrast just before this one in the
+# release job, so a fresh-process presentation proof must come before the
+# story's first window and first screen-pixel read (EVIDENCE-PIXEL-DIAG-01).
+$paletteMainStatements = @($paletteMainTry.Body.Statements)
+$preflightCanaryCalls = @(Get-NamedCommands -Ast $paletteMainTry.Body -Name 'Invoke-PostHighContrastPresentationCanary' |
+    Where-Object { Test-CommandHasStringArgument -Command $_ -Value 'palette-theme-preflight-canary' })
+$preflightCanaryIndex = if ($preflightCanaryCalls.Count -eq 1) {
+    [Array]::IndexOf($paletteMainStatements, (Get-DirectStatementBlockChild -Node $preflightCanaryCalls[0] -StatementBlock $paletteMainTry.Body))
+} else { -1 }
+$firstStoryIndex = -1
+for ($statementIndex = 0; $statementIndex -lt $paletteMainStatements.Count; $statementIndex++) {
+    $storyStart = @(Get-NamedCommands -Ast $paletteMainStatements[$statementIndex] -Name 'Start-StatefulApp' |
+        Where-Object { Test-CommandHasStringArgument -Command $_ -Value 'palette-theme-normal' })
+    $pixelReads = @(Get-NamedCommands -Ast $paletteMainStatements[$statementIndex] -Name 'Get-StatefulPixel')
+    if ($storyStart.Count -ne 0 -or $pixelReads.Count -ne 0) { $firstStoryIndex = $statementIndex; break }
+}
+if ($preflightCanaryCalls.Count -ne 1 -or $preflightCanaryIndex -lt 0 -or $firstStoryIndex -lt 0 -or
+    $preflightCanaryIndex -ge $firstStoryIndex -or
+    $preflightCanaryCalls[0].CommandElements.Count -ne 3 -or
+    (Get-VariableExpressionName -Node $preflightCanaryCalls[0].CommandElements[2]) -ne 'draculaRgb') {
+    throw 'Palette theme must prove fresh-process Dracula presentation before its story starts and before any screen-pixel read.'
+}
+
 if ($paletteThemeHarnessText -notmatch
         [regex]::Escape('SystemParametersInfo(0x42, $activeHc.cbSize, [ref]$activeHc, 0)') -or
     $paletteThemeHarnessText -notmatch
@@ -532,7 +629,7 @@ if ($paletteThemeHarnessText -notmatch
 
 $paletteOpenCalls = @(
     Get-NamedCommands `
-        -Ast $paletteThemeAst.EndBlock `
+        -Ast $paletteThemeBody `
         -Name 'Open-ThemeQuery'
 )
 # Three opens are the scenario matrix: preview, commit, and High Contrast.

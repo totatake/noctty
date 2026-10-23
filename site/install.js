@@ -1,8 +1,14 @@
-// Copies the WinGet install command from the hero.
+// Copies the install commands. The copied text comes from these constants,
+// not the page, so the clipboard gets exactly what the copy checks pin;
+// tests/install.test.mjs checks each button's command against the text
+// shown beside it.
 
 const COPY_RESET_MS = 1400;
-const INSTALL_COMMAND =
-  'winget install --id AmanThanvi.noctty -e';
+export const INSTALL_COMMANDS = {
+  winget: 'winget install --id AmanThanvi.noctty -e',
+  'scoop-bucket': 'scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty',
+  'scoop-install': 'scoop install noctty/noctty',
+};
 
 function writeClipboardTextFallback(text) {
   const textarea = document.createElement('textarea');
@@ -34,34 +40,49 @@ function writeClipboardText(text) {
   return writeClipboardTextFallback(text);
 }
 
-const copyButton = document.getElementById('nc-install-copy');
-const status = document.getElementById('nc-install-status');
+function initCopyButtons() {
+  const status = document.getElementById('nc-copy-status');
 
-if (copyButton && status) {
-  let copyTimer = null;
+  for (const button of document.querySelectorAll('[data-nc-copy]')) {
+    const text = INSTALL_COMMANDS[button.dataset.ncCopy];
+    if (!text) continue;
 
-  function setCopyState(state) {
-    if (copyTimer !== null) {
-      clearTimeout(copyTimer);
-      copyTimer = null;
-    }
-    copyButton.classList.toggle('is-copied', state === 'copied');
-    copyButton.classList.toggle('is-failed', state === 'failed');
-    const label =
-      state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : 'Copy install command';
-    copyButton.setAttribute('aria-label', label);
-    status.textContent = state === 'idle' ? '' : label;
-    if (state !== 'idle') {
-      copyTimer = setTimeout(() => {
+    // "Copy the WinGet command" -> "the WinGet command", for the messages.
+    const idleLabel = button.getAttribute('aria-label') || 'Copy command';
+    const what = idleLabel.replace(/^Copy\s+/, '');
+    let copyTimer = null;
+
+    function setCopyState(state) {
+      if (copyTimer !== null) {
+        clearTimeout(copyTimer);
         copyTimer = null;
-        setCopyState('idle');
-      }, COPY_RESET_MS);
+      }
+      button.classList.toggle('is-copied', state === 'copied');
+      button.classList.toggle('is-failed', state === 'failed');
+      const label =
+        state === 'copied' ? `Copied ${what}` : state === 'failed' ? `Could not copy ${what}` : idleLabel;
+      button.setAttribute('aria-label', label);
+      if (status) {
+        if (state !== 'idle') status.textContent = label;
+        // On reset, clear only this button's own message.
+        else if (status.textContent.endsWith(what)) status.textContent = '';
+      }
+      if (state !== 'idle') {
+        copyTimer = setTimeout(() => {
+          copyTimer = null;
+          setCopyState('idle');
+        }, COPY_RESET_MS);
+      }
     }
-  }
 
-  copyButton.addEventListener('click', () => {
-    writeClipboardText(INSTALL_COMMAND)
-      .then(() => setCopyState('copied'))
-      .catch(() => setCopyState('failed'));
-  });
+    button.addEventListener('click', () => {
+      // Clear first so a repeated copy of the same command is announced again.
+      if (status) status.textContent = '';
+      writeClipboardText(text)
+        .then(() => setCopyState('copied'))
+        .catch(() => setCopyState('failed'));
+    });
+  }
 }
+
+if (typeof document !== 'undefined') initCopyButtons();

@@ -301,8 +301,11 @@ pub const DWMSBT_TABBEDWINDOW: u32 = 4;
 pub const OS_BUILD_WIN10_22H2: u32 = 19045;
 pub const OS_BUILD_WIN11_21H2: u32 = 22000;
 pub const OS_BUILD_WIN11_22H2: u32 = 22621;
+pub const NULL_BRUSH: i32 = 5;
+pub const NULL_PEN: i32 = 8;
 pub const DC_BRUSH: i32 = 18;
 pub const DC_PEN: i32 = 19;
+pub const PS_SOLID: i32 = 0;
 
 pub const SPI_GETHIGHCONTRAST: UINT = 0x0042;
 pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;

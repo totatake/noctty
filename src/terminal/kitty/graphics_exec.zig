@@ -246,6 +246,7 @@ fn display(
     };
     storage.addPlacement(
         alloc,
+        terminal.screens.active,
         img.id,
         result.placement_id,
         p,
@@ -262,15 +263,43 @@ fn display(
             .none => {},
             .after => {
                 // We use terminal.index to properly handle scroll regions.
+                const screen = terminal.screens.active;
                 const size = p.gridSize(img, terminal);
-                for (0..size.rows) |_| terminal.index() catch |err| {
+
+                // A scroll below can move this placement off the screen,
+                // which deletes it and frees its pin, so read the column
+                // first.
+                const pin_x = pin.x;
+
+                // The row count comes from the application and can be as
+                // large as u32, and one terminal.index call per row would
+                // keep this thread busy for a very long time. A cursor at or
+                // above the bottom of the scroll region (above the region
+                // too) moves down to that bottom, and each call after that
+                // scrolls the region. So allow the calls that reach the
+                // bottom, then one screen of scrolling: past that the region
+                // is blank and the protocol leaves the position undefined.
+                // setCursorPos below reads the 0-based row as 1-based and
+                // moves the cursor back up a row, so allow one call more.
+                // A cursor below the region or outside its left and right
+                // margins never scrolls, so the budget only bounds moves.
+                const region = terminal.scrolling_region;
+                const rows_before_scroll: usize = if (screen.cursor.y <= region.bottom)
+                    @as(usize, region.bottom - screen.cursor.y)
+                else
+                    0;
+                const rows_to_move: usize = @min(
+                    @as(usize, size.rows),
+                    rows_before_scroll +| @as(usize, terminal.rows) +| 1,
+                );
+                for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
                     break;
                 };
 
                 terminal.setCursorPos(
-                    terminal.screens.active.cursor.y,
-                    pin.x + size.cols + 1,
+                    screen.cursor.y,
+                    @as(usize, pin_x) +| @as(usize, size.cols) +| 1,
                 );
             },
         },
@@ -357,7 +386,7 @@ fn loadAndAddImage(
     // Validate and store our image
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
-    try storage.addImage(alloc, img);
+    try storage.addImage(alloc, terminal.screens.active, img);
 
     // Get our display settings
     const display_ = loading.display;
@@ -567,4 +596,249 @@ test "kittygfx no response with no image ID or number load and display" {
         const resp = execute(alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
+}
+
+test "kittygfx placement at the cursor after a full reset is drawn and kept" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // RIS: the page reset marks every tracked pin garbage, the cursor's
+    // included, and display() tracks a copy of the cursor pin.
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    const cmds = [_][]const u8{
+        // Transmit and display at the home position. C=1 keeps the cursor
+        // there, so the second placement copies the same cursor pin.
+        "a=T,f=24,t=d,i=1,p=1,s=1,v=2,c=1,r=1,C=1,q=2;////////",
+        "a=p,i=1,p=2,c=1,r=1,C=1,q=2",
+    };
+    for (cmds, 1..) |str, expected| {
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+
+        // Every placement so far must have a rect (be drawn) and survive
+        // the garbage sweep in the next addPlacement.
+        try testing.expectEqual(expected, storage.placements.count());
+        const img = storage.imageById(1).?;
+        var it = storage.placements.iterator();
+        while (it.next()) |entry| {
+            try testing.expect(entry.value_ptr.rect(img, &t) != null);
+        }
+    }
+}
+
+test "kittygfx placement bounds cursor movement for untrusted dimensions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // q=2 keeps the response null, so nothing below unwraps an optional.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=4294967295,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
+
+    // Reaching the bottom takes four rows, then scrolling is capped at one
+    // screen (five rows) plus the row the cursor moves back up from, and
+    // the column stops at the right edge.
+    try testing.expectEqual(@as(usize, 11), t.screens.active.pages.scrollbar().total);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+}
+
+test "kittygfx placement scrolls at most one screen past a tall image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct {
+        cmd: []const u8,
+        total: usize,
+        // Whether the cursor ends on the image's last row, as on main.
+        last_row: bool,
+    }{
+        // Eight rows on a five-row screen: four moves reach the bottom and
+        // four more scroll. That is within the bound, so it is unchanged,
+        // and the cursor still ends on its last row.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=5,r=8,q=2;////", .total = 9, .last_row = true },
+
+        // The tallest image the bound leaves alone: four moves, five
+        // scrolls, and the call the cursor then moves back up from.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=10,q=2;////", .total = 11, .last_row = true },
+
+        // A thousand rows stop at the same ten calls.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1000,q=2;////", .total = 11, .last_row = false },
+    };
+
+    for (cases) |case| {
+        var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+
+        const cmd = try command.Parser.parseString(alloc, case.cmd);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        const screen = t.screens.active;
+        try testing.expectEqual(@as(usize, 1), screen.kitty_images.placements.count());
+        try testing.expectEqual(case.total, screen.pages.scrollbar().total);
+
+        if (case.last_row) {
+            var it = screen.kitty_images.placements.iterator();
+            const placement = it.next().?.value_ptr;
+            const img = screen.kitty_images.imageById(1).?;
+            const top = screen.pages.pointFromPin(.screen, placement.location.pin.*).?.screen.y;
+            const cursor = screen.pages.pointFromPin(.screen, screen.cursor.page_pin.*).?.screen.y;
+            try testing.expectEqual(top + placement.gridSize(img, &t).rows - 1, cursor);
+        }
+    }
+}
+
+test "kittygfx cursor movement after its own placement scrolled away" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A one-row screen without scrollback: moving the cursor down a row
+    // after the image scrolls the image's only row off the screen, which
+    // deletes the placement and releases its pin.
+    var t = try Terminal.init(alloc, .{ .rows = 1, .cols = 5 });
+    defer t.deinit(alloc);
+    try t.switchScreenMode(.@"1049", true);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+
+    // The cursor lands right of where the one-column image was.
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+}
+
+test "kittygfx placement above the scroll region scrolls the region" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Text in a scroll region on the last two rows. Setting the margins
+    // homes the cursor, above the region.
+    t.setCursorPos(4, 1);
+    try t.printString("AAAAA");
+    t.setCursorPos(5, 1);
+    try t.printString("BBBBB");
+    t.setTopAndBottomMargin(4, 5);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+
+    // An eight-row image: the cursor moves down into the region and on to
+    // its bottom, and the rest scrolls the region empty.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=8,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("", str);
+}
+
+test "kittygfx cursor movement after a placement with the maximum column count" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=1,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+}
+
+test "kittygfx stays disabled after a full reset with a zero storage limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // `image-storage-limit = 0`, applied to every screen as Termio does.
+    var it = t.screens.all.iterator();
+    while (it.next()) |entry| {
+        const screen = entry.value.*;
+        try screen.kitty_images.setLimit(alloc, screen, 0);
+    }
+
+    // RIS (`ESC c`).
+    t.fullReset();
+
+    // A disabled protocol answers nothing and stores nothing.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.images.count());
+}
+
+test "kittygfx retransmit same id removes existing placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    // q=1 answers only failures, so every command below returns null.
+    const Run = struct {
+        fn run(term: *Terminal, str: []const u8) !void {
+            const a = std.testing.allocator;
+            const cmd = try command.Parser.parseString(a, str);
+            defer cmd.deinit(a);
+            try std.testing.expect(execute(a, term, &cmd) == null);
+        }
+    };
+
+    // Transmit and display an image, then add an anonymous and a named
+    // placement. Several anonymous placements of one image are valid.
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;////////");
+    try Run.run(&t, "a=p,i=1,C=1,q=1");
+    try Run.run(&t, "a=p,i=1,p=7,C=1,q=1");
+    try testing.expectEqual(@as(usize, 3), storage.placements.count());
+    try testing.expectEqual(tracked + 3, t.screens.active.pages.countTrackedPins());
+
+    // Retransmitting replaces the image and deletes every placement it
+    // had. a=t creates none of its own.
+    try Run.run(&t, "a=t,t=d,f=24,i=1,s=1,v=2,q=1;AAAAAAAA");
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expect(storage.imageById(1) != null);
+
+    // a=T deletes the previous image and its placements before it adds
+    // one, so a program that draws every frame this way keeps one.
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;////////");
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;AAAAAAAA");
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
 }

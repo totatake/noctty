@@ -95,17 +95,19 @@ pub fn setup(
         var iter = try command.argIterator(alloc_arena);
         defer iter.deinit();
         const exe = iter.next() orelse return null;
+        const bare = std.mem.indexOfAny(u8, exe, "\\/:") == null;
         // Explicit relative paths in a cmd string are relative to the pane's
         // cwd. CreateProcess's application name uses the app's cwd instead.
-        if (command == .shell and std.mem.indexOfAny(u8, exe, "\\/:") != null and
-            !(exe.len >= 3 and std.ascii.isAlphabetic(exe[0]) and exe[1] == ':' and
-                (exe[2] == '\\' or exe[2] == '/'))) return null;
-        if (std.mem.indexOfAny(u8, exe, "\\/:") == null) {
+        if (command == .shell and !bare and !windows_shell.isDriveAbsolutePath(exe)) return null;
+        // The program `command` starts.
+        var program = exe;
+        if (bare) {
             if (try windows_shell.lookupChildExecutable(alloc_arena, exe, env)) |path| {
                 var argv: std.ArrayList([:0]const u8) = .empty;
                 try argv.append(alloc_arena, path);
                 while (iter.next()) |arg| try argv.append(alloc_arena, try alloc_arena.dupeZ(u8, arg));
                 command = .{ .direct = try argv.toOwnedSlice(alloc_arena) };
+                program = path;
             } else if (command == .shell) {
                 // Preserve main's integrated launch form when lookup cannot
                 // resolve a native file: PowerShell was direct, Bash/Nu cmd.
@@ -116,12 +118,7 @@ pub fn setup(
         // WSL's bash.exe launcher starts a Linux distribution, which neither
         // sees the ENV and GHOSTTY_* variables injection relies on (WSLENV
         // does not list them) nor leaves the `--posix` it would be given.
-        if (shell == .bash) {
-            var bash_iter = try command.argIterator(alloc_arena);
-            defer bash_iter.deinit();
-            const bash = bash_iter.next() orelse return null;
-            if (try windows_shell.isWslBashLauncherPath(alloc_arena, bash)) return null;
-        }
+        if (shell == .bash and try windows_shell.isWslBashLauncherPath(alloc_arena, program)) return null;
     }
 
     const new_command: config.Command = switch (shell) {

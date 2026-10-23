@@ -73,6 +73,23 @@ pub fn focusRepaintNeeded(pane_count: usize) bool {
     return pane_count > 1;
 }
 
+/// Whether the renderer dims a pane as an unfocused split
+/// (`unfocused-split-opacity`): one of two or more panes in its tab that is
+/// neither the tab's focused pane nor its zoomed one. High Contrast keeps
+/// system colors, so it draws no dim.
+pub fn splitDimmed(pane_count: usize, focused_or_zoomed: bool, high_contrast: bool) bool {
+    return pane_count > 1 and !focused_or_zoomed and !high_contrast;
+}
+
+test "splitDimmed needs two panes, neither focused nor zoomed, and no High Contrast" {
+    const testing = std.testing;
+    try testing.expect(!splitDimmed(1, false, false));
+    try testing.expect(splitDimmed(2, false, false));
+    try testing.expect(splitDimmed(3, false, false));
+    try testing.expect(!splitDimmed(2, true, false));
+    try testing.expect(!splitDimmed(2, false, true));
+}
+
 pub fn profileVisible(overlay_mode: HostOverlayMode) bool {
     return overlay_mode == .profile;
 }

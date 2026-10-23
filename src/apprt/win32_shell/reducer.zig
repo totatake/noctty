@@ -590,7 +590,12 @@ fn reorderTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId, in
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
-fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.WindowId) !void {
+fn closeWindow(state: *model.ShellState, out: *Reduction, window_arg: model.WindowId) !void {
+    // Read field by field before anything moves. Zig may pass `window_arg` by
+    // reference, and `closeTab` passes `tab.window`, a field of the tab this
+    // swap-removes from `state.tabs`: the slot then holds a later tab, and the
+    // wrong window closed. A `const` copy of the struct aliased it as well.
+    const window_id: model.WindowId = .{ .index = window_arg.index, .generation = window_arg.generation };
     const window = state.window(window_id) orelse return error.StaleId;
     var pane_count: usize = 0;
     var node_count: usize = 0;
@@ -862,4 +867,54 @@ test "close active last tab preserves previous adjacent focus" {
     try std.testing.expectEqual(@as(usize, 1), window.tabs.items.len);
     try std.testing.expect(window.tabs.items[0].eql(tab_a));
     try std.testing.expect(window.active_tab.?.eql(tab_a));
+}
+
+test "closing the only tab of a window opened before another closes that window" {
+    var state = model.ShellState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const first_window = state.focused_window.?;
+    const first_tab = state.window(first_window).?.tabs.items[0];
+    reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const second_window = state.focused_window.?;
+
+    // The first window's tab is not the last one in `state.tabs`, so closing
+    // it moves the second window's tab into its slot. Before the fix that
+    // closed the second window and left the first holding a freed tab, which
+    // `validate` rejects (`MissingTab`): the caption X of the first of two
+    // windows did nothing.
+    reduction = try apply(&state, .{ .close_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    try std.testing.expect(state.window(first_window) == null);
+    try std.testing.expect(state.window(second_window) != null);
+    try std.testing.expect(state.focused_window.?.eql(second_window));
+}
+
+test "discarding the undo tab of a window opened before another removes that window" {
+    var state = model.ShellState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const first_window = state.focused_window.?;
+    const first_tab = state.window(first_window).?.tabs.items[0];
+    reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const second_window = state.focused_window.?;
+
+    // `close_tab:this` on the first window's only tab keeps it for undo, and
+    // its expiry discards it, removing the now empty first window, which is
+    // not the last one in `state.windows`.
+    reduction = try apply(&state, .{ .detach_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    reduction = try apply(&state, .{ .discard_detached_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    try std.testing.expect(state.window(first_window) == null);
+    try std.testing.expect(state.window(second_window) != null);
 }

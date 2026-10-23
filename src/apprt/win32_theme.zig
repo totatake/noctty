@@ -700,23 +700,24 @@ pub fn buttonColorsFromTheme(
         };
     }
     if (hovered and !pressed and !disabled) {
-        // High Contrast palettes can have a dark background with is_dark=false.
-        // Choose hover direction from the actual button background.
-        const hover_lightens = ((colors.bg & 0xff) * 299 + ((colors.bg >> 8) & 0xff) * 587 + ((colors.bg >> 16) & 0xff) * 114) < 128000;
-        colors.bg = if (accept)
-            adjustColor(theme.button_accept_bg, 14, 16, 22)
-        else if (active)
-            adjustColor(theme.button_active_bg, 16, 18, 22)
-        else if (overlay)
-            if (hover_lightens) adjustColor(theme.button_overlay_bg, 14, 14, 16) else adjustColor(theme.button_overlay_bg, -8, -8, -8)
-        else if (hover_lightens) adjustColor(theme.button_bg, 16, 16, 18) else adjustColor(theme.button_bg, -8, -8, -8);
-        colors.border = if (accept)
-            adjustColor(theme.button_accept_border, 24, 20, 10)
-        else if (active)
-            theme.accent_hover
-        else if (overlay)
-            if (hover_lightens) adjustColor(theme.button_overlay_border, 20, 20, 24) else adjustColor(theme.button_overlay_border, -20, -20, -24)
-        else if (hover_lightens) adjustColor(theme.button_border, 28, 28, 30) else adjustColor(theme.button_border, -28, -28, -30);
+        if (accept) {
+            colors.bg = adjustColor(theme.button_accept_bg, 14, 16, 22);
+            colors.border = adjustColor(theme.button_accept_border, 24, 20, 10);
+        } else if (active) {
+            colors.bg = adjustColor(theme.button_active_bg, 16, 18, 22);
+            colors.border = theme.accent_hover;
+        } else {
+            // High Contrast palettes can have a dark background with is_dark=false.
+            // Choose hover direction from the actual button background.
+            const hover_lightens = ((colors.bg & 0xff) * 299 + ((colors.bg >> 8) & 0xff) * 587 + ((colors.bg >> 16) & 0xff) * 114) < 128000;
+            if (overlay) {
+                colors.bg = if (hover_lightens) adjustColor(theme.button_overlay_bg, 14, 14, 16) else adjustColor(theme.button_overlay_bg, -8, -8, -8);
+                colors.border = if (hover_lightens) adjustColor(theme.button_overlay_border, 20, 20, 24) else adjustColor(theme.button_overlay_border, -20, -20, -24);
+            } else {
+                colors.bg = if (hover_lightens) adjustColor(theme.button_bg, 16, 16, 18) else adjustColor(theme.button_bg, -8, -8, -8);
+                colors.border = if (hover_lightens) adjustColor(theme.button_border, 28, 28, 30) else adjustColor(theme.button_border, -28, -28, -30);
+            }
+        }
     }
     if (pressed) {
         colors.bg = if (overlay) adjustColor(theme.overlay_bg, -4, -4, -4) else adjustColor(theme.chrome_bg, -8, -8, -8);
@@ -772,7 +773,7 @@ test "CHROME57 High Contrast hover uses readable system highlight colours" {
 }
 
 // Legacy buttonColors() and buttonFocusRingColor() removed.
-// Use buttonColorsFromTheme(, false) and ThemeColors focus ring fields instead.
+// Use buttonColorsFromTheme() and ThemeColors focus ring fields instead.
 
 // ── Overlay accent ──────────────────────────────────────────────────────
 

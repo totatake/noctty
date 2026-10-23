@@ -1,3 +1,33 @@
+. (Join-Path $PSScriptRoot 'interactive-win11-measure-lib.ps1')
+
+function Test-InteractiveWin11MeasureMode {
+    return $env:NOCTTY_INTERACTIVE_MEASURE_AUMID -eq '1'
+}
+
+function Get-InteractiveWin11ProcessAumid {
+    if (Test-InteractiveWin11MeasureMode) { return 'io.github.amanthanvi.noctty.measure' }
+    return 'io.github.amanthanvi.noctty'
+}
+
+function Get-InteractiveWin11ToastAumid {
+    # CreateToastNotifierWithId uses this explicit identity in App.init, even
+    # when the process/jump-list identity is isolated. Keep the release gate's
+    # product notifier and product notification setting; do not substitute a
+    # potentially unregistered measurement notifier or accept its fallback.
+    return 'io.github.amanthanvi.noctty'
+}
+
+function Get-InteractiveWin11MeasureRepoForExe {
+    param([Parameter(Mandatory)] [string] $ExePath)
+
+    $path = Get-InteractiveWin11NormalizedPath $ExePath
+    $match = [regex]::Match($path, '^(?<repo>.+)\\\.sandbox\\interactive-measure\\[0-9a-f]{40,64}\\prefix\\bin\\noctty\.exe$', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        throw 'Measurement mode requires the raw measurement prefix executable.'
+    }
+    return $match.Groups['repo'].Value
+}
+
 function Get-InteractiveWin11NormalizedPath {
     param(
         [Parameter(Mandatory)] [string] $Path
@@ -308,13 +338,17 @@ function Get-InteractiveWin11ContainmentArguments {
 
 function Get-InteractiveWin11LaunchArguments {
     param(
-        [Parameter(Mandatory)] [System.Collections.IDictionary] $Layout
+        [Parameter(Mandatory)] [System.Collections.IDictionary] $Layout,
+        [switch] $UseConfiguredCommand
     )
 
     return @(
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=noctty-interactive-$($Layout.SandboxId)"
+        # Most harnesses type cmd syntax or only need a prompt. PowerShell's
+        # default history ignores APPDATA, so never inherit the product default.
+        if (-not $UseConfiguredCommand) { '--command=cmd.exe' }
     )
 }
 
@@ -424,7 +458,12 @@ function Set-InteractiveWin11Environment {
 
     if ($IncludeResourcesDir) {
         $builtResourcesDir = Join-Path $Layout.RepoRoot 'zig-out\share\ghostty'
-        $resourcesDir = if (Test-Path -LiteralPath $builtResourcesDir -PathType Container) {
+        $resourcesDir = if (Test-InteractiveWin11MeasureMode) {
+            # Keep resources with the archived build, even before its first
+            # build. Never fall back to a different checkout's resource tree.
+            Join-Path (Get-InteractiveWin11MeasureLayout $Layout.RepoRoot).Prefix 'share\ghostty'
+        }
+        elseif (Test-Path -LiteralPath $builtResourcesDir -PathType Container) {
             $builtResourcesDir
         }
         else {
@@ -489,6 +528,7 @@ function Get-InteractiveWin11ExePath {
         [Parameter(Mandatory)] [string] $RepoRoot
     )
 
+    if (Test-InteractiveWin11MeasureMode) { return Get-InteractiveWin11MeasureExePath -RepoRoot $RepoRoot }
     return Get-InteractiveWin11NormalizedPath -Path (Join-Path $RepoRoot 'zig-out\bin\noctty.exe')
 }
 
@@ -498,6 +538,12 @@ function Invoke-InteractiveWin11Build {
         [ValidateSet('Debug', 'ReleaseSafe', 'ReleaseFast', 'ReleaseSmall')] [string] $Optimize
     )
 
+    if (Test-InteractiveWin11MeasureMode) {
+        $measureArguments = @{ RepoRoot = $RepoRoot }
+        if (-not [string]::IsNullOrWhiteSpace($Optimize)) { $measureArguments.Optimize = $Optimize }
+        Invoke-InteractiveWin11MeasureBuild @measureArguments
+        return
+    }
     $devWindowsCmd = Join-Path $RepoRoot 'scripts\dev-windows.cmd'
     $repoSandboxRoot = Get-InteractiveWin11NormalizedPath -Path (Join-Path $RepoRoot '.sandbox\win11')
     $savedLocalAppData = $env:LOCALAPPDATA
@@ -560,6 +606,10 @@ function Assert-InteractiveWin11ExeExists {
         [switch] $AllowInboxConPty
     )
 
+    if (Test-InteractiveWin11MeasureMode) {
+        $measureRepo = Get-InteractiveWin11MeasureRepoForExe $ExePath
+        Assert-InteractiveWin11MeasureBuild -RepoRoot $measureRepo -ExePath $ExePath
+    }
     if (-not [System.IO.File]::Exists($ExePath)) {
         throw "Missing noctty.exe at $ExePath"
     }
@@ -669,6 +719,9 @@ function Wait-InteractiveWin11Until {
         [switch] $ConditionFirst
     )
 
+    # A condition that reads screen pixels (Get-StatefulPixel) names its window
+    # here, so a timeout can say what was on screen instead of only a color.
+    $script:InteractiveWin11PixelWindow = [IntPtr]::Zero
     if ($ConditionFirst) {
         while ($true) {
             if ($null -ne $WatchProcess -and $WatchProcess.HasExited) {
@@ -703,10 +756,12 @@ function Wait-InteractiveWin11Until {
     }
     }
 
-    if ([string]::IsNullOrEmpty($TimeoutMessage)) {
-        throw "Timed out waiting for $Description"
+    $message = if ([string]::IsNullOrEmpty($TimeoutMessage)) { "Timed out waiting for $Description" } else { $TimeoutMessage }
+    if ($script:InteractiveWin11PixelWindow -ne [IntPtr]::Zero) {
+        try { $message += "; $(Save-StatefulPixelDiagnostic -Hwnd $script:InteractiveWin11PixelWindow -Description $Description)" }
+        catch { $message += "; pixel diagnostic failed: $($_.Exception.Message)" }
     }
-    throw $TimeoutMessage
+    throw $message
 }
 
 function Get-InteractiveWin11ProcessTreeSnapshot {
@@ -1099,6 +1154,19 @@ function Get-InteractiveWin11LaunchAction {
     }
 
     if ($Rebuild) {
+        return 'build'
+    }
+
+    if (Test-InteractiveWin11MeasureMode) {
+        [void] (Get-InteractiveWin11MeasureRepoForExe $resolvedExePath)
+        if ([IO.File]::Exists($resolvedExePath)) {
+            # This selects build versus reuse only. Every caller then runs
+            # Assert-InteractiveWin11ExeExists at admission, which validates
+            # HEAD/source/binary receipts once, including with -NoBuild.
+            # Do not duplicate that full source walk inside leaf budgets.
+            return 'launch'
+        }
+        if ($NoBuild) { throw "Missing measurement noctty.exe at $resolvedExePath (-NoBuild)." }
         return 'build'
     }
 

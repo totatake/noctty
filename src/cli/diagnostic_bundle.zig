@@ -83,7 +83,7 @@ const InstallKind = enum {
     fn detect(alloc: Allocator) InstallKind {
         if (xdg.portableRoot(alloc) catch return .other) |root| {
             alloc.free(root);
-            return classify(true, false);
+            return .portable;
         }
         if (builtin.os.tag != .windows) return .other;
         const exe_dir = std.fs.selfExeDirPathAlloc(alloc) catch return .other;
@@ -129,14 +129,18 @@ fn scanConfigBytes(alloc: Allocator, bytes: []const u8, keys: *ConfigKeys) !void
     var decoded: ?[]u8 = null;
     defer if (decoded) |text| alloc.free(text);
     var text = bytes;
-    if (bytes.len >= 2 and (std.mem.eql(u8, bytes[0..2], "\xff\xfe") or
-        std.mem.eql(u8, bytes[0..2], "\xfe\xff")))
-    {
+    const utf16_order: ?std.builtin.Endian = if (std.mem.startsWith(u8, bytes, "\xff\xfe"))
+        .little
+    else if (std.mem.startsWith(u8, bytes, "\xfe\xff"))
+        .big
+    else
+        null;
+    if (utf16_order) |order| {
         if (bytes.len % 2 != 0) return error.InvalidEncoding;
         const units = try alloc.alloc(u16, (bytes.len - 2) / 2);
         defer alloc.free(units);
         for (units, 0..) |*unit, i| {
-            unit.* = std.mem.nativeToLittle(u16, std.mem.readInt(u16, bytes[2 + i * 2 ..][0..2], if (bytes[0] == 0xff) .little else .big));
+            unit.* = std.mem.nativeToLittle(u16, std.mem.readInt(u16, bytes[2 + i * 2 ..][0..2], order));
         }
         decoded = try std.unicode.utf16LeToUtf8Alloc(alloc, units);
         text = decoded.?;

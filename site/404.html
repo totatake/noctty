@@ -1,74 +1,87 @@
 <!DOCTYPE html>
-<html lang="en" class="nc-no-js" data-theme="dark">
+<html lang="en" class="nc-no-js">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Not found, Noctty</title>
   <meta name="description" content="That page does not exist on noctty.com." />
   <meta name="robots" content="noindex, follow" />
-  <meta name="theme-color" content="#05060d" media="(prefers-color-scheme: dark)" />
-  <meta name="theme-color" content="#f7f5ed" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#09090b" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
   <link rel="shortcut icon" href="/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/styles.css?v=6477492a71d23788cd3f29ac9ce8f6c735737babe29597c9c36aa7238148a2ca" />
+  <link rel="stylesheet" href="/styles.css?v=af1d11bc81a2ac204d8d767dfd9984032e736cf88548ba7c07b033bde9d15762" />
   <script>
     (function () {
       var root = document.documentElement;
       root.classList.remove("nc-no-js");
       root.classList.add("nc-js");
+      var theme = null;
       try {
-        var stored = localStorage.getItem("nc-theme");
-        if (!stored) {
+        theme = localStorage.getItem("nc-theme");
+        if (!theme) {
           var legacy = localStorage.getItem("wg-theme");
           if (legacy) {
-            stored = legacy;
+            theme = legacy;
             localStorage.setItem("nc-theme", legacy);
             localStorage.removeItem("wg-theme");
           }
         }
-        root.setAttribute("data-theme", stored || "dark");
       } catch (e) {}
+      if (theme !== "light" && theme !== "dark") {
+        var media = typeof window !== "undefined" && window.matchMedia
+          ? window.matchMedia("(prefers-color-scheme: light)")
+          : null;
+        theme = media && media.matches ? "light" : "dark";
+      }
+      root.setAttribute("data-theme", theme);
     })();
   </script>
 </head>
 <body>
   <a class="nc-skip-link" href="#main-content">Skip to content</a>
 
-  <header class="nc-topbar">
-    <div class="nc-shell nc-topbar__inner">
+  <header class="nc-header">
+    <div class="nc-frame nc-header__inner">
       <a class="nc-wordmark" href="/" aria-label="Noctty home">
-        <svg class="nc-wordmark__mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-          <rect x="1" y="1" width="30" height="30" rx="7" fill="#16173A" />
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="#F4F1E3" />
-          <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="#8FB7FF" />
-          <circle cx="27.3" cy="12.6" r="0.7" fill="#8FB7FF" />
-          <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="#7DD3A8" />
+        <svg width="22" height="21" viewBox="4 4 25 24" fill="none" aria-hidden="true">
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="currentColor" />
+          <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="currentColor" opacity="0.6" />
+          <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="currentColor" />
         </svg>
-        <span class="nc-wordmark__text">Noctty</span>
+        <span>Noctty</span>
       </a>
       <nav class="nc-nav" aria-label="Primary">
+        <a class="nc-nav__link" href="/why-noctty.html">About</a>
         <a class="nc-nav__link" href="https://github.com/amanthanvi/noctty" target="_blank" rel="noopener noreferrer">GitHub</a>
         <button type="button" class="nc-theme-toggle" id="theme-toggle" aria-label="Toggle color theme" title="Toggle color theme">
-          <svg width="16" height="16" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-            <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="currentColor" />
-            <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="currentColor" opacity="0.7" />
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5" />
+            <path d="M8 1.75a6.25 6.25 0 0 1 0 12.5Z" fill="currentColor" />
           </svg>
         </button>
       </nav>
     </div>
   </header>
 
-  <main id="main-content" class="nc-shell nc-lost">
-    <h1 class="nc-lost__title">That page does not exist.</h1>
+  <main id="main-content" class="nc-frame nc-lost">
+    <h1 class="nc-lost__title">Nothing at this path.</h1>
+    <div class="nc-term">
+      <div class="nc-term__panes">
+        <div class="nc-term__pane is-focused">
+          <div class="nc-term__line"><span class="nc-term__prompt">PS C:\&gt;</span> cd <span data-nc-lost-path>\that-page</span></div>
+          <div class="nc-term__line nc-term__red">Set-Location: Cannot find path 'C:<span data-nc-lost-path>\that-page</span>' because it does not exist.</div>
+          <div class="nc-term__line"><span class="nc-term__prompt">PS C:\&gt;</span> <span class="nc-term__cursor"></span></div>
+        </div>
+      </div>
+    </div>
     <p class="nc-lost__body">
-      The link may be out of date. The download and the install commands are on
-      the front page.
+      The link may be out of date. The download and the install commands are
+      on the front page.
     </p>
-    <p class="nc-lost__action">
-      <a class="nc-button nc-button--primary" href="/">Back to noctty.com</a>
-    </p>
+    <a class="nc-btn nc-btn--primary" href="/">Back to noctty.com</a>
   </main>
 
-  <script type="module" src="/app.js?v=98916ae44c47820a7a796236e272181592d780769a90b706acea8eeb8eead2d1"></script>
+  <script type="module" src="/app.js?v=def851c82b908513d211facbc6d1c7122a287a7dcfa678fd18081ebfe51d1c09"></script>
 </body>
 </html>

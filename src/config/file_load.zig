@@ -68,21 +68,15 @@ pub fn preferredXdgPath(alloc: Allocator) ![]const u8 {
     const xdg_state = fileState(xdg_path);
     const legacy_state = fileState(legacy_path);
 
-    if (xdg_state == .content) {
-        alloc.free(legacy_path);
-        return xdg_path;
-    }
-    if (legacy_state == .content) {
-        alloc.free(xdg_path);
-        return legacy_path;
-    }
-    if (xdg_state == .empty) {
-        alloc.free(legacy_path);
-        return xdg_path;
-    }
-    if (legacy_state == .empty) {
-        alloc.free(xdg_path);
-        return legacy_path;
+    for ([_]FileState{ .content, .empty }) |wanted| {
+        if (xdg_state == wanted) {
+            alloc.free(legacy_path);
+            return xdg_path;
+        }
+        if (legacy_state == wanted) {
+            alloc.free(xdg_path);
+            return legacy_path;
+        }
     }
 
     const fork_path = try legacyForkXdgPath(alloc);

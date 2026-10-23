@@ -145,9 +145,6 @@ pub fn ref(
     self.lock.lock();
     defer self.lock.unlock();
 
-    var missing: MissingFamilies = .{};
-    errdefer missing.deinit(self.alloc);
-
     const gop = try self.map.getOrPut(self.alloc, key);
     if (gop.found_existing) {
         log.debug("found cached grid for font config", .{});
@@ -170,6 +167,10 @@ pub fn ref(
         .grid = grid,
         .ref = 1,
     };
+
+    // The configured families no installed font matched, kept with the grid.
+    var missing: MissingFamilies = .{};
+    errdefer missing.deinit(self.alloc);
 
     grid.* = try .init(self.alloc, resolver: {
         // Build our collection. This is the expensive operation that

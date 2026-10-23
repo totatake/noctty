@@ -1276,9 +1276,10 @@ test {
         );
         try thread.wakeup.notify();
 
-        // Keep the original budget. Atomic observations identify scheduling,
-        // worker exit and the last delivered stages without racing callbacks.
-        ud.reset.timedWait(100 * std.time.ns_per_ms) catch |err| {
+        // Wait for the .complete callback, not a scheduling performance target.
+        // The generous timeout only guards against a hung search. Atomic
+        // observations diagnose failure without racing the worker's callbacks.
+        ud.reset.timedWait(30 * std.time.ns_per_s) catch |err| {
             std.debug.print("search-test wait failed err={} elapsed_ns={d} started={} exited={} events:", .{
                 err,
                 timer.read(),

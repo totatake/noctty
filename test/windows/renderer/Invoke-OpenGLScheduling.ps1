@@ -7,6 +7,11 @@ param(
     [string]$DesktopName,
     [string]$RealProfile
 )
+
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Invoke-OpenGLScheduling.ps1'
+try {
+
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Native.ps1')
 $DefaultBinary=[IO.Path]::GetFullPath($DefaultBinary)
@@ -71,9 +76,11 @@ function Case([string]$Name,[string]$Binary){
     Set-Content -LiteralPath (Join-Path $bin 'config.ghostty') -Value @('renderer=opengl','auto-update=off','confirm-close-surface=false','window-save-state=never','single-instance=false','shell-integration=none','window-vsync=false','window-width=96','window-height=28','windows-job-object-kill-on-close=true',$command)
     $envForRun=@{LOCALAPPDATA=(Join-Path $run 'LocalAppData');APPDATA=(Join-Path $run 'AppData');NOCTTY_RENDERER_READY_PATH=(Join-Path $run 'ready.txt');NOCTTY_RENDER_TRACE_FILE=(Join-Path $run 'trace.json');NOCTTY_RENDER_TRACE_LIVE='1'}
     [void](New-Item -ItemType Directory -Path $envForRun.LOCALAPPDATA,$envForRun.APPDATA)
-    $proc=$null;$hostWindow=[IntPtr]::Zero
+    $proc=$null;$hostWindow=[IntPtr]::Zero;$nativeProcess=New-Object RendererNative+PI
     try{
-        $proc=Start-Process -FilePath (Join-Path $bin 'noctty.exe') -WorkingDirectory $bin -WindowStyle Hidden -Environment $envForRun -PassThru -RedirectStandardError (Join-Path $run 'stderr.txt')
+        # On this private desktop by name, as Invoke-RendererParity.ps1 launches: a null desktop can land on the interactive one.
+        $nativeProcess=[RendererNative]::Launch((Join-Path $bin 'noctty.exe'),$bin,$DesktopName,$envForRun,(Join-Path $run 'stderr.txt'))
+        try{$proc=Get-Process -Id $nativeProcess.pid}catch{throw 'App exited before fixture.'}
         $identity=$proc.StartTime;$timer=[Diagnostics.Stopwatch]::StartNew();$surface=[IntPtr]::Zero
         while($timer.Elapsed.TotalSeconds -lt 40){$proc.Refresh();if($proc.HasExited){throw 'App exited before fixture.'};$hostWindow=[RendererNative]::Host($proc.Id);if($hostWindow -ne [IntPtr]::Zero){[void][RendererNative]::ShowWindow($hostWindow,4);$surface=[RendererNative]::Surface($hostWindow)};if($surface -ne [IntPtr]::Zero -and (Test-Path -LiteralPath $envForRun.NOCTTY_RENDERER_READY_PATH)){break};Start-Sleep -Milliseconds 25}
         if($surface -eq [IntPtr]::Zero){throw 'No fixture surface.'}
@@ -99,10 +106,18 @@ function Case([string]$Name,[string]$Binary){
         if($record.frameUpdates -lt 1 -or $record.presentedOutputBytes -lt 1000){throw 'Streaming stopped during resize.'}
         return $record
     }finally{
-        if($proc){$proc.Refresh();if(!$proc.HasExited){[void][RendererNative]::PostMessageW($hostWindow,0x0010,[IntPtr]::Zero,[IntPtr]::Zero);[void]$proc.WaitForExit(5000)};if(!$proc.HasExited){$live=Get-Process -Id $proc.Id;if($live.StartTime -ne $identity -or $live.Path -ne (Join-Path $bin 'noctty.exe')){throw 'Process identity changed.'};Stop-Process -Id $proc.Id;throw 'Graceful teardown failed.'}}
+        try{if($proc){$proc.Refresh();if(!$proc.HasExited){[void][RendererNative]::PostMessageW($hostWindow,0x0010,[IntPtr]::Zero,[IntPtr]::Zero);[void]$proc.WaitForExit(5000)};if(!$proc.HasExited){$live=Get-Process -Id $proc.Id;if($live.StartTime -ne $identity -or $live.Path -ne (Join-Path $bin 'noctty.exe')){throw 'Process identity changed.'};Stop-Process -Id $proc.Id;throw 'Graceful teardown failed.'}}}
+        finally{
+            if($nativeProcess.thread -ne [IntPtr]::Zero){[void][RendererNative]::CloseHandle($nativeProcess.thread)}
+            if($nativeProcess.process -ne [IntPtr]::Zero){[void][RendererNative]::CloseHandle($nativeProcess.process)}
+        }
         CheckProfile
     }
 }
 try{$result.runs+=Case 'default' $DefaultBinary;$result.runs+=Case 'opengl-only' $OpenGLOnlyBinary;$result.status='pass'}catch{$result.failure=$_.Exception.Message}
 finally{CheckProfile;$result.profileAfter=Receipt;$result|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json')}
 if($result.status -ne 'pass'){exit 1}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

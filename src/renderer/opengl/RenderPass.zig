@@ -181,6 +181,15 @@ pub fn step(self: *Self, s: Step) !void {
         gl.disable(gl.c.GL_BLEND) catch |err| return self.fail("blend.disable", err);
     }
 
+    // The context keeps sRGB conversion on (`prepareContext`), as `present`
+    // assumes when it turns it off around its blit and back on.
+    if (!s.pipeline.framebuffer_srgb) {
+        gl.disable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| return self.fail("framebuffer_srgb.disable", err);
+    }
+    defer if (!s.pipeline.framebuffer_srgb) gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+        self.markUnhealthy("framebuffer_srgb.enable", err);
+    };
+
     gl.drawArraysInstanced(
         s.draw.type,
         0,

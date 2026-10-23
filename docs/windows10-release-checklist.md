@@ -83,7 +83,7 @@ gate function named in the source is missing from this page.
 | `supportsDwmSystemBackdropAttribute` (`win32.zig`)                         | Build 22621 (`OS_BUILD_WIN11_22H2`) for `DWMWA_SYSTEMBACKDROP_TYPE`                 | W10-12                 |
 | `OS_BUILD_WIN10_22H2` (`win32/consts.zig`)                                 | 19045, used only by tests that stand in for this machine                            | W10-01                 |
 | DWM attributes 20 and 19, 34 to 36 (`win32_theme.zig`)                     | Dark caption tries 20, then 19; border, caption and text colour need build 22000    | W10-11, W10-12         |
-| Titlebar icon font chain (`createTitlebarIconFont`, `win32.zig`)           | Segoe Fluent Icons, then Segoe MDL2 Assets                                          | W10-16                 |
+| Titlebar icon font chain (`createTitlebarIconFont`, `win32.zig`)           | Segoe Fluent Icons, then Segoe MDL2 Assets, by glyph table; else `win32_icons`      | W10-16                 |
 | Chrome and Settings fonts (`createChromeFont`, `recreateUiFont`)           | Segoe UI Variable Text where present, else Segoe UI                                 | W10-15                 |
 | `GUID_ENERGY_SAVER_STATUS` (`win32_power.zig`)                             | Windows 11 Energy Saver; the registration may fail elsewhere and is not a warning   | W10-26                 |
 | ConPTY source (`pty.zig`)                                                  | Bundled `conpty.dll` and `OpenConsole.exe`, else the in-box conhost                 | W10-19, W10-02         |
@@ -167,14 +167,15 @@ rectangles during the round trip from a normal window. This expectation comes
 from the `SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED` path, not a Windows 10
 measurement. A maximised window is a separate observation:
 the Windows 10 path rewrites the window style without `WS_MAXIMIZE`
-(`AGENTS.md`, 2026-09-24 entry, trap 4), so toggling while maximised is expected
-to leave an un-maximised window inside the maximised rectangle. Record what you
+(`docs/agents/log/window-frame.md`, 2026-09-24 entry, trap 4), so toggling
+while maximised is expected to leave an un-maximised window inside the maximised rectangle. Record what you
 see; neither outcome is a pass or a fail.
 
 **W10-09 Fullscreen round trip.** Maximise, then `toggle_fullscreen`, leave
 fullscreen, then restore from maximised. Expected: the window returns to its
 normal size and place, not to the maximised rectangle (the 2026-10-06 fullscreen
-entry in `AGENTS.md` describes the Windows 11 failure this guards).
+entry in `docs/agents/log/window-frame.md` describes the Windows 11 failure this
+guards).
 
 **W10-10 Quick terminal.** There is no default key for it. Put `quick-terminal-position
 = top` and `keybind = global:ctrl+alt+q=toggle_quick_terminal` in the config, reload
@@ -222,14 +223,14 @@ Segoe UI (Windows 10 has no Segoe UI Variable), no clipped labels at 100%, 150% 
 
 **W10-16 Tab-row `+` and `▾` glyphs (Core).** Gate: `createTitlebarIconFont`. In the
 separate tab row, look at the new-tab and dropdown buttons, at 100% and 150%.
-Expected: a plus and a chevron. The code asks GDI for "Segoe Fluent Icons" first and
-for "Segoe MDL2 Assets" only if that fails, but `CreateFontIndirectW` can return
-a substitute for a missing face, and Microsoft does not ship
-Segoe Fluent Icons with Windows 10 ([Segoe Fluent Icons font](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font)).
-So the MDL2 fallback may never be reached and these two buttons may draw empty or
-as boxes. This is an inference from the code, not a measurement on Windows 10: if
-the glyphs are missing, record it as a defect with a screenshot; the search bar's
-icons (W10-17) already guard against exactly this by checking the glyph table.
+Expected: a plus and a chevron, never a hollow box. Microsoft does not ship
+Segoe Fluent Icons with Windows 10 ([Segoe Fluent Icons font](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font)),
+and `CreateFontIndirectW` returns a substitute for a missing face, which draws a
+hollow box for every icon (measured on build 26300 with a face that is not
+installed). So the code takes the first of Segoe Fluent Icons and Segoe MDL2 Assets
+whose glyph table has every titlebar icon, and draws the built-in vector icons when
+neither has; on Windows 10 that should be Segoe MDL2 Assets. A box or an empty
+button is a defect: record it with a screenshot.
 
 **W10-17 Search bar icons.** Open the search bar (`Ctrl+Shift+F`). Expected: six
 buttons, previous, next, regex, case, whole word and close, drawn from the embedded

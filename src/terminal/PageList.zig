@@ -2520,7 +2520,9 @@ fn keepRowActive(self: *PageList, p: *const Pin) void {
 }
 
 /// Remove the last `n` rows of the screen, content and all. Tracked pins in
-/// them move to the new last row. The caller keeps at least `rows` rows.
+/// them move to the new last row and, like the pins of a pruned page, are
+/// marked garbage, since what they pointed at is gone (the viewport pin
+/// excepted, which is never garbage). The caller keeps at least `rows` rows.
 fn eraseTrailingRows(self: *PageList, n: usize) void {
     assert(self.total_rows - n >= self.rows);
     var remaining = n;
@@ -2538,7 +2540,9 @@ fn eraseTrailingRows(self: *PageList, n: usize) void {
             if (tracked.node != node or tracked.y < keep) continue;
             tracked.node = dest_node;
             tracked.y = dest_y;
+            tracked.garbage = true;
         }
+        self.viewport_pin.garbage = false;
 
         // Free what the rows hold and reset their flags, since a later
         // grow() hands the same memory back out.
@@ -13773,6 +13777,9 @@ test "PageList erase trailing rows across pages moves pins and frees styles" {
     const doomed = try s.trackPin(s.pin(.{ .active = .{ .y = 3 } }).?);
     defer s.untrackPin(doomed);
 
+    // The viewport pin is moved like any other, but is never garbage.
+    s.viewport_pin.* = doomed.*;
+
     // Erase every row of the last page and one more.
     const last_rows = s.pages.last.?.data.size.rows;
     const total = s.totalRows();
@@ -13780,11 +13787,14 @@ test "PageList erase trailing rows across pages moves pins and frees styles" {
     try testing.expectEqual(total - last_rows - 1, s.totalRows());
     try testing.expect(s.pages.first == s.pages.last);
 
-    // The pin moved to the new last row, which no longer wraps and lost
-    // its spacer head; the erased row's style went with it.
+    // The pin moved to the new last row, marked garbage because its own
+    // row is gone. That row no longer wraps and lost its spacer head; the
+    // erased row's style went with it.
     const page = &s.pages.last.?.data;
     try testing.expect(doomed.node == s.pages.last.?);
     try testing.expectEqual(page.size.rows - 1, doomed.y);
+    try testing.expect(doomed.garbage);
+    try testing.expect(!s.viewport_pin.garbage);
     const end_row = page.getRow(page.size.rows - 1);
     try testing.expect(!end_row.wrap);
     try testing.expect(page.getCells(end_row)[s.cols - 1].wide != .spacer_head);

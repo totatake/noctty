@@ -40,6 +40,7 @@ param(
     [string] $ExpectedStartupModified
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hidden-win11-local-lib.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -59,57 +60,11 @@ public static class Rq {
     [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr h, int id);
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr dev,IntPtr mode,int flags,uint access,IntPtr sa);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
-    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h,uint ms);
-    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h,out uint code);
     [DllImport("kernel32.dll")] public static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr a,string name);
-    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
     [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
     [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job,uint code);
-    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job,int type,out JobAccounting accounting,uint size,IntPtr returned);
-    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
-        public long userTime,kernelTime,periodUserTime,periodKernelTime;
-        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long processTime,jobTime; public uint flags;
-        public UIntPtr minWorking,maxWorking; public uint activeProcesses;
-        public UIntPtr affinity; public uint priority,scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes; }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public IoCounters io;
-        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
-    }
-    public static IntPtr CreateOwnedJob() {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job==IntPtr.Zero) throw new Exception("CreateJobObject failed");
-        var limits=new JobLimits(); limits.basic.flags=0x2000; // KILL_ON_JOB_CLOSE
-        if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf<JobLimits>())) {
-            CloseHandle(job); throw new Exception("SetInformationJobObject failed");
-        }
-        return job;
-    }
-    public static uint StopOwnedJob(IntPtr job) {
-        try {
-            if(!TerminateJobObject(job,1)) throw new Exception("Terminate owned job failed");
-            var deadline=DateTime.UtcNow.AddSeconds(5);
-            do {
-                JobAccounting accounting;
-                if(!QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf<JobAccounting>(),IntPtr.Zero))
-                    throw new Exception("Query owned job failed");
-                if(accounting.activeProcesses==0) return accounting.totalProcesses;
-                System.Threading.Thread.Sleep(10);
-            } while(DateTime.UtcNow<deadline);
-            throw new Exception("Owned job cleanup exceeded five seconds");
-        } finally { CloseHandle(job); }
-    }
     static string Class(IntPtr h) { var s=new StringBuilder(128); GetClassNameW(h,s,128); return s.ToString(); }
     public static IntPtr[] Windows(int pid,string cls) {
         var list=new List<IntPtr>(); EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id);
@@ -137,30 +92,6 @@ public static class Rq {
     }
 }
 '@
-function Startup-Fingerprint {
-    $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
-}
-# Size and time only; the contents of a shell history are never read.
-function History-Metadata {
-    $path = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    $item = Get-Item -LiteralPath $path
-    return @{ Exists=$true; Length=$item.Length; Modified=$item.LastWriteTimeUtc.ToString('o') }
-}
-function Jump-List-Files {
-    $dir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\Recent\CustomDestinations'
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Filter '*.customDestinations-ms' -File | ForEach-Object { @{ Path=$_.FullName; Written=[DateTimeOffset]$_.LastWriteTimeUtc } })
-}
-function Copy-Portable([string] $Source, [string] $Destination) {
-    [void](New-Item -ItemType Directory -Path $Destination)
-    Get-ChildItem -LiteralPath $Source -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Destination }
-    $share = Join-Path (Split-Path -Parent $Source) 'share'
-    if (Test-Path -LiteralPath $share) { Copy-Item -LiteralPath $share -Destination (Join-Path (Split-Path -Parent $Destination) 'share') -Recurse }
-    Set-Content -LiteralPath (Join-Path $Destination 'noctty.portable') -Value '' -NoNewline
-}
 
 if (-not $Driver) {
     $Run = [IO.Path]::GetFullPath($Run)
@@ -168,8 +99,8 @@ if (-not $Driver) {
     $source = (Resolve-Path -LiteralPath $Bin).Path
     if (-not (Test-Path -LiteralPath (Join-Path $source 'noctty.exe'))) { throw "No noctty.exe in $source." }
     $before = Startup-Fingerprint
-    $historyBefore = History-Metadata
-    $clipboardBefore = [Rq]::GetClipboardSequenceNumber()
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-restore-quarantine.ps1'
+    $clipboardBefore = [HiddenLocal]::GetClipboardSequenceNumber()
     if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
     $jumpBefore = @(Jump-List-Files | ForEach-Object { $_.Path })
     $batchStart = [DateTimeOffset]::UtcNow
@@ -179,28 +110,28 @@ if (-not $Driver) {
     Copy-Portable $source $copy
     foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
     $desktopName = 'noctty-rq-' + [guid]::NewGuid().ToString('N')
-    $desktop = [Rq]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
+    $desktop = [HiddenLocal]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
     if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
     $oldLocal=$env:LOCALAPPDATA; $oldRoaming=$env:APPDATA
     $pi=$null; $job=[IntPtr]::Zero; $code=1
     try {
-        $job=[Rq]::CreateOwnedJob()
+        $job=[HiddenLocal]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
         $pwsh=(Get-Command pwsh.exe).Source
         $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -Label {4} -Desktop "{5}" -Driver' -f $pwsh,$PSCommandPath,$copy,$Run,$Label,"WinSta0\$desktopName"
         $pi=[Rq]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
         Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
-        while ([Rq]::WaitForSingleObject($pi.process,1000) -eq 258) {
+        while ([HiddenLocal]::WaitForSingleObject($pi.process,1000) -eq 258) {
             if([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $DriverTimeoutSeconds seconds; owned process job will be closed." }
         }
-        [uint32]$exit=0; [void][Rq]::GetExitCodeProcess($pi.process,[ref]$exit); $code=$exit
+        [uint32]$exit=0; [void][HiddenLocal]::GetExitCodeProcess($pi.process,[ref]$exit); $code=$exit
     } finally {
         $env:LOCALAPPDATA=$oldLocal; $env:APPDATA=$oldRoaming
         $cleanupError=$null; $ownedProcessCount=0
-        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[Rq]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
+        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[HiddenLocal]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
         if($pi) { [void][Rq]::CloseHandle($pi.thread); [void][Rq]::CloseHandle($pi.process) }
-        [void][Rq]::CloseDesktop($desktop)
+        [void][HiddenLocal]::CloseDesktop($desktop)
         $batchEnd = [DateTimeOffset]::UtcNow
         # Only the measurement AUMID's file, and only if this batch created it:
         # absent before and written during it. Not its creation time: NTFS
@@ -214,15 +145,15 @@ if (-not $Driver) {
             } else { $otherNew += (Split-Path -Leaf $f.Path) }
         }
         $after=Startup-Fingerprint
-        $historyAfter = History-Metadata
-        $clipboardAfter=[Rq]::GetClipboardSequenceNumber()
+        $clipboardAfter=[HiddenLocal]::GetClipboardSequenceNumber()
         Write-Host "Clipboard sequence after: $clipboardAfter"
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        $historyUnchanged=$historyBefore.Exists -eq $historyAfter.Exists -and $historyBefore.Length -eq $historyAfter.Length -and $historyBefore.Modified -eq $historyAfter.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=$historyUnchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; OtherNewJumpListFiles=$otherNew; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{ Before=$before; After=$after; Unchanged=$unchanged; HistoryUnchanged=($null -eq $historyFailure); OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount; ClipboardSequenceBefore=$clipboardBefore; ClipboardSequenceAfter=$clipboardAfter; JumpListFilesRemoved=$removed; OtherNewJumpListFiles=$otherNew; BatchStartUtc=$batchStart.ToString('o'); BatchEndUtc=$batchEnd.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
         if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
-        if (-not $historyUnchanged) { throw 'Real PowerShell history metadata changed; stop launches and report it.' }
+        if ($historyFailure) { throw $historyFailure }
         if($cleanupError) { throw $cleanupError }
     }
     if($code -ne 0) { throw "Hidden driver failed with exit $code; inspect sanitized results in $Run." }
@@ -236,7 +167,6 @@ $script:launches=[Collections.Generic.List[object]]::new()
 function Check([string]$Build,[string]$Name,[bool]$Passed,$Expected,$Actual) {
     $script:checks.Add(@{ Build=$Build; Name=$Name; Passed=$Passed; Expected=$Expected; Actual=$Actual })
 }
-function Hash-Of([string]$Path) { if(Test-Path -LiteralPath $Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } return $null }
 function Ledger([string]$Dir) {
     $path = Join-Path $Dir 'startup-attempts.json'
     if (-not (Test-Path -LiteralPath $path)) { return @() }
@@ -256,7 +186,7 @@ function Launch-Once([string]$Build,[string]$Dir,[int]$Index) {
     try {
         $deadline=[datetime]::UtcNow.AddSeconds(25)
         while ([datetime]::UtcNow -lt $deadline) {
-            if ([Rq]::WaitForSingleObject($pi.process,100) -eq 0) { break }
+            if ([HiddenLocal]::WaitForSingleObject($pi.process,100) -eq 0) { break }
             $hosts = @([Rq]::Windows($pi.pid,'noctty.win32.host'))
             $attempts = @(Ledger $Dir)
             $ready = $attempts.Count -gt 0 -and $null -ne $attempts[-1].ready_at_unix_ms
@@ -274,15 +204,15 @@ function Launch-Once([string]$Build,[string]$Dir,[int]$Index) {
                 break
             }
         }
-        if ([Rq]::WaitForSingleObject($pi.process,0) -ne 0) {
+        if ([HiddenLocal]::WaitForSingleObject($pi.process,0) -ne 0) {
             foreach ($h in [Rq]::Windows($pi.pid,'noctty.win32.host')) { [void][Rq]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
-            if ([Rq]::WaitForSingleObject($pi.process,8000) -ne 0) {
+            if ([HiddenLocal]::WaitForSingleObject($pi.process,8000) -ne 0) {
                 # Our own handle from CreateProcess: the exact process we started.
-                [void][Rq]::TerminateProcess($pi.process,1); [void][Rq]::WaitForSingleObject($pi.process,5000)
+                [void][Rq]::TerminateProcess($pi.process,1); [void][HiddenLocal]::WaitForSingleObject($pi.process,5000)
                 $record.Terminated = $true
             }
         } else {
-            [uint32]$exit=0; [void][Rq]::GetExitCodeProcess($pi.process,[ref]$exit); $record.ExitCode = $exit
+            [uint32]$exit=0; [void][HiddenLocal]::GetExitCodeProcess($pi.process,[ref]$exit); $record.ExitCode = $exit
         }
     } finally { [void][Rq]::CloseHandle($pi.thread); [void][Rq]::CloseHandle($pi.process) }
     $attempts = @(Ledger $Dir)

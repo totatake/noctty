@@ -1,5 +1,10 @@
 [CmdletBinding()]
 param([switch]$Rebuild, [switch]$ResetState, [int]$TimeoutSeconds = 30)
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-session-restore.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 # Retry cadence for session-automation snapshot queries.
 $script:SESSION_RESTORE_RETRY_MS = 250
@@ -125,3 +130,7 @@ foreach ($run in $runs) {
     }
 }
 Write-Host "interactive-win11 session-restore validation: PASS (state=$statePath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

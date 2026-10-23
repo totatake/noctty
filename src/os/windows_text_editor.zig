@@ -200,9 +200,12 @@ test "SET text editor query failure and invalid bounded ProgID never dispatch th
                 },
                 .unterminated, .embedded_null, .short_count => {
                     @memcpy(out.?[0..4], &[_]u16{ 'A', 'B', 'C', 0 });
-                    len.* = if (mode == .embedded_null) 4 else 3;
+                    len.* = switch (mode) {
+                        .embedded_null => 4,
+                        .short_count => 2,
+                        else => 3,
+                    };
                     if (mode == .embedded_null) out.?[1] = 0;
-                    if (mode == .short_count) len.* = 2;
                 },
             }
             return 0;

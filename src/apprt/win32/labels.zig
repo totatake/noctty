@@ -206,10 +206,9 @@ pub fn tabButtonKeyAction(vk: WPARAM, mods: KeyMods) ?TabButtonKeyAction {
         c.VK_DELETE => .close,
         // The overview is a palette action; the menu key opens the tab's
         // context menu, as it does on every other Windows control.
-        c.VK_APPS => .context_menu,
         // Shift+F10 is the same request. F10 is a system key, so it arrives
         // as WM_SYSKEYDOWN, and plain F10 stays with the window.
-        c.VK_F10 => if (mods.shift and !mods.ctrl) .context_menu else null,
+        c.VK_APPS, c.VK_F10 => if (tabContextMenuKey(vk, mods)) .context_menu else null,
         c.VK_TAB => switch (tabFocusStep(vk, mods) orelse return null) {
             .next => .focus_next,
             .previous => .focus_previous,
@@ -238,6 +237,11 @@ pub fn chromeButtonKeyAction(vk: WPARAM, mods: KeyMods) ?ChromeButtonKeyAction {
 /// the menu key's release (and Shift+F10's) into a second WM_CONTEXTMENU after
 /// the key-down already opened the menu.
 pub fn tabButtonSwallowsKeyUp(vk: WPARAM, mods: KeyMods) bool {
+    return tabContextMenuKey(vk, mods);
+}
+
+/// The menu key, or Shift+F10 without Ctrl or Alt.
+fn tabContextMenuKey(vk: WPARAM, mods: KeyMods) bool {
     return vk == c.VK_APPS or (vk == c.VK_F10 and mods.shift and !mods.ctrl and !mods.alt);
 }
 
@@ -299,8 +303,8 @@ pub const SearchToggleKeys = struct {
         return role;
     }
 
-    pub fn consumeChar(self: *SearchToggleKeys, ch: WPARAM, bits: usize) bool {
-        _ = ch;
+    /// `bits` is the WM_SYSCHAR's lParam; its character does not matter.
+    pub fn consumeChar(self: *SearchToggleKeys, bits: usize) bool {
         const pending = self.pending_scan;
         self.pending_scan = null;
         return if (pending) |scan| scan == ((bits >> 16) & 0x1FF) else false;
@@ -470,10 +474,6 @@ pub fn searchBarDisplayStateChanged(
         search_bar.selected != selected;
 }
 
-pub fn profileChromeVisible(overlay_mode: HostOverlayMode) bool {
-    return win32_chrome_state.profileVisible(overlay_mode);
-}
-
 pub fn inspectorVisibilityChangeNeedsHostRelayout(changed: bool) bool {
     return changed;
 }
@@ -609,10 +609,6 @@ pub fn nextVisibleOverlayFocusSlot(
         )) return candidate;
     }
     return null;
-}
-
-pub fn inspectorChromeVisible(overlay_mode: HostOverlayMode) bool {
-    return win32_chrome_state.inspectorVisible(overlay_mode);
 }
 
 pub fn inspectorBannerStateChanged(
@@ -4276,18 +4272,19 @@ test "win32 search toggle accelerators need Alt without Ctrl, Shift or AltGr" {
     const r_scan = 0x13 << 16;
     const c_scan = 0x2E << 16;
     try std.testing.expectEqual(@as(?SearchBarButtonRole, .regex), keys.keyDown('R', alt, r_scan));
-    // Cyrillic K on the R key is consumed just like Latin r.
-    try std.testing.expect(keys.consumeChar(0x041A, r_scan));
-    try std.testing.expect(!keys.consumeChar('r', r_scan));
+    // The character is never read, so Cyrillic K on the R key is consumed
+    // just like Latin r: only the one character the press typed, though.
+    try std.testing.expect(keys.consumeChar(r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
     _ = keys.keyDown('C', alt, c_scan);
-    try std.testing.expect(keys.consumeChar('C', c_scan));
+    try std.testing.expect(keys.consumeChar(c_scan));
     _ = keys.keyDown('R', alt, r_scan);
-    try std.testing.expect(!keys.consumeChar('c', c_scan));
+    try std.testing.expect(!keys.consumeChar(c_scan));
     _ = keys.keyDown('R', .{ .alt = true, .ctrl = true }, r_scan);
-    try std.testing.expect(!keys.consumeChar(0x20AC, r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
     _ = keys.keyDown('R', alt, r_scan);
     _ = keys.keyDown('X', alt, r_scan);
-    try std.testing.expect(!keys.consumeChar('x', r_scan));
+    try std.testing.expect(!keys.consumeChar(r_scan));
 }
 
 test "win32 a tab context menu hands focus back to the strip only from the keyboard and without an overlay" {
@@ -4487,22 +4484,6 @@ test "win32 overlayPaintCacheDirty ignores repaint-only dirtiness" {
     try std.testing.expect(overlayPaintCacheDirty(true, .search, cached, cached, null));
     try std.testing.expect(overlayPaintCacheDirty(false, .search, null, cached, null));
     try std.testing.expect(overlayPaintCacheDirty(false, .profile, cached, cached, null));
-}
-
-test "win32 profile chrome visibility requires the profile overlay" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    inline for (std.meta.tags(HostOverlayMode)) |mode| {
-        try std.testing.expectEqual(mode == .profile, profileChromeVisible(mode));
-    }
-}
-
-test "win32 inspector chrome visibility requires no overlay" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    inline for (std.meta.tags(HostOverlayMode)) |mode| {
-        try std.testing.expectEqual(mode == .none, inspectorChromeVisible(mode));
-    }
 }
 
 test "win32 inspector visibility changes require host relayout" {

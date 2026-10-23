@@ -380,7 +380,9 @@ fn serve(alloc: Allocator, args: []const [:0]u8) !void {
     var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80 }, .{});
     var command: Command = .{
         .path = "pwsh.exe",
-        .args = &.{ "pwsh.exe", "-NoLogo", "-NoProfile" },
+        // This is a driven test shell. APPDATA cannot redirect PSReadLine's
+        // known-folder history; disable persistence before its first read.
+        .args = &.{ "pwsh.exe", "-NoLogo", "-NoProfile", "-NoExit", "-Command", "try { Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction Stop; if ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing') { exit 1 } } catch { exit 1 }" },
         .pseudo_console = pty.pseudoConsole(),
         .windows_job_object_plan = .{
             .mode = .always,

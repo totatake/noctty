@@ -134,21 +134,25 @@ pub const UnderlineState = struct {
     slide_started_ms: u64 = 0,
 
     /// Slide only on selection changes; layout/DPI changes track the tab exactly.
+    /// Returns whether a slide started.
     pub fn retarget(self: *UnderlineState, tab_id: u32, left: f32, width: f32, now_ms: u64, animate: bool) bool {
         const selection_changed = self.tab_id != tab_id;
         self.tab_id = tab_id;
-        if (animate and !selection_changed and self.positioned and self.target_left == left and self.target_width == width) return false;
-        if (!self.positioned or !animate or !selection_changed) {
-            self.positioned = true;
-            self.slide_started_ms = 0;
-            self.target_left = left;
-            self.start_left = left;
-            self.target_width = width;
-            self.start_width = width;
-            return false;
+        if (self.positioned and animate) {
+            if (selection_changed) {
+                self.retargetTo(left, width, now_ms);
+                return true;
+            }
+            // The same tab where it was: a slide toward it keeps going.
+            if (self.target_left == left and self.target_width == width) return false;
         }
-        self.retargetTo(left, width, now_ms);
-        return true;
+        self.positioned = true;
+        self.slide_started_ms = 0;
+        self.target_left = left;
+        self.start_left = left;
+        self.target_width = width;
+        self.start_width = width;
+        return false;
     }
 
     /// Begin (or redirect) a slide toward `new_left` / `new_width`.

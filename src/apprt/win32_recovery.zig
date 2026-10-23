@@ -259,13 +259,9 @@ pub fn mergeRecords(
             } else if (phase_order == .eq and current.last_win32_error == null) {
                 current.last_win32_error = next.last_win32_error;
             }
-            if (current.session_restore_at_unix_ms == null) {
-                current.session_restore_at_unix_ms = next.session_restore_at_unix_ms;
-            }
-            if (current.opengl_unavailable_at_unix_ms == null) {
-                current.opengl_unavailable_at_unix_ms = next.opengl_unavailable_at_unix_ms;
-            }
-            if (current.version == null) current.version = next.version;
+            current.session_restore_at_unix_ms = current.session_restore_at_unix_ms orelse next.session_restore_at_unix_ms;
+            current.opengl_unavailable_at_unix_ms = current.opengl_unavailable_at_unix_ms orelse next.opengl_unavailable_at_unix_ms;
+            current.version = current.version orelse next.version;
             continue;
         }
         merged[count] = next;
@@ -360,6 +356,10 @@ const RecentFailures = struct {
     now_unix_ms: u64,
     max_age_ms: u64,
 
+    fn init(record: StartupAttemptRecord, now_unix_ms: u64, max_age_ms: u64) RecentFailures {
+        return .{ .attempts = record.attempts, .now_unix_ms = now_unix_ms, .max_age_ms = max_age_ms };
+    }
+
     fn next(self: *RecentFailures) ?StartupAttempt {
         while (self.attempts.len > 0) {
             const attempt = self.attempts[self.attempts.len - 1];
@@ -379,7 +379,7 @@ pub fn recentFailureCount(
     now_unix_ms: u64,
     max_age_ms: u64,
 ) usize {
-    var failures: RecentFailures = .{ .attempts = record.attempts, .now_unix_ms = now_unix_ms, .max_age_ms = max_age_ms };
+    var failures: RecentFailures = .init(record, now_unix_ms, max_age_ms);
     var count: usize = 0;
     while (failures.next() != null) count += 1;
     return count;
@@ -394,15 +394,14 @@ pub fn decide(
     now_unix_ms: u64,
     policy: Policy,
 ) Decision {
-    const threshold = policy.failure_threshold;
-    if (threshold == 0) return .normal;
-    if (recentFailureCount(record, now_unix_ms, policy.max_failure_age_ms) < threshold) return .normal;
-    var failures: RecentFailures = .{ .attempts = record.attempts, .now_unix_ms = now_unix_ms, .max_age_ms = policy.max_failure_age_ms };
-    for (0..threshold) |_| {
-        const attempt = failures.next().?;
-        if (attempt.session_restore_at_unix_ms == null or attempt.phase != .init) return .safe_mode;
+    if (policy.failure_threshold == 0) return .normal;
+    var failures: RecentFailures = .init(record, now_unix_ms, policy.max_failure_age_ms);
+    var all_ended_restoring = true;
+    for (0..policy.failure_threshold) |_| {
+        const attempt = failures.next() orelse return .normal;
+        if (attempt.session_restore_at_unix_ms == null or attempt.phase != .init) all_ended_restoring = false;
     }
-    return .quarantine_session;
+    return if (all_ended_restoring) .quarantine_session else .safe_mode;
 }
 
 test "win32 recovery record round trips strict schema v1" {

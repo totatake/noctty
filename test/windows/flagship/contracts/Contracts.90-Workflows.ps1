@@ -85,6 +85,16 @@ if ($releaseWindowsJob -match 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24') {
 $windowsArmWorkflow = Join-Path $repoRoot '.github\workflows\windows-arm64.yml'
 $windowsArmWorkflowText = Get-Content -LiteralPath $windowsArmWorkflow -Raw
 $checksJob = Get-YamlJobText -Content $testWorkflowText -Name 'checks' -Source $testWorkflow
+foreach ($controlCase in @(
+        @{ Name = 'Harness provenance and state controls (PowerShell 7)'; Shell = 'pwsh' },
+        @{ Name = 'Harness provenance and state controls (Windows PowerShell 5.1)'; Shell = 'powershell' }
+    )) {
+    $step = Get-YamlStepBlock -Content $checksJob -Name $controlCase.Name -Source $testWorkflow
+    if ($step -notmatch ('(?m)^ {8}shell: ' + $controlCase.Shell + '\s*$') -or
+        $step -notmatch '(?m)^ {8}run: \|\r?\n {10}\./test/windows/interactive-win11-measure-contract\.ps1\r?\n {10}\./test/windows/interactive-win11-state-guard-contract\.ps1\s*$') {
+        throw "Missing executable provenance and state controls: $($controlCase.Name)"
+    }
+}
 foreach ($shellCase in @(
         @{ Name = 'PowerShell shell integration tests (PowerShell 7)'; Shell = 'pwsh'; Script = 'powershell-shell-integration' },
         @{ Name = 'PowerShell shell integration tests (Windows PowerShell 5.1)'; Shell = 'powershell'; Script = 'powershell-shell-integration' },
@@ -132,6 +142,8 @@ foreach ($coverage in @(
                 'Flagship verification contract checks',
                 'PowerShell shell integration tests (PowerShell 7)',
                 'PowerShell shell integration tests (Windows PowerShell 5.1)',
+                'Harness provenance and state controls (PowerShell 7)',
+                'Harness provenance and state controls (Windows PowerShell 5.1)',
                 'Bash shell integration tests (Git Bash)',
                 'Cmd and Clink integration tests (portable)',
                 'Interactive hints contract checks',
@@ -380,37 +392,49 @@ Invoke-ContractTable -Contracts @(
         Description = 'interactive builds use clean per-job Zig caches'
     }
 )
-$interactiveRunScript = Get-YamlLiteralRunScript `
-    -Content $interactiveRunStep `
-    -Source "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
-$expectedInteractiveRunScript = @'
-$ErrorActionPreference = 'Stop'
-$quick = '${{ github.event_name }}' -eq 'pull_request'
-if ($quick) {
-  ./test/windows/interactive-win11-pr-smoke.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shader-pacing.ps1 -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} else {
-  ./test/windows/flagship/Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shader-pacing.ps1 -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-accessibility.ps1 -ResetState -TimeoutSeconds 120 -IdleSoakSeconds 600
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-palette-theme.ps1 -ResetState -ExerciseHighContrast
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-session-restore.ps1 -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# The job's whole run is the driver, which puts every launch on the composite's
+# measure-AUMID build inside one state guard (STANDALONE-LEAF-AUMID-01).
+if ($interactiveRunStep -notmatch '(?m)^ {8}shell: pwsh\s*$' -or
+    $interactiveRunStep -notmatch '(?m)^ {8}run: \./test/windows/interactive-win11-job\.ps1\s*$' -or
+    $interactiveRunStep -match '(?m)^ {8}run: \|') {
+    throw 'The interactive job must run the composite and every leaf through test/windows/interactive-win11-job.ps1.'
 }
+$interactiveJobDriver = Join-Path $repoRoot 'test\windows\interactive-win11-job.ps1'
+$interactiveJobTokens = $null
+$interactiveJobErrors = $null
+$interactiveJobAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $interactiveJobDriver, [ref]$interactiveJobTokens, [ref]$interactiveJobErrors)
+if ($interactiveJobErrors.Count -ne 0) { throw "Interactive job driver does not parse: $($interactiveJobErrors[0].Message)" }
+[void](Get-HistoryGuardedScriptBody -Ast $interactiveJobAst -Harness 'interactive-win11-job.ps1')
+$interactiveJobPlanDefinitions = @($interactiveJobAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-InteractiveWin11JobPlan'
+}, $true))
+if ($interactiveJobPlanDefinitions.Count -ne 1) { throw 'The interactive job driver must own one Get-InteractiveWin11JobPlan.' }
+$interactiveJobPlan = & ([scriptblock]::Create($interactiveJobPlanDefinitions[0].Extent.Text + "`nGet-InteractiveWin11JobPlan"))
+$interactiveJobPlanText = @($interactiveJobPlan | ForEach-Object {
+    $step = $_
+    (@($step.Script) + @($step.Arguments.Keys | Sort-Object | ForEach-Object {
+        if ($step.Arguments[$_] -is [bool]) { "-$_" } else { "-$_ $($step.Arguments[$_])" }
+    })) -join ' '
+}) -join "`n"
+$expectedInteractiveJobPlan = @'
+test\windows\flagship\Invoke-InteractiveWin11.ps1 -IncludeForegroundHarness -Rebuild -ResetState
+test\windows\interactive-win11-shaders.ps1 -ResetState
+test\windows\interactive-win11-shader-pacing.ps1 -ResetState
+test\windows\interactive-win11-accessibility.ps1 -IdleSoakSeconds 600 -ResetState -TimeoutSeconds 120
+test\windows\interactive-win11-palette-theme.ps1 -ExerciseHighContrast -ResetState
+test\windows\interactive-win11-session-restore.ps1 -ResetState
 '@
-$expectedInteractiveRunScript = ($expectedInteractiveRunScript -replace '\r\n?', "`n").TrimEnd([char[]]"`n")
-if ($interactiveRunScript -cne $expectedInteractiveRunScript) {
-    throw 'Interactive workflow run script drifted from its exact fail-closed source snapshot.'
+if ($interactiveJobPlanText -cne ($expectedInteractiveJobPlan -replace '\r\n?', "`n").TrimEnd([char[]]"`n")) {
+    throw "Interactive job plan drifted from its exact fail-closed snapshot:`n$interactiveJobPlanText"
+}
+foreach ($leafHarness in @($shaderHarness, (Join-Path $repoRoot 'test\windows\interactive-win11-shader-pacing.ps1'))) {
+    # A leaf rebuild in measurement mode rebuilds the measurement generation,
+    # never a product-AUMID zig-out build.
+    if ((Get-Content -LiteralPath $leafHarness -Raw) -notmatch '(?s)if \(\$Rebuild\) \{\s*if \(Test-InteractiveWin11MeasureMode\) \{[^{}]*?Invoke-InteractiveWin11Build -RepoRoot \$repoRoot\s*\}\s*else \{.*?zig build -Demit-exe=true -Dcustom-shaders=true') {
+        throw "Shader leaf rebuilds a product-AUMID build in measurement mode: $leafHarness"
+    }
 }
 Invoke-ContractTable -Contracts @(
     @{

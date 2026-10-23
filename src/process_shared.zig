@@ -5,6 +5,40 @@ const windows = std.os.windows;
 const cli = @import("cli.zig");
 const state = &@import("global.zig").state;
 
+/// Enable Ctrl+C in children of the Windows GUI before any are started.
+///
+/// Windows-subsystem processes have no console when created, but still inherit
+/// the launcher's Ctrl+C ignore attribute. Reset it once, before GUI startup,
+/// rather than toggling process-wide state around concurrent child launches.
+/// CLI actions can attach to a console and must exit before reaching this call.
+/// Windows Terminal makes the same reset in its GUI entrypoint:
+/// https://github.com/microsoft/terminal/blob/3b8c5606ee1866e7bf5c4e84e962798492282097/src/cascadia/WindowsTerminal/main.cpp#L97-L102
+pub fn enableGuiChildCtrlC() !void {
+    if (comptime builtin.os.tag != .windows) return;
+    try windows.SetConsoleCtrlHandler(null, false);
+}
+
+test "GUI child Ctrl+C reset clears inherited ignore and is idempotent" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // Only the test oracle reads this field; production uses the documented
+    // API. Restore the runner's original ignore policy even if an assertion
+    // fails, so this test cannot affect a later console-control test.
+    const flags = &windows.peb().ProcessParameters.ConsoleFlags;
+    const before = flags.*;
+    defer windows.SetConsoleCtrlHandler(null, before & 1 != 0) catch unreachable;
+
+    try windows.SetConsoleCtrlHandler(null, true);
+    try std.testing.expect(flags.* & 1 != 0);
+    try enableGuiChildCtrlC();
+    try std.testing.expectEqual(before & ~@as(windows.ULONG, 1), flags.*);
+
+    // An already enabled parent follows the same path, without a toggle or
+    // a second per-launch state change.
+    try enableGuiChildCtrlC();
+    try std.testing.expectEqual(before & ~@as(windows.ULONG, 1), flags.*);
+}
+
 /// Give CLI output somewhere to go.
 ///
 /// noctty.exe is a Windows-subsystem binary, so a shell that launches it

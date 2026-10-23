@@ -1832,10 +1832,10 @@ fn deleteRegistryKeyIfEmpty(alloc: Allocator, key_utf8: []const u8) (Allocator.E
 var test_registry_prefix: []const u8 = "";
 
 fn registryKeyW(alloc: Allocator, key_utf8: []const u8) (Allocator.Error || RegistrationError)![:0]u16 {
-    // A test that forgot `ScratchHive` would otherwise read and write the
-    // machine's classes and its default terminal.
-    if (builtin.is_test and test_registry_prefix.len == 0) @panic("registry test without a scratch hive");
     if (builtin.is_test) {
+        // A test that forgot `ScratchHive` would otherwise read and write the
+        // machine's classes and its default terminal.
+        if (test_registry_prefix.len == 0) @panic("registry test without a scratch hive");
         const joined = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ test_registry_prefix, key_utf8 });
         defer alloc.free(joined);
         return std.unicode.utf8ToUtf16LeAllocZ(alloc, joined);

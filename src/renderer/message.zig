@@ -22,6 +22,10 @@ pub const Message = union(enum) {
     /// and still have focus.
     visible: bool,
 
+    /// Whether this terminal is an unfocused split, drawn dimmed
+    /// (`unfocused-split-opacity`). Only sent when it changes.
+    split_dimmed: bool,
+
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
     reset_cursor_blink,

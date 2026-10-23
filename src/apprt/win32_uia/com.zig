@@ -171,6 +171,12 @@ pub const UiaRect = extern struct {
     top: f64,
     width: f64,
     height: f64,
+
+    /// Half-open: a point on the right or bottom edge is outside.
+    pub fn contains(self: UiaRect, x: f64, y: f64) bool {
+        return x >= self.left and x < self.left + self.width and
+            y >= self.top and y < self.top + self.height;
+    }
 };
 
 pub const IRawElementProviderFragmentVtbl = extern struct {

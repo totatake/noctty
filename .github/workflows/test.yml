@@ -97,6 +97,18 @@ jobs:
         shell: powershell
         run: ./test/windows/powershell-shell-integration.ps1
 
+      - name: Harness provenance and state controls (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./test/windows/interactive-win11-measure-contract.ps1
+          ./test/windows/interactive-win11-state-guard-contract.ps1
+
+      - name: Harness provenance and state controls (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          ./test/windows/interactive-win11-measure-contract.ps1
+          ./test/windows/interactive-win11-state-guard-contract.ps1
+
       - name: Cmd and Clink integration tests (portable)
         shell: pwsh
         run: |
@@ -685,30 +697,9 @@ jobs:
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}\zig-global-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}\zig-local-cache
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $quick = '${{ github.event_name }}' -eq 'pull_request'
-          if ($quick) {
-            ./test/windows/interactive-win11-pr-smoke.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shader-pacing.ps1 -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } else {
-            ./test/windows/flagship/Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shader-pacing.ps1 -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-accessibility.ps1 -ResetState -TimeoutSeconds 120 -IdleSoakSeconds 600
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-palette-theme.ps1 -ResetState -ExerciseHighContrast
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-session-restore.ps1 -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+        # The composite and the standalone leaves, all on the composite's
+        # measure-AUMID build inside one state guard; see the script header.
+        run: ./test/windows/interactive-win11-job.ps1
 
       - name: Upload interactive evidence
         if: always()

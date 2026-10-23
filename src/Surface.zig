@@ -762,7 +762,9 @@ const DerivedConfig = struct {
             .window_padding_balance = config.@"window-padding-balance",
             .window_height = config.@"window-height",
             .window_width = config.@"window-width",
-            .title = config.title,
+            // Copied: `config` is not owned past this call. It is a
+            // conditional-state clone, or a reload config the caller frees.
+            .title = if (config.title) |title| try alloc.dupeZ(u8, title) else null,
             .title_report = config.@"title-report",
             .links = links,
             .link_previews = config.@"link-previews",
@@ -843,6 +845,31 @@ const DerivedConfig = struct {
         );
     }
 
+    test "DerivedConfig owns its title" {
+        const testing = std.testing;
+
+        // The config a DerivedConfig is built from dies first: the
+        // conditional-state clone at the end of Surface.init and
+        // updateConfig, or the reload config App.updateConfig's caller
+        // frees. So the derived title must not borrow the source's bytes.
+        var source = try configpkg.Config.default(testing.allocator);
+        var source_alive = true;
+        defer if (source_alive) source.deinit();
+        const title = try source._arena.?.allocator().dupeZ(u8, "pinned title");
+        source.title = title;
+
+        var derived = try DerivedConfig.init(testing.allocator, &source);
+        defer derived.deinit();
+
+        // Stands in for the freed source's memory being reused.
+        @memset(title, 'x');
+        try testing.expectEqualStrings("pinned title", derived.title.?);
+
+        source.deinit();
+        source_alive = false;
+        try testing.expectEqualStrings("pinned title", derived.title.?);
+    }
+
     fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
         const padding_top: u32 = padding_top: {
             const padding_top: f32 = @floatFromInt(self.window_padding_top);
@@ -912,11 +939,8 @@ pub fn init(
     // Initialize our renderer with our initialized surface.
     try Renderer.surfaceInit(rt_surface);
     if (comptime @hasDecl(apprt.Surface, "noteBenchmarkMemoryStage")) {
-        if (comptime build_config.d3d11) {
-            if (rt_surface.renderer_gl_prepared) rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        } else {
+        if (!build_config.d3d11 or rt_surface.renderer_gl_prepared)
             rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        }
     }
 
     // Determine our DPI configurations so we can properly configure
@@ -2300,9 +2324,8 @@ fn pushSearchMessage(
     stopping: *const std.atomic.Value(bool),
     msg: apprt.surface.Message,
 ) void {
-    if (!stopping.load(.acquire)) {
-        if (self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
-    }
+    if (!stopping.load(.acquire) and
+        self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
     var dropped = msg;
     dropped.deinit();
 }
@@ -2974,7 +2997,8 @@ pub fn openLinkText(self: *Surface, text: []const u8) !void {
 }
 
 /// The path to open for link text, when that is not the text itself: see
-/// `resolveOpenPath`. Takes the terminal's pwd for a relative path.
+/// `resolveOpenPath`, and `resolveMsysOpenPath` in a pane that is not WSL.
+/// Takes the terminal's pwd for a relative path.
 ///
 /// Must be called without the renderer state mutex held: it takes the mutex
 /// to copy the pwd, then checks the filesystem without it.
@@ -2987,7 +3011,50 @@ fn resolvePathForOpening(
     else
         try self.pwd(self.alloc) orelse return null;
     defer if (terminal_pwd) |p| self.alloc.free(p);
+    if (builtin.os.tag == .windows and !self.launchesWsl())
+        return resolveMsysOpenPath(self.alloc, terminal_pwd, path);
     return resolveOpenPath(self.alloc, terminal_pwd, path);
+}
+
+/// Whether this pane runs WSL, as its launch command says
+/// (`termio.Exec.launchesWsl`).
+pub fn launchesWsl(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .exec => |*exec| exec.launchesWsl(),
+    };
+}
+
+/// `resolveOpenPath` for a pane that is not WSL, where an absolute MSYS2 or
+/// Cygwin drive path is a Windows path (`windows_shell.msysDrivePathToWindows`):
+/// `/c/Users/me` is `C:\Users\me`. Link text of that form is read as the
+/// Windows path, and so is a pane directory of that form (fish under MSYS2
+/// reports `/c/...` in its OSC 7, and `/c` for the drive's root) for a
+/// relative link. A drive's root as link text (`/c`, as in `cmd /c`) is not
+/// read: it is left to the opener as written, which refuses it.
+///
+/// Such text is never left to the opener as written, which cannot read it:
+/// the result is the Windows path even when nothing is there, and the opener
+/// then refuses it as it refuses that path typed with a drive letter (a
+/// missing file, a letter that is no local drive, a share behind a link).
+fn resolveMsysOpenPath(
+    alloc: Allocator,
+    dir: ?[]const u8,
+    text: []const u8,
+) Allocator.Error!?[]const u8 {
+    const windows_shell = configpkg.windows_shell;
+    if (try windows_shell.msysDrivePathToWindows(alloc, text)) |path| {
+        const found = resolveOpenPath(alloc, null, path) catch |err| {
+            alloc.free(path);
+            return err;
+        };
+        if (found == null) return path;
+        alloc.free(path);
+        return found;
+    }
+    const base = dir orelse return resolveOpenPath(alloc, null, text);
+    const windows_base = try windows_shell.msysDriveDirToWindows(alloc, base);
+    defer if (windows_base) |p| alloc.free(p);
+    return resolveOpenPath(alloc, windows_base orelse base, text);
 }
 
 /// What link text names on disk, as an owned path. Null leaves the text to
@@ -3413,6 +3480,168 @@ test "link text resolves to the file it names, without its line and column" {
         "\\\\?\\UNC\\server\\share\\a.txt(1,2)",
         "\\\\.\\pipe\\x:3",
     }) |text| try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
+}
+
+/// `windows_path` as MSYS2 prints it (`/c/x/y`), after `prefix` (`/cygdrive`
+/// for Cygwin's form).
+fn testMsysPath(alloc: Allocator, prefix: []const u8, windows_path: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{c}{s}", .{
+        prefix,
+        std.ascii.toLower(windows_path[0]),
+        windows_path[2..],
+    });
+    std.mem.replaceScalar(u8, path, '\\', '/');
+    return path;
+}
+
+test "an MSYS2 or Cygwin drive path in link text is the Windows path it names (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "" });
+    try tmp.dir.makePath("conf.d");
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/b.zig", .data = "" });
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    if (!configpkg.windows_shell.isDriveAbsolutePath(dir)) return error.SkipZigTest;
+
+    const Case = struct { prefix: []const u8 = "", text: []const u8, expect: []const u8 };
+    for ([_]Case{
+        // The reporter's case: `pwd` printed a folder.
+        .{ .text = "conf.d", .expect = "conf.d" },
+        .{ .text = "a.txt", .expect = "a.txt" },
+        .{ .prefix = "/cygdrive", .text = "a.txt", .expect = "a.txt" },
+        // A location comes off, as for the same path with a drive letter.
+        .{ .text = "conf.d\\b.zig:12:5", .expect = "conf.d\\b.zig" },
+        .{ .prefix = "/cygdrive", .text = "conf.d\\b.zig(3,4)", .expect = "conf.d\\b.zig" },
+        // A missing file is still the Windows path, for the opener to refuse
+        // as it refuses that path typed with a drive letter.
+        .{ .text = "missing.txt", .expect = "missing.txt" },
+        .{ .text = "missing.txt:12", .expect = "missing.txt:12" },
+    }) |case| {
+        const windows_text = try std.fs.path.join(alloc, &.{ dir, case.text });
+        defer alloc.free(windows_text);
+        const text = try testMsysPath(alloc, case.prefix, windows_text);
+        defer alloc.free(text);
+        const want = try std.fs.path.join(alloc, &.{ dir, case.expect });
+        defer alloc.free(want);
+        want[0] = std.ascii.toUpper(want[0]);
+
+        const got = try resolveMsysOpenPath(alloc, null, text);
+        defer if (got) |p| alloc.free(p);
+        std.testing.expectEqualStrings(want, got orelse "(null)") catch |err| {
+            std.debug.print("text {s}\n", .{text});
+            return err;
+        };
+
+        // Before #514 (and still in a WSL pane, where `/c/x` is a Linux path)
+        // the text went to the opener as written, which refuses it.
+        try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
+    }
+
+    // A relative link in a pane whose directory is an MSYS2 path (fish under
+    // MSYS2 reports `/c/...` in its OSC 7) resolves against the Windows path.
+    {
+        const msys_dir = try testMsysPath(alloc, "", dir);
+        defer alloc.free(msys_dir);
+        const want = try std.fs.path.join(alloc, &.{ dir, "conf.d\\b.zig" });
+        defer alloc.free(want);
+        want[0] = std.ascii.toUpper(want[0]);
+        const got = try resolveMsysOpenPath(alloc, msys_dir, "conf.d/b.zig:7");
+        defer if (got) |p| alloc.free(p);
+        try std.testing.expectEqualStrings(want, got orelse "(null)");
+        try std.testing.expect(try resolveOpenPath(alloc, msys_dir, "conf.d/b.zig:7") == null);
+        // A Windows directory still works.
+        const plain = try resolveMsysOpenPath(alloc, dir, "a.txt");
+        defer if (plain) |p| alloc.free(p);
+        try std.testing.expect(plain != null);
+        // So does a drive's root as the pane directory (`cd /c` in fish).
+        const root = [_]u8{ '/', std.ascii.toLower(dir[0]) };
+        const below_root = try std.fs.path.join(alloc, &.{ dir[3..], "a.txt" });
+        defer alloc.free(below_root);
+        const from_root = try resolveMsysOpenPath(alloc, &root, below_root);
+        defer if (from_root) |p| alloc.free(p);
+        try std.testing.expect(from_root != null);
+        try std.testing.expect(std.ascii.eqlIgnoreCase(from_root.?[3..], below_root));
+    }
+
+    // A drive's root is not read from link text: a lone `/c` is nearly always
+    // a switch (`cmd /c "x"`, `findstr /c:x`, `xcopy /s /e`), and a `..` above
+    // the drive is MSYS2's own root. The opener gets the text as written and
+    // refuses it, as on main (#520 review).
+    for ([_][]const u8{ "/c", "/C", "/d", "/s", "/e", "/c/", "/cygdrive/c", "/c/x/..", "/c/..", "/c/..." }) |text| {
+        try std.testing.expect(try resolveMsysOpenPath(alloc, null, text) == null);
+    }
+
+    // A letter that is no drive here is the Windows path too, which the opener
+    // refuses (`localRoot`); nothing is looked up for it.
+    var free_letter: ?u8 = null;
+    for ("BHJKMNOPQRSTUVWY") |letter| {
+        if (internal_os.windows.driveTypeForLetter(letter) == internal_os.windows.DRIVE_NO_ROOT_DIR) {
+            free_letter = letter;
+            break;
+        }
+    }
+    if (free_letter) |letter| {
+        const text = try std.fmt.allocPrint(alloc, "/{c}/file.txt:3", .{std.ascii.toLower(letter)});
+        defer alloc.free(text);
+        const want = try std.fmt.allocPrint(alloc, "{c}:\\file.txt:3", .{letter});
+        defer alloc.free(want);
+        const got = try resolveMsysOpenPath(alloc, null, text);
+        defer if (got) |p| alloc.free(p);
+        try std.testing.expectEqualStrings(want, got orelse "(null)");
+    }
+
+    // Shares, devices and rooted paths that are not drives stay as they are:
+    // the resolver leaves them to the opener, which refuses them.
+    for ([_][]const u8{
+        "//server/share/a.txt",
+        "//server/share/a.txt:1",
+        "//c/share/a.txt",
+        "/\\server\\share\\a.txt",
+        "//?/UNC/server/share/a.txt",
+        "//./pipe/x",
+        "/home/me/a.txt",
+        "/cd/a.txt:1",
+        "/cygdrive/cd/a.txt",
+    }) |text| try std.testing.expect(try resolveMsysOpenPath(alloc, null, text) == null);
+    // And a share as the pane's directory never resolves a relative link.
+    for ([_][]const u8{ "//server/share", "/\\server\\share", "//c/share" }) |share| {
+        try std.testing.expect(try resolveMsysOpenPath(alloc, share, "a.txt") == null);
+    }
+}
+
+test "only a pane that is not WSL reads /c/x as C:\\x (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "" });
+    const file = try tmp.dir.realpathAlloc(alloc, "a.txt");
+    defer alloc.free(file);
+    if (!configpkg.windows_shell.isDriveAbsolutePath(file)) return error.SkipZigTest;
+    const text = try testMsysPath(alloc, "", file);
+    defer alloc.free(text);
+
+    // An absolute path never reads the pwd, so the surface needs only its
+    // allocator and its launch.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.alloc = alloc;
+    surface.io.backend = .{ .exec = undefined };
+
+    surface.io.backend.exec.subprocess.wsl_launch = false;
+    const got = try surface.resolvePathForOpening(text);
+    defer if (got) |p| alloc.free(p);
+    try std.testing.expect(got != null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(file, got.?));
+
+    // In WSL `/c/x` is a Linux path: left to the opener as written, as before.
+    surface.io.backend.exec.subprocess.wsl_launch = true;
+    try std.testing.expect(try surface.resolvePathForOpening(text) == null);
 }
 
 test "a link through a symlink to a share is never stat-ed" {
@@ -3935,6 +4164,10 @@ const ResizeBatch = struct {
     depth: u8 = 0,
     pending: bool = false,
 
+    fn begin(self: *ResizeBatch) void {
+        self.depth += 1;
+    }
+
     /// Whether a resize must wait for the batch to end.
     fn hold(self: *ResizeBatch) bool {
         if (self.depth == 0) return false;
@@ -3956,14 +4189,14 @@ test "Surface: a resize batch sends one resize when its last level ends" {
     const testing = std.testing;
     var batch: ResizeBatch = .{};
     try testing.expect(!batch.hold());
-    batch.depth += 1;
-    batch.depth += 1;
+    batch.begin();
+    batch.begin();
     try testing.expect(batch.hold());
     try testing.expect(batch.hold());
     try testing.expect(!batch.end());
     try testing.expect(batch.end());
     try testing.expect(!batch.end());
-    batch.depth += 1;
+    batch.begin();
     try testing.expect(!batch.end());
 }
 
@@ -4011,7 +4244,7 @@ test "Surface: resizes inside a batch reach termio once, with the final size and
 /// the new cells, a grid neither monitor uses, which can wrap lines into
 /// scrollback if termio applies it before the second arrives.
 pub fn beginResizeBatch(self: *Surface) void {
-    self.resize_batch.depth += 1;
+    self.resize_batch.begin();
 }
 
 pub fn endResizeBatch(self: *Surface) void {

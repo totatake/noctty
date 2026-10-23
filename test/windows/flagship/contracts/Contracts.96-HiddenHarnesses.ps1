@@ -481,6 +481,8 @@ function Test-HiddenDriverCode([string] $Code) {
     $script:driverRunnerGuardCalled = $false
     function Assert-HiddenRunner { $script:driverRunnerGuardCalled = $true }
     function Get-RealStateFingerprints { return @{ Startup = @{}; History = @{} } }
+    function Start-WindowsHarnessHistoryGuard { param($Harness) return @{} }
+    function Assert-WindowsHarnessHistoryGuard { param($Guard) }
     function Get-FileFingerprint { return @{ Exists = $true; Hash = 'managed fixture' } }
     function Test-SameFingerprint { return $true }
     function Copy-PortableBin { }

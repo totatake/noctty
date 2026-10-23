@@ -1305,11 +1305,7 @@ pub fn semanticPrompt(
             // nested shell needs reset. Without PSReadLine, noctty's
             // PowerShell integration writes no C either, and the same
             // inference serves its `redraw=0` prompts.
-            if (redraw) |v| {
-                self.flags.shell_redraws_prompt = v;
-            } else if (new_prompt) {
-                self.flags.shell_redraws_prompt = .true;
-            }
+            self.semanticPromptApplyRedraw(redraw, new_prompt);
 
             click: {
                 // Handle click_events as a priority over cl. click_events
@@ -1373,11 +1369,7 @@ pub fn semanticPrompt(
             const redraw = cmd.readOption(.redraw);
             const new_prompt = kind == .initial and
                 self.screens.active.semanticPromptMarkStart((redraw orelse .true) == .false);
-            if (redraw) |v| {
-                self.flags.shell_redraws_prompt = v;
-            } else if (new_prompt) {
-                self.flags.shell_redraws_prompt = .true;
-            }
+            self.semanticPromptApplyRedraw(redraw, new_prompt);
 
             self.screens.active.cursorSetSemanticContent(.{ .prompt = kind });
         },
@@ -1429,6 +1421,21 @@ pub fn semanticPrompt(
             // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
         },
+    }
+}
+
+/// Apply the `redraw` option of a prompt-start mark. An explicit value always
+/// applies; a mark without one resets the setting to its default only when
+/// it starts a new prompt. See the A arm of `semanticPrompt` for why.
+fn semanticPromptApplyRedraw(
+    self: *Terminal,
+    redraw: ?osc.semantic_prompt.Redraw,
+    new_prompt: bool,
+) void {
+    if (redraw) |v| {
+        self.flags.shell_redraws_prompt = v;
+    } else if (new_prompt) {
+        self.flags.shell_redraws_prompt = .true;
     }
 }
 
@@ -1610,11 +1617,23 @@ pub fn index(self: *Terminal) !void {
             self.scrolling_region.left == 0 and
             self.scrolling_region.right == self.cols - 1)
         {
+            // Kitty image placements may need adjusting around the scroll.
+            // The rare placements-present case is handled out of line so
+            // this hot path only pays a count check.
+            if (comptime build_options.kitty_graphics) {
+                if (screen.kitty_images.placements.count() != 0) {
+                    @branchHint(.unlikely);
+                    try self.indexScrollWithImages(.window_shift);
+                    return;
+                }
+            }
+
             try screen.cursorScrollAbove();
             return;
         }
 
         // Slow path for left and right scrolling region margins.
+        // scrollUp handles the kitty image adjustment itself.
         if (self.scrolling_region.left != 0 or
             self.scrolling_region.right != self.cols - 1 or
 
@@ -1630,35 +1649,17 @@ pub fn index(self: *Terminal) !void {
             return;
         }
 
-        // Otherwise use a fast path function from PageList to efficiently
-        // scroll the contents of the scrolling region.
+        // Kitty image placements may need adjusting around the scroll;
+        // handled out of line like the scrollback path above.
+        if (comptime build_options.kitty_graphics) {
+            if (screen.kitty_images.placements.count() != 0) {
+                @branchHint(.unlikely);
+                try self.indexScrollWithImages(.in_place);
+                return;
+            }
+        }
 
-        // Preserve old cursor just for assertions
-        const old_cursor = screen.cursor;
-
-        try screen.pages.eraseRowBounded(
-            .{ .active = .{ .y = self.scrolling_region.top } },
-            self.scrolling_region.bottom - self.scrolling_region.top,
-        );
-
-        // eraseRow and eraseRowBounded will end up moving the cursor pin
-        // up by 1, so we need to move it back down. A `cursorReload`
-        // would be better option but this is more efficient and this is
-        // a super hot path so we do this instead.
-        assert(screen.cursor.x == old_cursor.x);
-        assert(screen.cursor.y == old_cursor.y);
-        screen.cursor.y -= 1;
-        screen.cursorDown(1);
-
-        // The operations above can prune our cursor style so we need to
-        // update. This should never fail because the above can only FREE
-        // memory.
-        screen.manualStyleUpdate() catch |err| {
-            std.log.warn("deleteLines manualStyleUpdate err={}", .{err});
-            screen.cursor.style = .{};
-            screen.manualStyleUpdate() catch unreachable;
-        };
-
+        try self.indexScrollRegionUp();
         return;
     }
 
@@ -1666,6 +1667,98 @@ pub fn index(self: *Terminal) !void {
     if (screen.cursor.y < self.scrolling_region.bottom) {
         screen.cursorDown(1);
     }
+}
+
+/// Scroll a full-width scrolling region up by one row in place, with the
+/// cursor on its bottom row, using a fast path function from PageList.
+/// Inlined so index()'s hot path stays as it was.
+inline fn indexScrollRegionUp(self: *Terminal) !void {
+    const screen: *Screen = self.screens.active;
+
+    // Preserve old cursor just for assertions
+    const old_cursor = screen.cursor;
+
+    try screen.pages.eraseRowBounded(
+        .{ .active = .{ .y = self.scrolling_region.top } },
+        self.scrolling_region.bottom - self.scrolling_region.top,
+    );
+
+    // eraseRow and eraseRowBounded will end up moving the cursor pin
+    // up by 1, so we need to move it back down. A `cursorReload`
+    // would be better option but this is more efficient and this is
+    // a super hot path so we do this instead.
+    assert(screen.cursor.x == old_cursor.x);
+    assert(screen.cursor.y == old_cursor.y);
+    screen.cursor.y -= 1;
+    screen.cursorDown(1);
+
+    // The operations above can prune our cursor style so we need to
+    // update. This should never fail because the above can only FREE
+    // memory.
+    screen.manualStyleUpdate() catch |err| {
+        std.log.warn("deleteLines manualStyleUpdate err={}", .{err});
+        screen.cursor.style = .{};
+        screen.manualStyleUpdate() catch unreachable;
+    };
+}
+
+/// The index() scroll when Kitty image placements exist. Split out of
+/// index() so its hot paths don't carry the adjustment state in their
+/// stack frame.
+fn indexScrollWithImages(
+    self: *Terminal,
+    comptime op: kitty.graphics.ImageStorage.ScrollOp,
+) !void {
+    var kitty_scroll = self.kittyScrollMarginsBegin(-1, op);
+    defer if (kitty_scroll) |*state| state.end();
+    switch (op) {
+        .window_shift => try self.screens.active.cursorScrollAbove(),
+        .in_place => try self.indexScrollRegionUp(),
+    }
+}
+
+// Handle when Kitty graphics is disabled.
+const KittyScrollMargins = if (build_options.kitty_graphics)
+    kitty.graphics.ImageStorage.ScrollMargins
+else
+    struct {
+        pub inline fn end(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+/// Begin adjusting kitty image placements for a scroll of the scrolling
+/// region by delta rows (negative moves content up). If adjustment is
+/// needed this returns state whose end() must be called after the scroll's
+/// row operations complete (see ImageStorage.scrollMarginsBegin for why
+/// this is two phases).
+///
+/// This returns null for a full-screen scroll up on a screen that keeps
+/// scrollback: the rows move into the scrollback and the placements' pins
+/// move with them, as kitty moves its images. Every other full-screen
+/// scroll needs the adjustment too: a scroll down (insertLines) moves no
+/// pins, and a screen without scrollback discards its top row (eraseRow)
+/// and leaves the pins on that row in place.
+///
+/// Callers must comptime-gate on build_options.kitty_graphics and check
+/// that placements exist before calling, which keeps the cost on the hot
+/// scroll paths cheap.
+fn kittyScrollMarginsBegin(
+    self: *Terminal,
+    delta: isize,
+    op: kitty.graphics.ImageStorage.ScrollOp,
+) ?kitty.graphics.ImageStorage.ScrollMargins {
+    @branchHint(.cold);
+
+    const screen: *Screen = self.screens.active;
+    if (delta < 0 and
+        !screen.no_scrollback and
+        self.scrolling_region.top == 0 and
+        self.scrolling_region.bottom == self.rows - 1 and
+        self.scrolling_region.left == 0 and
+        self.scrolling_region.right == self.cols - 1) return null;
+
+    return screen.kitty_images.scrollMarginsBegin(self, delta, op);
 }
 
 /// Move the cursor to the previous line in the scrolling region, possibly
@@ -1793,6 +1886,23 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
         self.screens.active.cursor.pending_wrap = old_wrap;
     }
 
+    // If kitty image placements exist, they need adjusting around the
+    // scroll. Note this wraps scrollDown and NOT insertLines: kitty scrolls
+    // images for SD/RI but leaves them alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                @intCast(@min(count, region_height)),
+                .in_place,
+            );
+        }
+    }
+
     // Move to the top of the scroll region
     self.screens.active.cursorAbsolute(self.scrolling_region.left, self.scrolling_region.top);
     self.insertLines(count);
@@ -1813,6 +1923,32 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     defer {
         self.screens.active.cursorAbsolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
+    }
+
+    // If kitty image placements exist, they need adjusting around the
+    // scroll. Note this wraps scrollUp and NOT deleteLines: kitty scrolls
+    // images for SU/IND but leaves them alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+
+            // The op must mirror the branch below: the scrollback path
+            // shifts the active area while the deleteLines path moves rows
+            // in place.
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                -@as(isize, @intCast(@min(count, region_height))),
+                if (self.scrolling_region.top == 0 and
+                    self.scrolling_region.left == 0 and
+                    self.scrolling_region.right == self.cols - 1)
+                    .window_shift
+                else
+                    .in_place,
+            );
+        }
     }
 
     // If our scroll region is at the top and we have no left/right
@@ -13468,6 +13604,37 @@ test "Terminal: fullReset status display" {
     t.status_display = .status_line;
     t.fullReset();
     try testing.expect(t.status_display == .main);
+}
+
+test "Terminal: fullReset preserves kitty graphics limits" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    // Zero is `image-storage-limit = 0`, which disables the protocol.
+    for ([_]usize{ 1234, 0 }) |total_limit| {
+        try t.screens.active.kitty_images.setLimit(
+            alloc,
+            t.screens.active,
+            total_limit,
+        );
+        t.fullReset();
+        try testing.expectEqual(
+            total_limit,
+            t.screens.active.kitty_images.total_limit,
+        );
+
+        // An alternate screen created after the reset inherits the
+        // primary screen's limit.
+        _ = try t.switchScreen(.alternate);
+        try testing.expectEqual(
+            total_limit,
+            t.screens.active.kitty_images.total_limit,
+        );
+        _ = try t.switchScreen(.primary);
+    }
 }
 
 // https://github.com/mitchellh/ghostty/issues/1607

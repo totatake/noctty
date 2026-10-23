@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 15
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-shell-command.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -217,3 +222,7 @@ Assert-Contains -Text (Get-RequiredTextFile -Path $psColorsPath) -Expected 'alic
 Assert-Contains -Text (Get-RequiredTextFile -Path $psThemesPath) -Expected '0x96f (resources)' -Label 'PowerShell +list-themes'
 
 Write-Host "interactive-win11 shell command validation: PASS (cmd=$cmdStdoutPath, powershell=$psStdoutPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

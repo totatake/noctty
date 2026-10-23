@@ -530,20 +530,16 @@ fn legacy(
         // ConPTY cannot decode the CSI 27 modifier forms for these keys.
         // Keep committed IME text above and negotiated keyboard modes intact.
         if (windows_legacy) {
-            const byte: ?u8 = switch (event.key) {
-                .enter => '\r',
-                .escape => 0x1b,
-                .tab => if (all_mods.shift) null else '\t',
-                .backspace => if (all_mods.ctrl) 0x08 else 0x7f,
+            const legacy_sequence: ?[]const u8 = switch (event.key) {
+                .enter => "\r",
+                .escape => "\x1b",
+                .tab => if (all_mods.shift) "\x1b[Z" else "\t",
+                .backspace => if (all_mods.ctrl) "\x08" else "\x7f",
                 else => null,
             };
-            if (byte) |char| {
+            if (legacy_sequence) |bytes| {
                 if (all_mods.alt) try writer.writeByte(0x1b);
-                return try writer.writeByte(char);
-            }
-            if (event.key == .tab) {
-                if (all_mods.alt) try writer.writeByte(0x1b);
-                return try writer.writeAll("\x1b[Z");
+                return try writer.writeAll(bytes);
             }
         }
 
@@ -592,13 +588,13 @@ fn legacy(
     // alt-prefix handling of unshifted codepoints... so we process that.
     const utf8 = event.utf8;
     if (utf8.len == 0) {
-        if (try legacyAltPrefix(
+        _ = try legacyAltPrefix(
             writer,
             event,
             binding_mods,
             all_mods,
             opts,
-        )) return;
+        );
         return;
     }
 

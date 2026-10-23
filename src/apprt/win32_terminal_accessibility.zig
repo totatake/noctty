@@ -9,6 +9,7 @@ const std = @import("std");
 const win32_types = @import("win32_types.zig");
 const sys = @import("win32/sys.zig");
 const win32_uia = @import("win32_uia/mod.zig");
+const uia_text = @import("win32_uia/text.zig");
 
 const Allocator = std.mem.Allocator;
 const HWND = win32_types.HWND;
@@ -80,8 +81,8 @@ pub const TerminalAccessibilitySession = struct {
     scroll_retry_pending: bool = false,
     cached_scroll_token: ?u64 = null,
     cached_viewport_y: usize = 0,
-    cached_document_window: @import("win32_uia/text.zig").DocumentWindow = .{},
-    cached_row_numbering: ?@import("win32_uia/text.zig").RowNumbering = null,
+    cached_document_window: uia_text.DocumentWindow = .{},
+    cached_row_numbering: ?uia_text.RowNumbering = null,
     current_viewport: ?win32_uia.widgets.TerminalViewportGeometry = null,
     last_refresh_ms: u64 = 0,
     refresh_timer_active: bool = false,
@@ -905,7 +906,7 @@ pub fn cellsEqual(
 
 test "PKG71 scroll completes on responsive UI thread before returning without holding session lock" {
     const message: u32 = 0x8000 + 6;
-    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    const hwnd = testWindow() orelse return error.SkipZigTest;
     defer _ = sys.DestroyWindow(hwnd);
     const Hook = struct {
         target: HWND,
@@ -979,7 +980,7 @@ test "PKG71 scroll completes on responsive UI thread before returning without ho
 
 test "PKG71 scroll requests cross threads by value and detach cancels pending work" {
     const message: u32 = 0x8000 + 6;
-    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    const hwnd = testWindow() orelse return error.SkipZigTest;
     defer _ = sys.DestroyWindow(hwnd);
     const Context = struct {
         hwnd_value: HWND,
@@ -1054,7 +1055,7 @@ test "PKG71 scroll requests cross threads by value and detach cancels pending wo
 
 test "PKG71 new scroll request wakes pending work after retry timer failure" {
     const message: u32 = 0x8000 + 6;
-    const hwnd = sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null) orelse return error.SkipZigTest;
+    const hwnd = testWindow() orelse return error.SkipZigTest;
     defer _ = sys.DestroyWindow(hwnd);
     const Context = struct {
         target: HWND,
@@ -1084,6 +1085,11 @@ test "PKG71 new scroll request wakes pending work after retry timer failure" {
     ctx.target = hwnd;
     try TerminalAccessibilitySession.providerScroll(@ptrCast(session), request);
     try std.testing.expect(sys.PeekMessageW(&queued, hwnd, message, message, 1) != 0);
+}
+
+/// A hidden STATIC window for the tests whose session posts to a window.
+fn testWindow() ?HWND {
+    return sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 24, null, null, null, null);
 }
 
 const TestOps = struct {

@@ -16,6 +16,11 @@ param(
     [int] $TimeoutSeconds = 15
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-key-input.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Brief delay before key-input focus verification.
 $script:KEY_INPUT_FOCUS_SETTLE_MS = 100
@@ -535,6 +540,7 @@ $launchArgs = @(
     '-e'
     'powershell.exe'
     '-NoLogo'
+    '-NoProfile'
     '-ExecutionPolicy'
     'Bypass'
     '-File'
@@ -703,4 +709,8 @@ try {
 }
 finally {
     Stop-InteractiveWin11Process -Process $process -Contained
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }
