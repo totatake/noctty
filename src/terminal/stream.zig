@@ -589,6 +589,24 @@ pub fn Stream(comptime H: type) type {
             var offset: usize = 0;
             while (self.parser.state != .ground) {
                 if (offset >= input.len) return input.len;
+
+                // Fast path for bulk APC strings (e.g. Kitty graphics Base64 payloads).
+                // In sos_pm_apc_string, printable ASCII characters (0x20..0x7F) never
+                // cause state transitions and always emit .apc_put. We can scan the
+                // contiguous run and pass it to the handler in bulk.
+                if (comptime !@hasDecl(T, "vtRaw") and @hasDecl(T, "apcPutSlice")) {
+                    if (self.parser.state == .sos_pm_apc_string) {
+                        const slice = input[offset..];
+                        var i: usize = 0;
+                        while (i < slice.len and slice[i] >= 0x20 and slice[i] <= 0x7F) : (i += 1) {}
+                        if (i > 0) {
+                            const consumed = self.handler.apcPutSlice(slice[0..i]);
+                            offset += if (consumed > 0) consumed else i;
+                            continue;
+                        }
+                    }
+                }
+
                 self.nextNonUtf8(input[offset]);
                 offset += 1;
             }

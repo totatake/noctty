@@ -601,6 +601,10 @@ pub const StreamHandler = struct {
         }
     }
 
+    pub fn apcPutSlice(self: *StreamHandler, slice: []const u8) usize {
+        return self.apc.feedSlice(self.alloc, slice);
+    }
+
     pub fn apcEnd(self: *StreamHandler) !void {
         var cmd = self.apc.end() orelse return;
         defer cmd.deinit(self.alloc);

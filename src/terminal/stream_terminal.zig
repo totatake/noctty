@@ -702,6 +702,10 @@ pub const Handler = struct {
         }
     }
 
+    pub fn apcPutSlice(self: *Handler, slice: []const u8) usize {
+        return self.apc_handler.feedSlice(self.terminal.gpa(), slice);
+    }
+
     fn apcEnd(self: *Handler) void {
         const alloc = self.terminal.gpa();
         var cmd = self.apc_handler.end() orelse return;

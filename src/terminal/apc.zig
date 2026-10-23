@@ -65,6 +65,26 @@ pub const Handler = struct {
         }
     }
 
+    pub fn feedSlice(self: *Handler, alloc: Allocator, slice: []const u8) usize {
+        switch (self.state) {
+            .inactive => unreachable,
+            .ignore => return slice.len,
+            .identify => {
+                if (slice.len == 0) return 0;
+                self.feed(alloc, slice[0]);
+                return 1;
+            },
+            .kitty => |*p| if (comptime build_options.kitty_graphics) {
+                return p.feedSlice(slice) catch |err| {
+                    log.warn("kitty graphics protocol error: {}", .{err});
+                    p.deinit();
+                    self.state = .ignore;
+                    return slice.len;
+                };
+            } else unreachable,
+        }
+    }
+
     pub fn end(self: *Handler) ?Command {
         defer {
             self.state.deinit();
