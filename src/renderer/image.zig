@@ -914,6 +914,43 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                 // Get our pending info
                 const p = self.getPending().?;
 
+                // If this is a replace state and the dimensions match, update the
+                // existing GPU texture in-place via subresource / subImage2D instead
+                // of destroying and reallocating a new texture every frame.
+                switch (self.*) {
+                    .replace => |r| {
+                        if (r.texture.width == p.width and r.texture.height == p.height) {
+                            r.texture.replaceRegion(
+                                0,
+                                0,
+                                p.width,
+                                p.height,
+                                p.dataSlice(),
+                            ) catch return error.UploadFailed;
+
+                            alloc.free(p.dataSlice());
+                            self.* = .{ .ready = r.texture };
+                            return;
+                        }
+                    },
+                    .unload_replace => |r| {
+                        if (r.texture.width == p.width and r.texture.height == p.height) {
+                            r.texture.replaceRegion(
+                                0,
+                                0,
+                                p.width,
+                                p.height,
+                                p.dataSlice(),
+                            ) catch return error.UploadFailed;
+
+                            alloc.free(p.dataSlice());
+                            self.* = .{ .unload_ready = r.texture };
+                            return;
+                        }
+                    },
+                    else => {},
+                }
+
                 // Create our texture
                 const texture = Texture.init(
                     api.imageTextureOptions(.rgba, true),
@@ -924,12 +961,12 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                 errdefer comptime unreachable;
 
                 // Uploaded. We can now clear our data and change our state.
-                //
-                // NOTE: For the `replace` state, this will free the old texture.
-                //       We don't currently actually replace the existing texture
-                //       in-place but that is an optimization we can do later.
+                const unload = switch (self.*) {
+                    .unload_pending, .unload_replace => true,
+                    else => false,
+                };
                 self.deinit(alloc);
-                self.* = .{ .ready = texture };
+                self.* = if (unload) .{ .unload_ready = texture } else .{ .ready = texture };
             }
 
             /// Returns any pending image data for this image that requires upload.
