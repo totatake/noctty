@@ -180,6 +180,9 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                     .overlay => self.overlay_placements.items,
                 };
 
+                var vertex_buf: ?GraphicsAPI.Buffer(GraphicsAPI.shaders.Image) = null;
+                defer if (vertex_buf) |b| b.deinit();
+
                 for (placements) |p| {
                     // Look up the image
                     const image = self.images.get(p.image_id) orelse {
@@ -198,38 +201,46 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                         },
                     };
 
-                    // Create our vertex buffer, which is always exactly one item.
-                    // future(mitchellh): we can group rendering multiple instances of a single image
-                    var buf = GraphicsAPI.Buffer(GraphicsAPI.shaders.Image).initFill(
-                        api.imageBufferOptions(),
-                        &.{.{
-                            .grid_pos = .{
-                                @as(f32, @floatFromInt(p.x)),
-                                @as(f32, @floatFromInt(p.y)),
-                            },
+                    // Reusable vertex buffer for drawing image placement quads.
+                    const vertex = GraphicsAPI.shaders.Image{
+                        .grid_pos = .{
+                            @as(f32, @floatFromInt(p.x)),
+                            @as(f32, @floatFromInt(p.y)),
+                        },
 
-                            .cell_offset = .{
-                                @as(f32, @floatFromInt(p.cell_offset_x)),
-                                @as(f32, @floatFromInt(p.cell_offset_y)),
-                            },
+                        .cell_offset = .{
+                            @as(f32, @floatFromInt(p.cell_offset_x)),
+                            @as(f32, @floatFromInt(p.cell_offset_y)),
+                        },
 
-                            .source_rect = .{
-                                @as(f32, @floatFromInt(p.source_x)),
-                                @as(f32, @floatFromInt(p.source_y)),
-                                @as(f32, @floatFromInt(p.source_width)),
-                                @as(f32, @floatFromInt(p.source_height)),
-                            },
+                        .source_rect = .{
+                            @as(f32, @floatFromInt(p.source_x)),
+                            @as(f32, @floatFromInt(p.source_y)),
+                            @as(f32, @floatFromInt(p.source_width)),
+                            @as(f32, @floatFromInt(p.source_height)),
+                        },
 
-                            .dest_size = .{
-                                @as(f32, @floatFromInt(p.width)),
-                                @as(f32, @floatFromInt(p.height)),
-                            },
-                        }},
-                    ) catch |err| {
-                        log.warn("error creating image vertex buffer err={}", .{err});
-                        continue;
+                        .dest_size = .{
+                            @as(f32, @floatFromInt(p.width)),
+                            @as(f32, @floatFromInt(p.height)),
+                        },
                     };
-                    defer buf.deinit();
+
+                    if (vertex_buf == null) {
+                        vertex_buf = GraphicsAPI.Buffer(GraphicsAPI.shaders.Image).initFill(
+                            api.imageBufferOptions(),
+                            &.{vertex},
+                        ) catch |err| {
+                            log.warn("error creating image vertex buffer err={}", .{err});
+                            continue;
+                        };
+                    } else {
+                        vertex_buf.?.sync(&.{vertex}) catch |err| {
+                            log.warn("error updating image vertex buffer err={}", .{err});
+                            continue;
+                        };
+                    }
+                    const buf = &vertex_buf.?;
 
                     try pass.step(.{
                         .pipeline = pipeline,
