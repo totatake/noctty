@@ -601,6 +601,10 @@ pub const StreamHandler = struct {
         }
     }
 
+    pub fn apcPutSlice(self: *StreamHandler, slice: []const u8) usize {
+        return self.apc.feedSlice(self.alloc, slice);
+    }
+
     /// Finish the current APC and run its command. `terminated` is false
     /// when the APC was cancelled or aborted, and then nothing runs.
     pub fn apcEnd(self: *StreamHandler, terminated: bool) !void {

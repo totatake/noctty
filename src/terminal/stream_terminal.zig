@@ -726,6 +726,10 @@ pub const Handler = struct {
         }
     }
 
+    pub fn apcPutSlice(self: *Handler, slice: []const u8) usize {
+        return self.apc_handler.feedSlice(self.terminal.gpa(), slice);
+    }
+
     /// Finish the current APC and run its command. `terminated` is false
     /// when the APC was cancelled or aborted, and then nothing runs.
     fn apcEnd(self: *Handler, terminated: bool) void {
