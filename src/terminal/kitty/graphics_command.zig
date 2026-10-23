@@ -150,6 +150,33 @@ pub const Parser = struct {
         }
     }
 
+    /// Feed a slice of bytes into the parser.
+    ///
+    /// Returns the number of bytes consumed from `slice`.
+    /// When the parser is in the payload data state (`.data`),
+    /// bytes are appended in bulk directly to `self.data`.
+    pub fn feedSlice(self: *Parser, slice: []const u8) !usize {
+        var offset: usize = 0;
+        while (offset < slice.len) {
+            switch (self.state) {
+                .data => {
+                    if (self.data.items.len >= self.max_bytes) return error.OutOfMemory;
+                    const remaining = self.max_bytes - self.data.items.len;
+                    const to_copy = @min(slice.len - offset, remaining);
+                    try self.data.appendSlice(self.arena.child_allocator, slice[offset..][0..to_copy]);
+                    offset += to_copy;
+                    if (offset < slice.len) return error.OutOfMemory;
+                    return offset;
+                },
+                else => {
+                    try self.feed(slice[offset]);
+                    offset += 1;
+                },
+            }
+        }
+        return offset;
+    }
+
     /// Complete the parsing. This must be called after all the
     /// bytes have been fed to the parser.
     ///
@@ -1674,4 +1701,21 @@ test "unknown flag key values still fail parsing" {
             Parser.parseString(alloc, input),
         );
     }
+}
+
+test "feedSlice bulk payload data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var p = Parser.init(alloc, 1024 * 1024);
+    defer p.deinit();
+
+    const input = "a=t,f=24,s=2,v=2;AQIDBAUGBwgJCgsMDQ4PEA==";
+    const consumed = try p.feedSlice(input);
+    try testing.expectEqual(input.len, consumed);
+    const command = try p.complete(alloc);
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .transmit);
+    const expected = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    try testing.expectEqualSlices(u8, &expected, command.data);
 }
