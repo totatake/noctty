@@ -49,6 +49,7 @@ $script:CiPathRules = @(
     # Prose and metadata. The checks job runs the site and release copy checks
     # and the contracts that read these files; nothing compiled does.
     @{ Needs = 'none'; Pattern = '^plans/' }
+    # docs/ includes docs/agents/log/, the Self-Correction Log AGENTS.md indexes.
     @{ Needs = 'none'; Pattern = '^docs/' }
     @{ Needs = 'none'; Pattern = '^site/' }
     @{ Needs = 'none'; Pattern = '^\.greptile/' }

@@ -13,6 +13,11 @@ param(
     [string] $ResultPath
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-conpty-sync.ps1'
+try {
+
+
 # Differential harness: does noctty's screen agree with ConPTY's?
 #
 # ConPTY keeps its own copy of the screen. Console-API programs (cmd's line
@@ -507,11 +512,11 @@ if ($Inner) {
         $historyPath = Join-Path $script:Work "$Name-psreadline-history.txt"
         [IO.File]::WriteAllLines($historyPath, [string[]]@($History), (New-Object System.Text.UTF8Encoding $false))
         $integration = Join-Path $RunRoot 'tools\integration.ps1'
-        return ('{0} -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
+        return ('{0} -NoLogo -NoProfile -NoExit -Command "try {{ Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2} -ErrorAction Stop; if ((Get-PSReadLineOption).HistorySavePath -cne ''{1}'' -or (Get-PSReadLineOption).HistorySaveStyle -ne ''SaveAtExit'') {{ exit 1 }} }} catch {{ exit 1 }}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
             $Exe, $historyPath, $ExtraOptions, $integration)
     }
 
-    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @(), [int] $Cols = 80, [int] $Rows = 22) {
+    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @()) {
         $shellCommand = switch ($Shell) {
             'cmd' { 'cmd.exe' }
             'powershell' { Get-SyncPowerShellCommand 'powershell.exe' $Name $PSReadLineOptions $History }
@@ -527,8 +532,8 @@ if ($Inner) {
             'quit-after-last-window-closed = true'
             'auto-update = off'
             'font-size = 12'
-            "window-width = $Cols"
-            "window-height = $Rows"
+            'window-width = 80'
+            'window-height = 22'
             'working-directory = C:\'
             "command = $shellCommand"
         )
@@ -539,7 +544,7 @@ if ($Inner) {
         [IO.File]::WriteAllLines($configPath, [string[]]$config, (New-Object System.Text.UTF8Encoding $false))
         # The shared composer adds the Job Object containment, a private
         # single-instance class per scenario, and nothing else.
-        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" })) +
+        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" }) -UseConfiguredCommand) +
             @("`"--config-file=$configPath`"")
         $process = [NocttyConptySyncNative]::StartOnDesktop($script:Exe, ($arguments -join ' '), $script:Work, $DesktopName)
         $ctx = [pscustomobject]@{
@@ -667,6 +672,21 @@ if ($Inner) {
         Wait-SyncCondition -Description 'left the alternate screen' -Condition { -not (((Read-SyncNoctty $Ctx.Surface) -join "`n").Contains('ALT SCREEN')) }
     }
 
+    # Open a split below the pane, wait for its shell, close it again, and
+    # wait for the grid to give the rows back.
+    function Invoke-SyncSplitAndClose($Ctx) {
+        $before = Read-SyncConpty $Ctx.ShellPid
+        Send-SyncBinding $Ctx 'new_split:down'
+        Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 2 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
+        $other = @(Get-SyncSurfaces $Ctx | Where-Object { $_ -ne $Ctx.Surface })[0]
+        Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $Ctx).Count -eq 2 }
+        Start-Sleep -Milliseconds 500
+        Send-SyncBinding $Ctx 'close_surface' $other
+        Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 1 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -eq $before.Rows } 'rows back')
+    }
+
     function Get-SyncVim {
         $vim = Get-Command vim.exe -ErrorAction Ignore | Select-Object -First 1
         if ($vim) { return $vim.Source }
@@ -765,19 +785,7 @@ if ($Inner) {
             Name = 'split-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
             Description = 'open a split below and close it again'
             Setup = { param($c) Invoke-SyncFill $c }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'maximize-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
@@ -816,19 +824,7 @@ if ($Inner) {
                 Send-SyncText $c.Surface 'Get-Help about_P'
                 Wait-SyncText $c 'about_Providers'
             }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'listview-narrow-pwsh'; Shell = 'pwsh'; Expect = 'sync'; Finding = 'control'
@@ -1203,3 +1199,7 @@ $passCount = @($results | Where-Object Status -eq 'PASS').Count
 $xfailCount = @($results | Where-Object Status -eq 'XFAIL').Count
 $skipCount = @($results | Where-Object Status -eq 'SKIP').Count
 Write-Host ("interactive-win11 conpty-sync validation: PASS (scenarios={0}, in-sync={1}, known-desync={2}, skipped={3}, evidence={4})" -f $results.Count, $passCount, $xfailCount, $skipCount, (Join-Path $runRoot 'evidence'))
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

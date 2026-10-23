@@ -260,42 +260,23 @@ pub const TerminalViewportGeometry = struct {
 };
 
 pub const PaletteListProvider = struct {
-    const Object = object.ComObject(PaletteListProvider, queryObject, releaseObject);
+    const Object = object.ComObject(PaletteListProvider, query, object.destroyOnLastRelease(PaletteListProvider));
 
-    fn queryObject(self: *PaletteListProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *PaletteListProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
         {
             out.* = @ptrCast(&self.base);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
+        } else if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
             out.* = @ptrCast(&self.fragment_root);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
+        } else if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
             out.* = @ptrCast(&self.fragment);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_ISelectionProvider)) {
+        } else if (iidEqual(iid, &com.IID_ISelectionProvider)) {
             out.* = @ptrCast(&self.selection_iface);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        return com.E_NOINTERFACE;
-    }
-
-    fn releaseObject(self: *PaletteListProvider) u32 {
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
+        } else return com.E_NOINTERFACE;
+        _ = self.refcount.fetchAdd(1, .monotonic);
+        return com.S_OK;
     }
 
     base: com.IRawElementProviderSimple,
@@ -1058,15 +1039,15 @@ pub const settings_section_count = 7;
 /// Stable provider for native STATIC controls that this custom settings
 /// window otherwise exposes as generic Panes through the system bridge.
 pub const SettingsControlProvider = struct {
-    const Object = object.ComObject(SettingsControlProvider, queryObject, releaseObject);
+    const Object = object.ComObject(SettingsControlProvider, query, release);
 
-    fn queryObject(self: *SettingsControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *SettingsControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
         {
             out.* = @ptrCast(&self.base);
-        } else if ((self.role == .edit or self.role == .combo_box) and iidEqual(iid, &com.IID_IValueProvider)) {
+        } else if (self.role.hasValue() and iidEqual(iid, &com.IID_IValueProvider)) {
             out.* = @ptrCast(&self.value_iface);
         } else if (self.role == .button and iidEqual(iid, &com.IID_IInvokeProvider)) {
             out.* = @ptrCast(&self.invoke_iface);
@@ -1079,7 +1060,7 @@ pub const SettingsControlProvider = struct {
         return com.S_OK;
     }
 
-    fn releaseObject(self: *SettingsControlProvider) u32 {
+    fn release(self: *SettingsControlProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
             if (self.labeled_by) |label| _ = label.vtbl.Release(label);
@@ -1104,6 +1085,11 @@ pub const SettingsControlProvider = struct {
         /// so its children read as children of the window, as they did
         /// before the viewport existed.
         layout_pane,
+
+        /// Edits and combo boxes expose `IValueProvider`.
+        fn hasValue(self: Role) bool {
+            return self == .edit or self == .combo_box;
+        }
     };
 
     base: com.IRawElementProviderSimple,
@@ -1120,6 +1106,8 @@ pub const SettingsControlProvider = struct {
     hwnd: com.HWND,
     role: Role,
     name: ?[]const u8,
+    /// Static descriptor text; assigned before publishing the provider.
+    help_text: []const u8 = "",
     /// The element that names this one (`UIA_LabeledByPropertyId`). Holds
     /// a reference, released with this provider.
     labeled_by: ?*com.IRawElementProviderSimple = null,
@@ -1189,6 +1177,8 @@ pub const SettingsControlProvider = struct {
     const CB_SHOWDROPDOWN: u32 = 0x014F;
     const CB_GETDROPPEDSTATE: u32 = 0x0157;
     const CB_FINDSTRINGEXACT: u32 = 0x0158;
+    const BN_CLICKED: u16 = 0;
+    const CBN_SELCHANGE: u16 = 1;
 
     pub fn create(
         alloc: std.mem.Allocator,
@@ -1212,7 +1202,7 @@ pub const SettingsControlProvider = struct {
             .disconnected = std.atomic.Value(bool).init(false),
             .viewport_fully_clipped = std.atomic.Value(bool).init(false),
         };
-        if (role == .check_box) self.last_toggle = @intCast(SendMessageW(hwnd, BM_GETCHECK, 0, 0));
+        if (role == .check_box) self.last_toggle = self.toggleState();
         if (role == .combo_box) self.last_selection = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
         return self;
     }
@@ -1331,23 +1321,18 @@ pub const SettingsControlProvider = struct {
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.isText()) return com.S_OK;
-        if ((self.role == .edit or self.role == .combo_box) and pattern_id == constants.UIA_ValuePatternId) {
-            out.* = @ptrCast(&self.value_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .button and pattern_id == constants.UIA_InvokePatternId) {
-            out.* = @ptrCast(&self.invoke_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .check_box and pattern_id == constants.UIA_TogglePatternId) {
-            out.* = @ptrCast(&self.toggle_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .combo_box and pattern_id == constants.UIA_ExpandCollapsePatternId) {
-            out.* = @ptrCast(&self.expand_iface);
+        const pattern: ?*com.IUnknown = if (self.role.hasValue() and pattern_id == constants.UIA_ValuePatternId)
+            @ptrCast(&self.value_iface)
+        else if (self.role == .button and pattern_id == constants.UIA_InvokePatternId)
+            @ptrCast(&self.invoke_iface)
+        else if (self.role == .check_box and pattern_id == constants.UIA_TogglePatternId)
+            @ptrCast(&self.toggle_iface)
+        else if (self.role == .combo_box and pattern_id == constants.UIA_ExpandCollapsePatternId)
+            @ptrCast(&self.expand_iface)
+        else
+            null;
+        if (pattern) |provider| {
+            out.* = provider;
             _ = AddRef(&self.base);
             return com.S_OK;
         }
@@ -1388,18 +1373,22 @@ pub const SettingsControlProvider = struct {
                     out.* = com.VARIANT.fromBstr(bstr);
                 }
             },
-            constants.UIA_ValueValuePropertyId => if (self.role == .edit or self.role == .combo_box) {
+            constants.UIA_HelpTextPropertyId => if (self.help_text.len != 0) {
+                const bstr = allocBstrFromUtf8(self.alloc, self.help_text) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_ValueValuePropertyId => if (self.role.hasValue()) {
                 const value = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(value);
             },
-            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit or self.role == .combo_box) {
+            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role.hasValue()) {
                 out.* = com.VARIANT.fromBool(self.readOnly());
             },
             constants.UIA_ToggleToggleStatePropertyId => if (self.role == .check_box) {
-                out.* = com.VARIANT.fromI4(@intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0)));
+                out.* = com.VARIANT.fromI4(self.toggleState());
             },
             constants.UIA_ExpandCollapseExpandCollapseStatePropertyId => if (self.role == .combo_box) {
-                out.* = com.VARIANT.fromI4(@intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0));
+                out.* = com.VARIANT.fromI4(self.expandCollapseState());
             },
             constants.UIA_LabeledByPropertyId => if (self.labeled_by) |label| {
                 _ = label.vtbl.AddRef(label);
@@ -1445,7 +1434,7 @@ pub const SettingsControlProvider = struct {
 
     fn setValuePrecondition(provider_available: bool, role: Role, enabled: bool) com.HRESULT {
         if (!provider_available) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (role != .edit and role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         if (!enabled) return com.UIA_E_ELEMENTNOTENABLED;
         return com.S_OK;
     }
@@ -1505,7 +1494,7 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!self.role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         out.* = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
         return com.S_OK;
     }
@@ -1517,7 +1506,7 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!self.role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         out.* = @intFromBool(self.readOnly());
         return com.S_OK;
     }
@@ -1560,9 +1549,23 @@ pub const SettingsControlProvider = struct {
                 return com.S_OK;
             },
         }
-        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))), @bitCast(@intFromPtr(self.hwnd)));
+        self.notifyParent(parent, BN_CLICKED);
         self.syncNativeState(.observe);
         return com.S_OK;
+    }
+
+    /// Send the parent the WM_COMMAND notification the native control sends.
+    fn notifyParent(self: *SettingsControlProvider, parent: com.HWND, code: u16) void {
+        const control_id: usize = @intCast(GetDlgCtrlID(self.hwnd));
+        _ = SendMessageW(parent, WM_COMMAND, control_id | (@as(usize, code) << 16), @bitCast(@intFromPtr(self.hwnd)));
+    }
+
+    fn toggleState(self: *const SettingsControlProvider) i32 {
+        return @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+    }
+
+    fn expandCollapseState(self: *const SettingsControlProvider) i32 {
+        return @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
     }
 
     fn Toggle(p: *com.IToggleProvider) callconv(.winapi) com.HRESULT {
@@ -1573,7 +1576,7 @@ pub const SettingsControlProvider = struct {
         const self: *SettingsControlProvider = @fieldParentPtr("toggle_iface", p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        out.* = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+        out.* = self.toggleState();
         return com.S_OK;
     }
     fn Expand(p: *com.IExpandCollapseProvider) callconv(.winapi) com.HRESULT {
@@ -1588,7 +1591,7 @@ pub const SettingsControlProvider = struct {
         const self: *SettingsControlProvider = @fieldParentPtr("expand_iface", p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        out.* = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+        out.* = self.expandCollapseState();
         return com.S_OK;
     }
 
@@ -1597,12 +1600,12 @@ pub const SettingsControlProvider = struct {
     pub fn syncNativeState(self: *SettingsControlProvider, selection_sync: SelectionSync) void {
         if (!self.available()) return;
         if (self.role == .check_box) {
-            const next: i32 = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+            const next = self.toggleState();
             const old = self.last_toggle;
             self.last_toggle = next;
             if (old != next) events.raisePropertyChanged(&self.base, constants.UIA_ToggleToggleStatePropertyId, com.VARIANT.fromI4(old), com.VARIANT.fromI4(next));
         } else if (self.role == .combo_box) {
-            const expanded: i32 = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+            const expanded = self.expandCollapseState();
             const old_expanded = self.last_expanded;
             self.last_expanded = expanded;
             if (expanded != old_expanded) events.raisePropertyChanged(&self.base, constants.UIA_ExpandCollapseExpandCollapseStatePropertyId, com.VARIANT.fromI4(old_expanded), com.VARIANT.fromI4(expanded));
@@ -1618,9 +1621,7 @@ pub const SettingsControlProvider = struct {
                 // Settings draft together, using the same parent handler.
                 // Update the cache first: the handler may refresh controls.
                 if (selection_sync == .explicit_selection) {
-                    if (GetParent(self.hwnd)) |parent| {
-                        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))) | (@as(usize, 1) << 16), @bitCast(@intFromPtr(self.hwnd)));
-                    }
+                    if (GetParent(self.hwnd)) |parent| self.notifyParent(parent, CBN_SELCHANGE);
                 }
                 events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ValueValuePropertyId);
             }
@@ -1653,16 +1654,7 @@ pub fn returnSettingsControlProvider(
 /// The section providers retain this object; it only borrows their pointers while
 /// attached, so teardown cannot form a COM reference cycle.
 pub const SettingsSectionGroupProvider = struct {
-    const Object = object.ComObject(SettingsSectionGroupProvider, queryInterface, releaseObject);
-
-    fn releaseObject(self: *SettingsSectionGroupProvider) u32 {
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    const Object = object.ComObject(SettingsSectionGroupProvider, query, object.destroyOnLastRelease(SettingsSectionGroupProvider));
 
     base: com.IRawElementProviderSimple,
     selection_iface: com.ISelectionProvider,
@@ -1752,7 +1744,7 @@ pub const SettingsSectionGroupProvider = struct {
         return !self.detached.load(.acquire) and IsWindow(self.hwnd) != 0;
     }
 
-    fn queryInterface(
+    fn query(
         self: *SettingsSectionGroupProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -1919,9 +1911,9 @@ pub const SettingsSectionMarker = enum(u8) {
 /// The system UIA bridge reports these push-like BUTTON HWNDs as generic Panes,
 /// so Narrator otherwise loses both their radio role and selection semantics.
 pub const SettingsSectionProvider = struct {
-    const Object = object.ComObject(SettingsSectionProvider, queryInterface, releaseObject);
+    const Object = object.ComObject(SettingsSectionProvider, query, release);
 
-    fn releaseObject(self: *SettingsSectionProvider) u32 {
+    fn release(self: *SettingsSectionProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
             _ = SettingsSectionGroupProvider.Release(&self.container.base);
@@ -2036,7 +2028,7 @@ pub const SettingsSectionProvider = struct {
         return !self.detached.load(.acquire) and IsWindow(self.hwnd) != 0;
     }
 
-    fn queryInterface(
+    fn query(
         self: *SettingsSectionProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -2249,9 +2241,9 @@ pub const ChromeRangeValue = struct {
 /// creation; live names, selection, toggles, and scrollbar values are queried
 /// from their owner only while the provider remains attached.
 pub const ChromeControlProvider = struct {
-    const Object = object.ComObject(ChromeControlProvider, queryObject, releaseObject);
+    const Object = object.ComObject(ChromeControlProvider, query, object.destroyOnLastRelease(ChromeControlProvider));
 
-    fn queryObject(self: *ChromeControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *ChromeControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) {
             out.* = @ptrCast(&self.base);
@@ -2272,15 +2264,6 @@ pub const ChromeControlProvider = struct {
         } else return com.E_NOINTERFACE;
         _ = AddRef(&self.base);
         return com.S_OK;
-    }
-
-    fn releaseObject(self: *ChromeControlProvider) u32 {
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
     }
 
     base: com.IRawElementProviderSimple,
@@ -2383,7 +2366,7 @@ pub const ChromeControlProvider = struct {
     }
 
     fn TabNavigate(p: *com.IRawElementProviderFragment, direction: i32, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         // UIA supplies HWND parent/siblings through the host provider.
@@ -2398,7 +2381,7 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabBounds(p: *com.IRawElementProviderFragment, out: *com.UiaRect) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = .{ .left = 0, .top = 0, .width = 0, .height = 0 };
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         var rect: RECT = undefined;
@@ -2415,13 +2398,13 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabSetFocus(p: *com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         _ = SetFocus(self.hwnd);
         return com.S_OK;
     }
     fn TabFragmentRoot(p: *com.IRawElementProviderFragment, out: *?*com.IRawElementProviderFragmentRoot) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         _ = AddRef(&self.base);
@@ -2429,19 +2412,18 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabFromPoint(p: *com.IRawElementProviderFragmentRoot, x: f64, y: f64, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        const self = fromFragmentRoot(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.closeBounds()) |rect| {
-            if (x >= rect.left and x < rect.left + rect.width and y >= rect.top and y < rect.top + rect.height)
-                return TabNavigate(&self.fragment, com.NavigateDirection_FirstChild, out);
+            if (rect.contains(x, y)) return TabNavigate(&self.fragment, com.NavigateDirection_FirstChild, out);
         }
         _ = AddRef(&self.base);
         out.* = &self.fragment;
         return com.S_OK;
     }
     fn TabFocus(p: *com.IRawElementProviderFragmentRoot, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        const self = fromFragmentRoot(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (hwndHasKeyboardFocus(self.hwnd)) {
@@ -2591,6 +2573,12 @@ pub const ChromeControlProvider = struct {
     }
     fn fromSelectionItem(p: *com.ISelectionItemProvider) *ChromeControlProvider {
         return @fieldParentPtr("selection_item_iface", p);
+    }
+    fn fromFragment(p: *com.IRawElementProviderFragment) *ChromeControlProvider {
+        return @fieldParentPtr("fragment", p);
+    }
+    fn fromFragmentRoot(p: *com.IRawElementProviderFragmentRoot) *ChromeControlProvider {
+        return @fieldParentPtr("fragment_root", p);
     }
 
     const QueryInterface = Object.Interface("base").QueryInterface;
@@ -2891,6 +2879,7 @@ pub const ChromeControlProvider = struct {
 /// all owner callbacks. Instances share a stable runtime ID, not a cached BSTR.
 pub const TabCloseProvider = struct {
     const Object = object.ComObject(TabCloseProvider, query, release);
+    const runtime_id_tag: i32 = 0x54434C; // 'TCL'
 
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
@@ -2975,9 +2964,6 @@ pub const TabCloseProvider = struct {
     const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
     const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
 
-    fn addRef(self: *TabCloseProvider) u32 {
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
     pub const AddRef = Object.Interface("base").AddRef;
     const FragmentAddRef = Object.Interface("fragment").AddRef;
     const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
@@ -3015,7 +3001,7 @@ pub const TabCloseProvider = struct {
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (pattern_id != constants.UIA_InvokePatternId) return com.S_OK;
         out.* = @ptrCast(&self.invoke_iface);
-        _ = self.addRef();
+        _ = AddRef(&self.base);
         return com.S_OK;
     }
 
@@ -3074,10 +3060,8 @@ pub const TabCloseProvider = struct {
         if (direction == com.NavigateDirection_Parent) {
             out.* = &self.parent.fragment;
             _ = ChromeControlProvider.AddRef(&self.parent.base);
-            return com.S_OK;
         }
         return com.S_OK; // The close button is the tab's only child.
-
     }
 
     pub fn GetRuntimeId(
@@ -3087,7 +3071,7 @@ pub const TabCloseProvider = struct {
         const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return object.runtimeId(&.{ com.UiaAppendRuntimeId, 0x54434C, @bitCast(@as(u32, @truncate(self.parent.state.tag))) }, out);
+        return object.runtimeId(&.{ com.UiaAppendRuntimeId, runtime_id_tag, @bitCast(@as(u32, @truncate(self.parent.state.tag))) }, out);
     }
 
     pub fn GetBoundingRectangle(
@@ -3253,7 +3237,7 @@ pub fn returnChromeControlProvider(
 }
 
 pub const TerminalProvider = struct {
-    const Object = object.ComObject(TerminalProvider, queryInterface, release);
+    const Object = object.ComObject(TerminalProvider, query, release);
 
     base: com.IRawElementProviderSimple,
     value_iface: com.IValueProvider,
@@ -3373,7 +3357,7 @@ pub const TerminalProvider = struct {
 
     const ValueQueryInterface = Object.Interface("value_iface").QueryInterface;
 
-    fn queryInterface(
+    fn query(
         self: *TerminalProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -3968,9 +3952,9 @@ pub const TerminalProvider = struct {
 };
 
 const TerminalTextRangeProvider = struct {
-    const Object = object.ComObject(TerminalTextRangeProvider, queryObject, releaseObject);
+    const Object = object.ComObject(TerminalTextRangeProvider, query, release);
 
-    fn queryObject(self: *TerminalTextRangeProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *TerminalTextRangeProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_ITextRangeProvider))
@@ -3982,7 +3966,7 @@ const TerminalTextRangeProvider = struct {
         return com.E_NOINTERFACE;
     }
 
-    fn releaseObject(self: *TerminalTextRangeProvider) u32 {
+    fn release(self: *TerminalTextRangeProvider) u32 {
         const prev = self.refcount.fetchSub(1, .acq_rel);
         if (prev == 1) {
             self.snapshot.release();
@@ -4266,6 +4250,12 @@ const TerminalTextRangeProvider = struct {
         return com.S_OK;
     }
 
+    /// Report no rectangles, as an empty array rather than a null one.
+    fn noRectangles(out: *?*com.SAFEARRAY) com.HRESULT {
+        out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+        return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+    }
+
     fn GetBoundingRectangles(
         self_base: *com.ITextRangeProvider,
         out: *?*com.SAFEARRAY,
@@ -4273,22 +4263,17 @@ const TerminalTextRangeProvider = struct {
         const self = fromBase(self_base);
         out.* = null;
         if (self.parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        var geometry = self.geometry orelse {
-            out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-            return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
-        };
+        var geometry = self.geometry orelse return noRectangles(out);
         var row_shift: i64 = 0;
         if (self.parent.state.current_viewport) |current_viewport| {
             const current = current_viewport(self.parent.state.ctx) catch |err| {
                 if (err == error.ElementNotAvailable) return com.UIA_E_ELEMENTNOTAVAILABLE;
-                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+                return noRectangles(out);
             };
             if (current == null or geometry.row_numbering == null or
                 !std.meta.eql(geometry.row_numbering.?, current.?.row_numbering))
             {
-                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+                return noRectangles(out);
             }
             const live = current.?;
             row_shift = @as(i64, @intCast(geometry.viewport_y)) - @as(i64, @intCast(live.viewport_y));
@@ -4300,10 +4285,7 @@ const TerminalTextRangeProvider = struct {
             geometry.origin_y = live.origin_y;
         }
         var screen_origin: POINT = .{ .x = 0, .y = 0 };
-        if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) {
-            out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-            return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
-        }
+        if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) return noRectangles(out);
 
         const capacity = @as(usize, geometry.viewport_rows) * 4;
         const values = self.alloc.alloc(f64, capacity) catch return com.E_OUTOFMEMORY;
@@ -7910,24 +7892,7 @@ test "SettingsControlProvider exposes ValueProvider for edits and combos" {
 }
 
 test "SettingsControlProvider layout pane stays out of the control and content views" {
-    const win32 = struct {
-        extern "user32" fn CreateWindowExW(
-            dwExStyle: u32,
-            lpClassName: [*:0]const u16,
-            lpWindowName: [*:0]const u16,
-            dwStyle: u32,
-            x: i32,
-            y: i32,
-            nWidth: i32,
-            nHeight: i32,
-            hWndParent: ?com.HWND,
-            hMenu: ?*anyopaque,
-            hInstance: ?*anyopaque,
-            lpParam: ?*anyopaque,
-        ) callconv(.winapi) ?com.HWND;
-        extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
-        extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
-    };
+    const win32 = @import("../win32/sys.zig");
     const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
     const hwnd = win32.CreateWindowExW(
         0,
@@ -8861,24 +8826,11 @@ test "SettingsSectionProvider retains its selection container without a cycle" {
 }
 
 const settings_provider_windows = struct {
-    extern "user32" fn CreateWindowExW(
-        dwExStyle: u32,
-        lpClassName: [*:0]const u16,
-        lpWindowName: [*:0]const u16,
-        dwStyle: u32,
-        x: i32,
-        y: i32,
-        nWidth: i32,
-        nHeight: i32,
-        hWndParent: ?com.HWND,
-        hMenu: ?*anyopaque,
-        hInstance: ?*anyopaque,
-        lpParam: ?*anyopaque,
-    ) callconv(.winapi) ?com.HWND;
-    extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+    const sys = @import("../win32/sys.zig");
+    const DestroyWindow = sys.DestroyWindow;
 
     fn create(comptime class: []const u8) !com.HWND {
-        return CreateWindowExW(
+        return sys.CreateWindowExW(
             0,
             std.unicode.utf8ToUtf16LeStringLiteral(class),
             std.unicode.utf8ToUtf16LeStringLiteral(""),

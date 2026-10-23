@@ -1,13 +1,15 @@
 /* noctty.com
-   Dark is the default because the use scene is a developer at a terminal,
-   often at night. Light ("dawn") is a first-class state, not a fallback. */
+   The page is chrome and the terminal is the content. Everything outside a
+   terminal window is neutral (the shadcn zinc scale); the only color on the
+   site is terminal output. Light and dark follow the visitor's system until
+   they pick one with the toggle. */
 
 /* fonts */
 
 @font-face {
-  font-family: "Space Grotesk";
-  src: url("assets/fonts/space-grotesk.woff2") format("woff2-variations");
-  font-weight: 300 700;
+  font-family: "Geist";
+  src: url("assets/fonts/geist.woff2") format("woff2-variations");
+  font-weight: 400 600;
   font-style: normal;
   font-display: swap;
 }
@@ -23,72 +25,39 @@
 /* tokens */
 
 :root {
-  color-scheme: dark;
+  color-scheme: light dark;
 
-  --display: "Space Grotesk", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
-  --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --mono: "JetBrains Mono Web", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-sans: "Geist", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Web", "Cascadia Mono", ui-monospace, Consolas, monospace;
 
-  --ink-950: #05060d;
-  --ink-900: #090b16;
-  --ink-850: #0d1020;
-  --ink-800: #131730;
-
-  --moon: #f2efe4;
-  --moon-2: #c2c8e4;
-  --moon-3: #949bbe;
-
-  --peri: #93b8ff;
-  --peri-deep: #6d8fdb;
-  --on-accent: #08091a;
-  --aurora: #7fd6ac;
-  --ember: #f2b58a;
-
-  --line: color-mix(in srgb, var(--peri) 16%, transparent);
-  --line-soft: color-mix(in srgb, var(--peri) 9%, transparent);
-
-  --sky-veil: linear-gradient(180deg, rgba(5, 6, 13, 0) 0%, rgba(5, 6, 13, 0.58) 58%, var(--ink-950) 100%);
-
-  --space-2xs: 4px;
-  --space-xs: 8px;
-  --space-sm: 12px;
-  --space-md: 16px;
-  --space-lg: 24px;
-  --space-xl: 32px;
-  --space-2xl: 48px;
-  --space-3xl: 72px;
-  --space-4xl: 112px;
+  /* shadcn zinc: light value first, dark second */
+  --background: light-dark(#ffffff, #09090b);
+  --foreground: light-dark(#09090b, #fafafa);
+  --muted: light-dark(#f4f4f5, #18181b);
+  --muted-foreground: light-dark(#71717a, #a1a1aa);
+  --border: light-dark(#e4e4e7, #27272a);
+  --border-strong: light-dark(#d4d4d8, #3f3f46);
+  --ring: light-dark(#52525b, #a1a1aa);
+  --primary: light-dark(#18181b, #fafafa);
+  --primary-foreground: light-dark(#fafafa, #18181b);
+  --primary-hover: light-dark(#3f3f46, #d4d4d8);
+  --hover: light-dark(#f4f4f5, #18181b);
 
   --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
 
-  --shell: min(1180px, 100% - 2 * var(--space-lg));
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --shell: min(1152px, 100% - 48px);
+  --gutter: clamp(20px, 4vw, 48px);
+  --ease-out: cubic-bezier(0.25, 1, 0.5, 1);
 }
 
 [data-theme="light"] {
   color-scheme: light;
+}
 
-  --ink-950: #f7f5ed;
-  --ink-900: #fffdf7;
-  --ink-850: #fffdf7;
-  --ink-800: #efece1;
-
-  --moon: #14162f;
-  --moon-2: #3b4066;
-  --moon-3: #5b6183;
-
-  --peri: #2f52ac;
-  --peri-deep: #22407f;
-  --on-accent: #fffdf7;
-  --aurora: #10704f;
-  --ember: #8f5117;
-
-  --line: color-mix(in srgb, var(--peri) 22%, transparent);
-  --line-soft: color-mix(in srgb, var(--peri) 12%, transparent);
-
-  --sky-veil: linear-gradient(180deg, rgba(247, 245, 237, 0.55) 0%, rgba(247, 245, 237, 0.9) 60%, var(--ink-950) 100%);
+[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 /* reset and browser surfaces */
@@ -102,15 +71,17 @@
 html {
   -webkit-text-size-adjust: 100%;
   scroll-behavior: smooth;
+  scroll-padding-top: 72px;
 }
 
 body {
   margin: 0;
-  background: var(--ink-950);
-  color: var(--moon);
-  font-family: var(--sans);
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
   font-size: 16px;
   line-height: 1.6;
+  font-feature-settings: "ss01", "ss03";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizelegibility;
 }
@@ -118,28 +89,26 @@ body {
 h1,
 h2,
 h3 {
-  font-family: var(--display);
-  font-weight: 600;
-  letter-spacing: -0.03em;
-  line-height: 1.04;
   margin: 0;
+  font-weight: 500;
   text-wrap: balance;
 }
 
 p {
   margin: 0;
+  text-wrap: pretty;
 }
 
 a {
-  color: var(--peri);
-  text-decoration-color: color-mix(in srgb, var(--peri) 40%, transparent);
-  text-underline-offset: 0.22em;
-  text-decoration-thickness: from-font;
-  transition: color 140ms var(--ease-out), text-decoration-color 140ms var(--ease-out);
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-color: var(--border-strong);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.25em;
+  transition: text-decoration-color 150ms var(--ease-out), color 150ms var(--ease-out);
 }
 
 a:hover {
-  color: var(--moon);
   text-decoration-color: currentcolor;
 }
 
@@ -150,43 +119,40 @@ svg {
 }
 
 code {
-  font-family: var(--mono);
-  font-size: 0.9em;
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+
+kbd,
+.nc-kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--muted);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  white-space: nowrap;
+  vertical-align: 0.1em;
 }
 
 ::selection {
-  background: color-mix(in srgb, var(--peri) 34%, transparent);
-  color: var(--moon);
+  background: var(--foreground);
+  color: var(--background);
 }
 
 :focus-visible {
-  outline: 2px solid var(--peri);
-  outline-offset: 3px;
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
 
 * {
-  scrollbar-color: color-mix(in srgb, var(--peri) 34%, transparent) transparent;
+  scrollbar-color: var(--border-strong) transparent;
   scrollbar-width: thin;
-}
-
-::-webkit-scrollbar {
-  width: 11px;
-  height: 11px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--peri) 26%, transparent);
-  border: 3px solid var(--ink-950);
-  border-radius: 999px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--peri) 44%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -205,16 +171,41 @@ code {
 
 /* Controls that only work once the modules load stay hidden without JS. */
 .nc-no-js .nc-theme-toggle,
-.nc-no-js .nc-install__copy,
-.nc-no-js .nc-window__motion {
+.nc-no-js .nc-copy,
+.nc-no-js .nc-demo__controls {
+  display: none;
+}
+
+/* Screenshots come in a pair; show the one for the active theme. Without a
+   chosen theme the system preference decides. */
+.nc-shot--light {
+  display: none;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .nc-shot--light {
+    display: block;
+  }
+
+  :root:not([data-theme="dark"]) .nc-shot--dark {
+    display: none;
+  }
+}
+
+[data-theme="light"] .nc-shot--light {
+  display: block;
+}
+
+[data-theme="light"] .nc-shot--dark {
   display: none;
 }
 
 /* shared */
 
-.nc-shell {
+.nc-frame {
   width: var(--shell);
   margin-inline: auto;
+  border-inline: 1px solid var(--border);
 }
 
 .nc-sr-only {
@@ -231,19 +222,19 @@ code {
 
 .nc-skip-link {
   position: absolute;
-  left: var(--space-md);
+  left: 16px;
   top: -100px;
   z-index: 100;
-  padding: var(--space-xs) var(--space-md);
-  background: var(--ink-800);
-  color: var(--moon);
-  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  background: var(--primary);
+  color: var(--primary-foreground);
   text-decoration: none;
-  transition: top 160ms var(--ease-out);
+  transition: top 150ms var(--ease-out);
 }
 
 .nc-skip-link:focus {
-  top: var(--space-md);
+  top: 12px;
 }
 
 .nc-clipboard-stage {
@@ -253,659 +244,1181 @@ code {
   opacity: 0;
 }
 
-/* topbar */
+/* header */
 
-.nc-topbar {
+.nc-header {
   position: sticky;
   top: 0;
   z-index: 40;
-  backdrop-filter: blur(14px) saturate(1.2);
-  background: color-mix(in srgb, var(--ink-950) 72%, transparent);
-  border-bottom: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--background) 86%, transparent);
+  backdrop-filter: blur(8px);
 }
 
-.nc-topbar__inner {
+.nc-header__inner {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-md);
-  height: 62px;
+  gap: 16px;
+  height: 56px;
+  padding-inline: var(--gutter);
 }
 
 .nc-wordmark {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-sm);
-  text-decoration: none;
-  color: var(--moon);
-}
-
-.nc-wordmark__text {
-  font-family: var(--display);
-  font-size: 19px;
+  gap: 9px;
+  color: var(--foreground);
+  font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.02em;
+  text-decoration: none;
 }
 
 .nc-nav {
   display: flex;
   align-items: center;
-  gap: var(--space-lg);
+  gap: 4px;
 }
 
 .nc-nav__link {
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: var(--muted-foreground);
   font-size: 14px;
-  color: var(--moon-2);
   text-decoration: none;
+  transition: color 150ms var(--ease-out), background-color 150ms var(--ease-out);
 }
 
 .nc-nav__link:hover {
-  color: var(--moon);
+  color: var(--foreground);
+  background: var(--hover);
 }
 
-@media (max-width: 720px) {
+@media (max-width: 640px) {
   .nc-nav__link--optional {
     display: none;
   }
 }
 
+.nc-icon-button,
 .nc-theme-toggle {
   display: inline-grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   padding: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--ink-800) 70%, transparent);
-  color: var(--moon-2);
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
   cursor: pointer;
-  transition: color 140ms var(--ease-out), border-color 140ms var(--ease-out),
-    background 140ms var(--ease-out);
+  transition: color 150ms var(--ease-out), background-color 150ms var(--ease-out);
 }
 
+.nc-icon-button:hover,
 .nc-theme-toggle:hover {
-  color: var(--moon);
-  border-color: color-mix(in srgb, var(--peri) 40%, transparent);
-  background: var(--ink-800);
+  color: var(--foreground);
+  background: var(--hover);
+}
+
+.nc-theme-toggle {
+  margin-left: 4px;
+}
+
+/* buttons */
+
+.nc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 20px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 150ms var(--ease-out), border-color 150ms var(--ease-out),
+    color 150ms var(--ease-out);
+}
+
+.nc-btn--primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.nc-btn--primary:hover {
+  background: var(--primary-hover);
+}
+
+.nc-btn--outline {
+  border-color: var(--border-strong);
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.nc-btn--outline:hover {
+  background: var(--hover);
+}
+
+.nc-btn--sm {
+  height: 36px;
+  padding: 0 16px;
+  font-size: 14px;
+}
+
+.nc-btn svg {
+  flex: none;
+}
+
+/* copyable command */
+
+.nc-cmd {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 6px 0 18px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.nc-cmd__sigil {
+  flex: none;
+  color: var(--muted-foreground);
+  user-select: none;
+}
+
+.nc-cmd code {
+  flex: 1;
+  min-width: 0;
+  padding-block: 10px;
+  font-size: inherit;
+  overflow-wrap: anywhere;
+}
+
+.nc-copy {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: color 150ms var(--ease-out), background-color 150ms var(--ease-out);
+}
+
+.nc-copy:hover {
+  color: var(--foreground);
+  background: var(--background);
+}
+
+.nc-copy__icon--done {
+  display: none;
+}
+
+.nc-copy.is-copied .nc-copy__icon--copy {
+  display: none;
+}
+
+.nc-copy.is-copied .nc-copy__icon--done {
+  display: block;
+  color: var(--foreground);
+}
+
+.nc-copy.is-failed {
+  color: var(--foreground);
+  background: var(--background);
+}
+
+.nc-copy.is-failed:not(:focus-visible) {
+  outline: 1px solid var(--border-strong);
 }
 
 /* hero */
 
 .nc-hero {
-  position: relative;
-  padding-block: clamp(var(--space-2xl), 5vw, var(--space-3xl)) var(--space-2xl);
-  overflow: hidden;
-  isolation: isolate;
-}
-
-.nc-hero__sky {
-  position: absolute;
-  inset: -10% 0 auto;
-  height: 118%;
-  z-index: -2;
-  object-fit: cover;
-  width: 100%;
-  opacity: 0.92;
-}
-
-.nc-hero__veil {
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background: var(--sky-veil);
-}
-
-/* In daylight the night photograph desaturates to a gray band; drop it back
-   and let a warm dawn wash carry the hero instead. */
-[data-theme="light"] .nc-hero__sky {
-  opacity: 0.1;
-}
-
-[data-theme="light"] .nc-hero__veil {
-  background:
-    radial-gradient(90% 120% at 18% 0%, rgba(255, 214, 170, 0.5) 0%, transparent 58%),
-    var(--sky-veil);
-}
-
-.nc-hero__grid {
-  display: grid;
-  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
-  gap: clamp(var(--space-xl), 4vw, var(--space-3xl));
-  align-items: start;
-}
-
-@media (max-width: 1000px) {
-  .nc-hero__grid {
-    grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-2xl);
-  }
+  padding: clamp(56px, 9vw, 112px) var(--gutter) clamp(40px, 5vw, 56px);
 }
 
 .nc-hero__title {
-  margin-top: var(--space-lg);
-  font-size: clamp(2.9rem, 6.4vw, 5.1rem);
-  letter-spacing: -0.038em;
+  max-width: 21ch;
+  font-size: clamp(2.5rem, 1.55rem + 3.9vw, 4.4rem);
+  line-height: 1.02;
+  letter-spacing: -0.035em;
 }
 
 .nc-hero__lede {
-  margin-top: var(--space-lg);
   max-width: 54ch;
-  font-size: clamp(1.05rem, 1.5vw, 1.22rem);
-  color: var(--moon-2);
+  margin-top: 22px;
+  color: var(--muted-foreground);
+  font-size: clamp(1.06rem, 1rem + 0.3vw, 1.2rem);
+  line-height: 1.55;
 }
 
 .nc-hero__actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-sm) var(--space-md);
-  margin-top: var(--space-xl);
+  gap: 12px;
+  margin-top: 32px;
+}
+
+.nc-hero__actions .nc-cmd {
+  flex: 0 1 auto;
 }
 
 .nc-hero__meta {
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--moon-3);
+  margin-top: 16px;
+  color: var(--muted-foreground);
+  font-size: 13.5px;
 }
 
-.nc-hero__meta strong {
-  color: var(--moon-2);
-  font-weight: 500;
-}
-
-/* Secondary pages use the same hero at a single-column measure. */
-.nc-hero--page {
-  padding-block: clamp(var(--space-2xl), 6vw, var(--space-4xl)) var(--space-2xl);
-}
-
-.nc-hero__page {
-  max-width: 720px;
-}
-
-.nc-hero__page > .nc-hero__meta {
-  display: block;
-  max-width: 62ch;
-  margin-top: var(--space-lg);
-}
-
-.nc-js .nc-hero__page > * {
-  animation: nc-rise 620ms var(--ease-out) both;
-}
-
-.nc-js .nc-hero__page > :nth-child(2) {
-  animation-delay: 60ms;
-}
-
-.nc-js .nc-hero__page > :nth-child(3) {
-  animation-delay: 120ms;
-}
-
-.nc-js .nc-hero__page > :nth-child(4) {
-  animation-delay: 180ms;
-}
-
-@keyframes nc-rise {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
+@media (max-width: 560px) {
+  .nc-hero__actions {
+    flex-direction: column;
+    align-items: stretch;
   }
 
-  to {
-    opacity: 1;
-    transform: translateY(0);
+  .nc-cmd {
+    border-radius: var(--radius-lg);
   }
-}
-
-/* buttons */
-
-.nc-button {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-xs);
-  padding: 11px var(--space-lg);
-  border-radius: var(--radius-md);
-  border: 1px solid transparent;
-  font-family: var(--sans);
-  font-size: 15px;
-  font-weight: 600;
-  text-decoration: none;
-  cursor: pointer;
-  transition: background 160ms var(--ease-out), border-color 160ms var(--ease-out);
-}
-
-.nc-button--primary {
-  background: var(--peri);
-  color: var(--on-accent);
-}
-
-.nc-button--primary:hover {
-  background: var(--peri-deep);
-  color: var(--on-accent);
-}
-
-.nc-button--secondary {
-  border-color: var(--line);
-  background: color-mix(in srgb, var(--ink-800) 60%, transparent);
-  color: var(--moon);
-}
-
-.nc-button--secondary:hover {
-  border-color: color-mix(in srgb, var(--peri) 48%, transparent);
-  background: var(--ink-800);
-  color: var(--moon);
-}
-
-/* install command */
-
-.nc-install {
-  margin-top: var(--space-md);
-  border-top: 1px solid var(--line-soft);
-  padding-top: var(--space-sm);
-}
-
-.nc-install__row {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-xs);
-}
-
-.nc-install__sigil {
-  color: var(--aurora);
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.7;
-}
-
-.nc-install__command {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--moon);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.nc-install__copy {
-  display: inline-grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  flex: none;
-  margin-top: -4px;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--moon-3);
-  cursor: pointer;
-  transition: color 140ms var(--ease-out), background 140ms var(--ease-out);
-}
-
-.nc-install__copy:hover {
-  color: var(--moon);
-  background: var(--ink-800);
-}
-
-.nc-install__copy-icon--copied {
-  display: none;
-  color: var(--aurora);
-}
-
-.nc-install__copy.is-copied .nc-install__copy-icon--copy {
-  display: none;
-}
-
-.nc-install__copy.is-copied .nc-install__copy-icon--copied {
-  display: block;
-}
-
-.nc-install__copy.is-failed {
-  color: var(--ember);
-  background: color-mix(in srgb, var(--ember) 16%, transparent);
-}
-
-.nc-install__note {
-  margin-top: var(--space-xs);
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--moon-3);
-}
-
-/* terminal demo */
-
-.nc-window {
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--ink-900) 94%, transparent);
-  box-shadow: 0 24px 64px -20px rgba(0, 0, 0, 0.8);
-  overflow: hidden;
-}
-
-.nc-window__bar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  padding: 9px var(--space-sm) 9px var(--space-md);
-  border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--ink-850) 80%, transparent);
-}
-
-.nc-window__title {
-  flex: 1;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--moon-3);
-}
-
-.nc-window__motion {
-  padding: 3px 9px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--moon-3);
-  font-family: var(--mono);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.nc-window__motion:hover {
-  color: var(--moon);
-  border-color: color-mix(in srgb, var(--peri) 40%, transparent);
-}
-
-.nc-terminal__body {
-  padding: var(--space-md) var(--space-lg) var(--space-xl);
-  height: clamp(200px, 26vh, 268px);
-  overflow: auto;
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.72;
-  color: var(--moon-2);
-}
-
-.nc-terminal__body p {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.nc-terminal__prompt {
-  color: var(--aurora);
-  margin-right: var(--space-xs);
-}
-
-.nc-terminal__live {
-  color: var(--moon);
-}
-
-.nc-terminal__line--dim {
-  color: var(--moon-3);
-}
-
-.nc-caret {
-  display: inline-block;
-  width: 7px;
-  color: var(--peri);
-  animation: nc-blink 1.05s steps(1, end) infinite;
-}
-
-/* terminal.js flips data-motion when the demo is paused, scrolled away, or
-   hidden. The caret obeys it, and never blinks under reduced motion. */
-[data-nc-terminal][data-motion="paused"] .nc-caret {
-  animation: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .nc-caret {
-    animation: none;
-  }
-}
-
-@keyframes nc-blink {
-  0%,
-  49% {
-    opacity: 1;
-  }
-  50%,
-  100% {
-    opacity: 0;
-  }
-}
-
-/* release facts strip */
-
-.nc-facts {
-  border-block: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--ink-900) 55%, transparent);
-}
-
-.nc-facts__list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-sm) var(--space-xl);
-  margin-block: 0;
-  padding: var(--space-md) 0;
-  list-style: none;
-}
-
-.nc-facts__item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-xs);
-  font-size: 13px;
-  color: var(--moon-3);
-}
-
-.nc-facts__item svg {
-  flex: none;
 }
 
 /* sections */
 
 .nc-section {
-  scroll-margin-top: 78px;
-  padding-block: clamp(var(--space-xl), 4vw, var(--space-2xl));
+  padding: clamp(56px, 8vw, 96px) var(--gutter);
+  border-top: 1px solid var(--border);
 }
 
-.nc-section + .nc-section {
-  border-top: 1px solid var(--line-soft);
+.nc-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px 32px;
+  margin-bottom: clamp(32px, 4vw, 48px);
 }
 
 .nc-section__title {
   max-width: 22ch;
-  font-size: clamp(1.7rem, 3vw, 2.4rem);
+  font-size: clamp(1.75rem, 1.35rem + 1.5vw, 2.5rem);
+  line-height: 1.1;
+  letter-spacing: -0.03em;
 }
 
 .nc-section__intro {
-  max-width: 66ch;
-  margin-top: var(--space-md);
-  color: var(--moon-2);
+  max-width: 60ch;
+  margin-top: 14px;
+  color: var(--muted-foreground);
+  font-size: 1.06rem;
 }
 
-.nc-prose {
-  max-width: 66ch;
-  color: var(--moon-2);
+.nc-section > .nc-section__title + :not(.nc-section__intro),
+.nc-section > .nc-section__intro + * {
+  margin-top: clamp(28px, 4vw, 40px);
 }
 
-.nc-prose p + p,
-.nc-columns p + p {
-  margin-top: var(--space-md);
+/* demo: a scripted terminal window under the hero */
+
+.nc-demo {
+  padding: 0 var(--gutter) clamp(56px, 8vw, 96px);
+  container-type: inline-size;
 }
 
-.nc-columns {
+.nc-demo__controls {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: clamp(var(--space-lg), 4vw, var(--space-3xl));
-  margin-top: var(--space-xl);
-  color: var(--moon-2);
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
 }
 
-@media (max-width: 820px) {
-  .nc-columns {
-    grid-template-columns: minmax(0, 1fr);
+.nc-step {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  padding: 16px 16px 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  transition: color 150ms var(--ease-out);
+}
+
+.nc-step + .nc-step {
+  padding-left: 16px;
+}
+
+.nc-step::before {
+  content: "";
+  position: absolute;
+  inset: -1px 0 auto;
+  height: 1px;
+  background: var(--foreground);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+.nc-step:hover,
+.nc-step[aria-pressed="true"] {
+  color: var(--foreground);
+}
+
+.nc-step[aria-pressed="true"]::before {
+  transform: scaleX(1);
+}
+
+/* The active step's rule fills over its duration, holds where it is while
+   the demo is paused, and shows whole on a still frame. */
+[data-motion="playing"] .nc-step[aria-pressed="true"]::before,
+[data-motion="paused"] .nc-step[aria-pressed="true"]::before {
+  animation: nc-step-fill var(--nc-step-ms, 6000ms) linear both;
+}
+
+[data-motion="paused"] .nc-step[aria-pressed="true"]::before {
+  animation-play-state: paused;
+}
+
+@keyframes nc-step-fill {
+  from {
+    transform: scaleX(0);
+  }
+
+  to {
+    transform: scaleX(1);
   }
 }
 
-.nc-note {
-  margin-top: var(--space-lg);
-  padding-top: var(--space-md);
-  border-top: 1px solid var(--line-soft);
-  font-size: 14.5px;
-  color: var(--moon-3);
+.nc-step__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
 }
 
-/* app capture */
-
-.nc-figure {
-  margin: var(--space-xl) 0 0;
+.nc-step__body {
+  color: var(--muted-foreground);
+  font-size: 13.5px;
 }
 
-.nc-specimen {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--ink-900) 88%, transparent);
+.nc-step .nc-kbd {
+  transition: background-color 120ms var(--ease-out), color 120ms var(--ease-out),
+    border-color 120ms var(--ease-out);
+}
+
+/* The key the demo is "pressing" right now. */
+.nc-step .nc-kbd.is-pressed {
+  border-color: var(--foreground);
+  background: var(--foreground);
+  color: var(--background);
+}
+
+.nc-demo__motion {
+  align-self: start;
+  margin: 12px 0 0 12px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.nc-demo__motion:hover {
+  color: var(--foreground);
+  background: var(--hover);
+}
+
+.nc-demo__note {
+  margin-top: 14px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .nc-demo__controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .nc-step,
+  .nc-step + .nc-step {
+    padding: 14px 0 12px;
+  }
+
+  .nc-step + .nc-step {
+    border-top: 1px solid var(--border);
+  }
+
+  .nc-step__body {
+    display: none;
+  }
+
+  .nc-demo__motion {
+    justify-self: start;
+    margin: 4px 0 0;
+  }
+}
+
+/* terminal window: the only place on the site that carries color. It is
+   drawn from captures of the app at 100% scale (a 1200 px window, 16 px
+   JetBrains Mono): noctty's default colors in dark, GitHub Light Default in
+   light, and the chrome values sampled from the same captures. --px is one
+   pixel of that window, so the whole thing scales with its column. */
+
+.nc-term {
+  --term-bg: light-dark(#ffffff, #282c34);
+  --term-fg: light-dark(#1f2328, #ffffff);
+  --term-dim: light-dark(#57606a, #666666);
+  --term-yellow: light-dark(#4d2d00, #f0c674);
+  --term-bright-yellow: light-dark(#633c01, #e7c547);
+  --term-green: light-dark(#116329, #b5bd68);
+  --term-cyan: light-dark(#1b7c83, #8abeb7);
+  --term-red: light-dark(#cf222e, #cc6666);
+  --term-cursor: light-dark(#0969da, #ffffff);
+
+  --chrome-font: "Segoe UI Variable Text", "Segoe UI", var(--font-sans);
+  --chrome-strip: light-dark(#f3f3f3, #202020);
+  --chrome-line: light-dark(#d1d1d1, #303030);
+  --chrome-tab: light-dark(#f6f6f6, #242426);
+  --chrome-tab-border: light-dark(#c3c3c3, #38383a);
+  --chrome-tab-active: light-dark(#ffffff, #323236);
+  --chrome-tab-active-border: light-dark(#6872a3, #5e6ca1);
+  --chrome-underline: #6872a3;
+  --chrome-text: light-dark(#606060, #9e9ea4);
+  --chrome-text-strong: light-dark(#1b1b1b, #dcdce0);
+  --chrome-accent: light-dark(#0078d4, #749ce0);
+  --chrome-accent-strong: light-dark(#005a9e, #749ce0);
+  --chrome-divider: light-dark(#d1d1d1, #3a3a3a);
+  --bar-bg: light-dark(#f5f5f5, #1f1f22);
+  --bar-input: light-dark(#ffffff, #141416);
+  --bar-button: light-dark(#f5f5f5, #242426);
+  --bar-button-border: light-dark(#b4b4b4, #444448);
+  --list-bg: light-dark(#f9f9f9, #1a1a1c);
+  --list-selected: light-dark(#cce4f7, #323c52);
+
+  --term-font-size: clamp(8px, 1.3333cqi, 16px);
+  --px: calc(var(--term-font-size) / 16);
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  aspect-ratio: 1200 / 500;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--term-bg);
+  color: var(--term-fg);
+  font-family: var(--font-mono);
+  font-size: var(--term-font-size);
+  line-height: 1.3333;
+  transition: opacity 180ms var(--ease-out), transform 180ms var(--ease-out);
+}
+
+.nc-term.is-closed {
+  opacity: 0;
+  transform: scale(0.985);
+}
+
+/* On a narrow column a fixed height keeps the window readable without
+   letting the aspect ratio push it wider than the page. */
+@container (max-width: 640px) {
+  .nc-term {
+    --term-font-size: 10px;
+
+    aspect-ratio: auto;
+    height: 320px;
+  }
+}
+
+.nc-term__bar {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  height: calc(40 * var(--px));
+  border-bottom: 1px solid var(--chrome-line);
+  background: var(--chrome-strip);
+  color: var(--chrome-text);
+  font-family: var(--chrome-font);
+  font-size: calc(13 * var(--px));
+  line-height: 1;
+}
+
+.nc-term__tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: calc(1 * var(--px));
+  padding: calc(3 * var(--px)) 0 0 calc(1 * var(--px));
+}
+
+.nc-term__tab {
+  position: relative;
+  display: flex;
+  flex: 0 1 calc(220 * var(--px));
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 calc(22 * var(--px));
+  border: 1px solid var(--chrome-tab-border);
+  border-bottom: 0;
+  border-radius: calc(3 * var(--px)) calc(3 * var(--px)) 0 0;
+  background: var(--chrome-tab);
+  white-space: nowrap;
+}
+
+.nc-term__tab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nc-term__tab.is-active {
+  border-color: var(--chrome-tab-active-border);
+  background: var(--chrome-tab-active);
+}
+
+.nc-term__tab.is-active::after {
+  content: "";
+  position: absolute;
+  inset: auto -1px calc(-1 * var(--px)) -1px;
+  height: calc(2 * var(--px));
+  background: var(--chrome-underline);
+}
+
+.nc-term__close {
+  position: absolute;
+  right: calc(9 * var(--px));
+  width: calc(7 * var(--px));
+  height: calc(7 * var(--px));
+}
+
+.nc-term__tools,
+.nc-term__caption {
+  display: flex;
+  flex: none;
+}
+
+.nc-term__tools span,
+.nc-term__caption span {
+  display: grid;
+  place-items: center;
+  width: calc(46 * var(--px));
+}
+
+.nc-term__tools span {
+  width: calc(37 * var(--px));
+}
+
+.nc-term__tools svg,
+.nc-term__caption svg {
+  width: calc(10 * var(--px));
+  height: calc(10 * var(--px));
+}
+
+/* The command bar docks under the tab strip and pushes the panes down. */
+
+.nc-cmdbar {
+  flex: none;
+  padding: calc(4 * var(--px)) calc(8 * var(--px)) calc(5 * var(--px));
+  border-bottom: 1px solid var(--chrome-line);
+  background: var(--bar-bg);
+  color: var(--chrome-text-strong);
+  font-family: var(--chrome-font);
+  font-size: calc(13 * var(--px));
+  line-height: 1.3;
+}
+
+.nc-cmdbar[hidden] {
+  display: none;
+}
+
+.nc-cmdbar__row {
+  display: grid;
+  grid-template-columns: calc(104 * var(--px)) minmax(0, 1fr) calc(78 * var(--px));
+  gap: calc(10 * var(--px));
+  align-items: center;
+}
+
+.nc-cmdbar__label {
+  padding-left: calc(8 * var(--px));
+  border-left: calc(2 * var(--px)) solid var(--chrome-accent-strong);
+  color: var(--chrome-accent-strong);
+  white-space: nowrap;
+}
+
+.nc-cmdbar__input {
+  display: flex;
+  align-items: center;
+  height: calc(22 * var(--px));
+  padding: 0 calc(16 * var(--px));
+  border: 1px solid var(--chrome-accent-strong);
+  background: var(--bar-input);
+  font-size: calc(11.5 * var(--px));
+}
+
+.nc-cmdbar__caret {
+  display: inline-block;
+  width: 1px;
+  height: 1.1em;
+  margin-left: 1px;
+  background: currentcolor;
+}
+
+.nc-cmdbar__close {
+  display: grid;
+  place-items: center;
+  height: calc(22 * var(--px));
+  border: 1px solid var(--bar-button-border);
+  background: var(--bar-button);
+}
+
+.nc-cmdbar__status {
+  min-height: 1.3em;
+  margin-top: calc(3 * var(--px));
+  padding-left: calc(10 * var(--px));
+  border-left: calc(2 * var(--px)) solid var(--chrome-accent-strong);
+  color: var(--chrome-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The results drop over the panes, as the app's list does. */
+
+.nc-term__body {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.nc-cmdlist {
+  position: absolute;
+  inset: 0 calc(12 * var(--px)) auto calc(131 * var(--px));
+  z-index: 2;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--list-bg);
+  color: var(--chrome-text-strong);
+  font-family: var(--chrome-font);
+  font-size: calc(13 * var(--px));
+}
+
+.nc-cmdlist[hidden] {
+  display: none;
+}
+
+.nc-cmdlist li {
+  display: grid;
+  grid-template-columns: calc(200 * var(--px)) minmax(0, 1fr) auto;
+  gap: calc(8 * var(--px));
+  align-items: center;
+  height: calc(36 * var(--px));
+  padding: 0 calc(12 * var(--px));
+  white-space: nowrap;
+}
+
+.nc-cmdlist li.is-selected {
+  background: var(--list-selected);
+  color: light-dark(#003e6b, #ffffff);
+}
+
+.nc-cmdlist li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nc-cmdlist li span + span {
+  color: var(--chrome-text);
+}
+
+.nc-cmdlist li.is-selected span + span {
+  color: inherit;
+}
+
+/* panes */
+
+.nc-term__panes {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.nc-term__pane {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: calc(4 * var(--px));
   overflow: hidden;
 }
 
-.nc-shot {
+.nc-term__pane[hidden] {
+  display: none;
+}
+
+/* The split divider is two pixels: the accent on the focused pane's side
+   and the plain divider on the other. */
+.nc-term__panes.is-split .nc-term__pane:first-child {
+  border-right: calc(1 * var(--px)) solid var(--chrome-divider);
+}
+
+.nc-term__panes.is-split .nc-term__pane + .nc-term__pane {
+  border-left: calc(1 * var(--px)) solid var(--chrome-divider);
+}
+
+.nc-term__panes.is-split .nc-term__pane.is-focused:first-child {
+  border-right-color: var(--chrome-accent);
+}
+
+.nc-term__panes.is-split .nc-term__pane.is-focused + .nc-term__pane {
+  border-left-color: var(--chrome-divider);
+}
+
+.nc-term__panes.is-split .nc-term__pane + .nc-term__pane.is-focused {
+  border-left-color: var(--chrome-accent);
+}
+
+.nc-term__line {
+  min-height: 1.3333em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* PSReadLine's default token colors: command, argument, parameter, number. */
+.nc-term__command {
+  color: var(--term-bright-yellow);
+}
+
+.nc-term__arg {
+  color: light-dark(#6e7781, #c5c8c6);
+}
+
+.nc-term__dim {
+  color: var(--term-dim);
+}
+
+.nc-term__num {
+  color: light-dark(#8c959f, #eaeaea);
+}
+
+.nc-term__yellow {
+  color: var(--term-yellow);
+}
+
+.nc-term__green {
+  color: var(--term-green);
+  font-weight: 700;
+}
+
+.nc-term__cyan {
+  color: var(--term-cyan);
+  font-weight: 700;
+}
+
+.nc-term__red {
+  color: var(--term-red);
+}
+
+.nc-term__cursor {
+  display: inline-block;
+  width: 0.6em;
+  height: 1.2em;
+  vertical-align: -0.2em;
+  background: var(--term-cursor);
+}
+
+.nc-term__pane:not(.is-focused) .nc-term__cursor {
+  background: transparent;
+  outline: 1px solid var(--term-cursor);
+  outline-offset: -1px;
+}
+
+/* features */
+
+/* Each feature is a short text block over a full-width capture, so the
+   terminal text in the capture stays close to its real size. */
+.nc-feature__text {
+  display: grid;
+  grid-template-columns: minmax(0, 4fr) minmax(0, 7fr);
+  gap: 12px clamp(28px, 4vw, 64px);
+  align-items: start;
+  margin-bottom: clamp(28px, 3vw, 40px);
+}
+
+.nc-feature__text .nc-feature__body:first-child {
+  margin-top: 0;
+}
+
+.nc-feature + .nc-feature {
+  margin-top: clamp(56px, 7vw, 88px);
+  padding-top: clamp(56px, 7vw, 88px);
+  border-top: 1px solid var(--border);
+}
+
+.nc-feature__title {
+  font-size: clamp(1.75rem, 1.35rem + 1.5vw, 2.5rem);
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+}
+
+.nc-feature__body {
+  margin-top: 12px;
+  color: var(--muted-foreground);
+}
+
+.nc-feature__body strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.nc-feature__body + .nc-feature__body {
+  margin-top: 12px;
+}
+
+.nc-feature__keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 20px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted-foreground);
+  font-size: 13.5px;
+}
+
+.nc-feature__keys li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nc-feature code {
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+
+.nc-figure {
+  margin: 0;
+}
+
+.nc-figure__frame {
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--muted);
+}
+
+.nc-figure__frame img {
   width: 100%;
   height: auto;
 }
 
 .nc-figure__caption {
-  margin-top: var(--space-sm);
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--moon-3);
+  margin-top: 10px;
+  color: var(--muted-foreground);
+  font-size: 13px;
 }
 
-/* three capabilities */
-
-.nc-tri {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: clamp(var(--space-lg), 3vw, var(--space-2xl));
-  margin-top: var(--space-xl);
+/* A window capture is shown no larger than the window was. */
+.nc-figure--window {
+  max-width: 960px;
 }
 
 @media (max-width: 900px) {
-  .nc-tri {
+  .nc-feature__text {
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-lg);
   }
 }
 
-.nc-tri h3,
-.nc-evidence-grid h3,
-.nc-migration-grid h3,
-.nc-verify-steps h3,
-.nc-trust-limit h3 {
-  font-size: 1.05rem;
+/* On a phone a whole window shrinks its text past reading, so show its
+   top-left corner (the left pane, the palette's titles, the Settings
+   sidebar) at a size you can read. */
+@media (max-width: 640px) {
+  .nc-figure__frame img {
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+    object-position: left top;
+  }
+
+  .nc-figure--window .nc-figure__frame img {
+    aspect-ratio: 1;
+  }
+}
+
+/* also in the box */
+
+.nc-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  list-style: none;
+}
+
+.nc-list > li {
+  padding: 24px clamp(18px, 2vw, 28px) 28px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.nc-list h3 {
+  font-size: 16px;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+
+.nc-list p {
+  margin-top: 6px;
+  color: var(--muted-foreground);
+  font-size: 14.5px;
+}
+
+.nc-list code {
+  color: var(--foreground);
+}
+
+@media (max-width: 900px) {
+  .nc-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .nc-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* built on Ghostty */
+
+.nc-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: clamp(32px, 5vw, 72px);
+}
+
+.nc-split h3 {
+  font-size: 1.15rem;
   letter-spacing: -0.02em;
 }
 
-.nc-tri p,
-.nc-evidence-grid p,
-.nc-migration-grid p,
-.nc-verify-steps p,
-.nc-trust-limit p {
-  margin-top: var(--space-xs);
-  color: var(--moon-2);
-  font-size: 15px;
+.nc-split p {
+  color: var(--muted-foreground);
 }
 
-.nc-tri code {
-  color: var(--moon);
-  overflow-wrap: anywhere;
+.nc-split h3 + p,
+.nc-split p + p {
+  margin-top: 10px;
 }
 
-/* keybindings */
-
-.nc-keys {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 clamp(var(--space-xl), 5vw, var(--space-3xl));
-  margin: var(--space-xl) 0 0;
+.nc-split p + h3 {
+  margin-top: 32px;
 }
 
-.nc-keys > div {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-md);
-  padding: 8px 0;
-  border-top: 1px solid var(--line-soft);
-}
-
-.nc-keys dt {
-  color: var(--moon-2);
-  font-size: 14px;
-}
-
-.nc-keys dd {
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--moon-3);
-  white-space: nowrap;
-}
-
-@media (max-width: 700px) {
-  .nc-keys {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-/* closing install / call to action */
-
-.nc-close__grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-  gap: clamp(var(--space-xl), 4vw, var(--space-3xl));
-  align-items: start;
-  margin-top: var(--space-xl);
+.nc-split a {
+  color: var(--foreground);
 }
 
 @media (max-width: 820px) {
-  .nc-close__grid {
+  .nc-split {
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-lg);
   }
 }
 
-.nc-code {
-  margin: 0;
-  padding: 0;
-  font-family: var(--mono);
+/* install */
+
+.nc-install {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.nc-install__row {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.32fr) minmax(0, 1fr);
+  gap: 12px 32px;
+  padding: 22px 24px;
+}
+
+.nc-install__row + .nc-install__row {
+  border-top: 1px solid var(--border);
+}
+
+.nc-install__name {
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.nc-install__name small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted-foreground);
   font-size: 13px;
-  line-height: 1.9;
-  color: var(--moon);
-  white-space: pre-wrap;
+  font-weight: 400;
+}
+
+.nc-install__steps {
+  display: grid;
+  gap: 8px;
+}
+
+.nc-install__steps .nc-cmd {
+  border-radius: var(--radius-md);
+}
+
+.nc-install__note {
+  color: var(--muted-foreground);
+  font-size: 14px;
+}
+
+.nc-install__note code {
+  color: var(--foreground);
   overflow-wrap: anywhere;
 }
 
-.nc-close__note {
-  color: var(--moon-2);
-  max-width: 46ch;
+.nc-install__meta {
+  display: grid;
+  gap: 8px;
+  margin-top: 24px;
+  color: var(--muted-foreground);
+  font-size: 14px;
 }
 
-.nc-close__note code {
-  overflow-wrap: anywhere;
+.nc-install__meta code {
+  color: var(--foreground);
 }
 
-.nc-close .nc-hero__actions {
-  margin-top: var(--space-lg);
+@media (max-width: 680px) {
+  .nc-install__row {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 18px;
+  }
 }
 
-/* trust page */
+/* footer */
+
+.nc-footer {
+  padding: 40px var(--gutter) 56px;
+  border-top: 1px solid var(--border);
+}
+
+.nc-footer__top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.nc-footer__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
+.nc-footer__links a {
+  color: var(--muted-foreground);
+  font-size: 14px;
+  text-decoration: none;
+}
+
+.nc-footer__links a:hover {
+  color: var(--foreground);
+}
+
+.nc-footer__fine {
+  max-width: 78ch;
+  margin-top: 28px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.nc-footer__fine a {
+  color: var(--foreground);
+}
+
+/* below the frame, the rails stop being useful */
+
+@media (max-width: 720px) {
+  .nc-frame {
+    width: 100%;
+    border-inline: 0;
+  }
+}
+
+/* About page */
+
+.nc-page-hero {
+  padding: clamp(56px, 9vw, 104px) var(--gutter) clamp(48px, 6vw, 72px);
+}
+
+.nc-page-hero .nc-hero__title {
+  max-width: 18ch;
+}
+
+.nc-page-hero .nc-hero__lede {
+  max-width: 62ch;
+}
+
+.nc-page-hero .nc-hero__meta {
+  max-width: 62ch;
+  margin-top: 20px;
+}
+
+.nc-page-hero .nc-hero__meta strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.nc-prose {
+  max-width: 68ch;
+  color: var(--muted-foreground);
+}
+
+.nc-prose p + p {
+  margin-top: 16px;
+}
+
+.nc-prose a,
+.nc-facts-table a,
+.nc-trust-limit a,
+.nc-evidence-grid a,
+.nc-migration-grid a,
+.nc-verify-steps a,
+.nc-section__intro a {
+  color: var(--foreground);
+}
 
 .nc-proof-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
-  gap: clamp(var(--space-xl), 6vw, var(--space-4xl));
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: clamp(32px, 6vw, 88px);
   align-items: start;
-  margin-top: var(--space-xl);
 }
 
 .nc-facts-table {
@@ -914,51 +1427,67 @@ code {
 
 .nc-facts-table > div {
   display: grid;
-  grid-template-columns: minmax(130px, 0.4fr) minmax(0, 1fr);
-  gap: var(--space-md);
-  padding: 10px 0;
-  border-top: 1px solid var(--line-soft);
+  grid-template-columns: minmax(120px, 0.38fr) minmax(0, 1fr);
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
 }
 
 .nc-facts-table > div:last-child {
-  border-bottom: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--border);
 }
 
 .nc-facts-table dt {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--moon-3);
+  color: var(--muted-foreground);
+  font-size: 13.5px;
 }
 
 .nc-facts-table dd {
   margin: 0;
-  color: var(--moon-2);
-  font-size: 14px;
+  font-size: 14.5px;
 }
 
 .nc-evidence-grid,
 .nc-migration-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: clamp(var(--space-xl), 6vw, var(--space-4xl));
-  margin-top: var(--space-xl);
+  gap: clamp(32px, 6vw, 88px);
 }
 
 .nc-evidence-grid article,
 .nc-migration-grid article {
-  padding-top: var(--space-lg);
-  border-top: 1px solid var(--line);
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+
+.nc-evidence-grid h3,
+.nc-migration-grid h3,
+.nc-verify-steps h3,
+.nc-trust-limit h3 {
+  font-size: 1.15rem;
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+}
+
+.nc-evidence-grid p,
+.nc-migration-grid p,
+.nc-verify-steps p,
+.nc-trust-limit p {
+  margin-top: 10px;
+  color: var(--muted-foreground);
+  font-size: 15.5px;
 }
 
 .nc-evidence-grid article > a,
 .nc-migration-grid article > a {
   display: inline-block;
-  margin-top: var(--space-md);
-  font-weight: 600;
+  margin-top: 16px;
+  font-size: 15px;
+  font-weight: 500;
 }
 
 .nc-verify-steps {
-  margin: var(--space-xl) 0 0;
+  margin: 0;
   padding: 0;
   list-style: none;
   counter-reset: verify-step;
@@ -967,52 +1496,44 @@ code {
 .nc-verify-steps > li {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
-  gap: clamp(var(--space-lg), 4vw, var(--space-3xl));
-  padding: var(--space-xl) 0;
-  border-top: 1px solid var(--line-soft);
+  align-items: start;
+  gap: clamp(24px, 4vw, 56px);
+  padding: 32px 0;
+  border-top: 1px solid var(--border);
   counter-increment: verify-step;
 }
 
 .nc-verify-steps h3::before {
   content: counter(verify-step) ". ";
-  font-family: var(--mono);
-  color: var(--aurora);
-  letter-spacing: 0;
-}
-
-.nc-verify-steps p + p {
-  margin-top: var(--space-sm);
+  color: var(--muted-foreground);
 }
 
 .nc-proof-code {
   margin: 0;
-  padding: var(--space-md) var(--space-lg);
+  padding: 16px 20px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--ink-900) 84%, transparent);
-  color: var(--moon);
-  font-family: var(--mono);
+  background: var(--muted);
+  color: var(--foreground);
+  font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.75;
-  overflow-x: auto;
-}
-
-[data-theme="light"] .nc-proof-code {
-  border: 1px solid var(--line-soft);
 }
 
 .nc-trust-limit {
   max-width: 78ch;
-  margin-top: var(--space-xl);
-  padding-top: var(--space-xl);
-  border-top: 1px solid var(--line);
+  margin-top: 40px;
+  padding-top: 32px;
+  border-top: 1px solid var(--border);
 }
 
 .nc-trust-limit .nc-facts-table {
-  margin-block: var(--space-lg);
+  margin-block: 24px;
 }
 
 .nc-trust-limit p + p {
-  margin-top: var(--space-md);
+  margin-top: 16px;
 }
 
 .nc-pin {
@@ -1029,86 +1550,50 @@ code {
 
   .nc-evidence-grid,
   .nc-migration-grid {
-    gap: var(--space-lg);
+    gap: 24px;
   }
 
   .nc-verify-steps > li {
-    gap: var(--space-md);
+    gap: 16px;
   }
 }
 
 @media (max-width: 560px) {
   .nc-facts-table > div {
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-2xs);
+    gap: 2px;
   }
-}
-
-/* footer */
-
-.nc-footer {
-  padding-block: var(--space-2xl) var(--space-3xl);
-  border-top: 1px solid var(--line-soft);
-}
-
-.nc-footer__top {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-lg);
-}
-
-.nc-footer__links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-lg);
-}
-
-.nc-footer__links a {
-  font-size: 14px;
-  color: var(--moon-2);
-  text-decoration: none;
-}
-
-.nc-footer__links a:hover {
-  color: var(--moon);
-}
-
-.nc-footer__fine {
-  margin-top: var(--space-xl);
-  padding-top: var(--space-lg);
-  border-top: 1px solid var(--line-soft);
-  font-size: 13px;
-  color: var(--moon-3);
-  max-width: 78ch;
-}
-
-.nc-footer__fine a {
-  color: var(--moon-2);
 }
 
 /* 404 */
 
 .nc-lost {
-  min-height: 68vh;
   display: grid;
-  place-content: center;
-  text-align: center;
-  gap: var(--space-md);
-  padding-block: var(--space-4xl);
+  justify-items: start;
+  gap: 20px;
+  min-height: calc(100svh - 57px);
+  align-content: center;
+  padding: clamp(56px, 10vw, 120px) var(--gutter);
 }
 
 .nc-lost__title {
-  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  font-size: clamp(2.2rem, 1.6rem + 2.4vw, 3.4rem);
+  line-height: 1.05;
+  letter-spacing: -0.035em;
 }
 
-.nc-lost__action {
-  margin-top: var(--space-md);
+.nc-lost .nc-term {
+  --term-font-size: 14px;
+
+  width: min(640px, 100%);
+  aspect-ratio: auto;
+}
+
+.nc-lost .nc-term__pane {
+  padding: 14px 16px;
 }
 
 .nc-lost__body {
-  color: var(--moon-2);
-  max-width: 46ch;
-  margin-inline: auto;
+  max-width: 52ch;
+  color: var(--muted-foreground);
 }

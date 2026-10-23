@@ -439,16 +439,27 @@ pub const banner_dismiss_width_base: i32 = 72;
 pub const banner_open_release_width_base: i32 = 102;
 pub const banner_install_width_base: i32 = 86;
 
+/// The widths at 96 DPI of a banner's buttons (see `HostBannerParts`), or
+/// null for a button it does not have.
+const BannerButtonWidths = struct { dismiss: ?i32 = null, primary: ?i32 = null };
+
+fn bannerButtonWidths(actions: BannerActions) BannerButtonWidths {
+    return switch (actions) {
+        .mode => .{},
+        .close => .{ .dismiss = banner_close_width_base },
+        .update => .{ .dismiss = banner_dismiss_width_base, .primary = banner_open_release_width_base },
+        .update_staged => .{ .dismiss = banner_dismiss_width_base, .primary = banner_install_width_base },
+    };
+}
+
 /// The width a banner needs for a line `text_width` pixels wide and its
 /// buttons, before the content area bounds it.
 pub fn hostBannerWidth(text_width: i32, actions: BannerActions, dpi: u32) i32 {
     const gap = scaledBy(banner_button_gap_base, dpi);
-    const buttons = switch (actions) {
-        .mode => 0,
-        .close => scaledBy(banner_close_width_base, dpi),
-        .update => scaledBy(banner_open_release_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
-        .update_staged => scaledBy(banner_install_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
-    };
+    const widths = bannerButtonWidths(actions);
+    var buttons: i32 = 0;
+    if (widths.dismiss) |base| buttons += scaledBy(base, dpi);
+    if (widths.primary) |base| buttons += scaledBy(base, dpi) + gap;
     return scaledBy(banner_text_left_base, dpi) + @max(0, text_width) + gap + buttons + gap;
 }
 
@@ -487,17 +498,15 @@ pub fn hostBannerParts(width: i32, height: i32, actions: BannerActions, dpi: u32
     const gap = scaledBy(banner_button_gap_base, dpi);
 
     var right = w - gap;
-    const dismiss_w = scaledBy(switch (actions) {
-        .mode => 0,
-        .close => banner_close_width_base,
-        .update, .update_staged => banner_dismiss_width_base,
-    }, dpi);
-    const dismiss = if (actions == .mode) null else bannerButtonRect(&right, dismiss_w, button_top, button_h, gap);
-    const primary: ?RECT = switch (actions) {
-        .close, .mode => null,
-        .update => bannerButtonRect(&right, scaledBy(banner_open_release_width_base, dpi), button_top, button_h, gap),
-        .update_staged => bannerButtonRect(&right, scaledBy(banner_install_width_base, dpi), button_top, button_h, gap),
-    };
+    const widths = bannerButtonWidths(actions);
+    const dismiss: ?RECT = if (widths.dismiss) |base|
+        bannerButtonRect(&right, scaledBy(base, dpi), button_top, button_h, gap)
+    else
+        null;
+    const primary: ?RECT = if (widths.primary) |base|
+        bannerButtonRect(&right, scaledBy(base, dpi), button_top, button_h, gap)
+    else
+        null;
     const text_left = @min(w, scaledBy(banner_text_left_base, dpi));
     return .{
         .stripe = .{ .left = 0, .top = 0, .right = @min(w, scaledBy(banner_stripe_width_base, dpi)), .bottom = h },

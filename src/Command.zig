@@ -393,21 +393,22 @@ fn startWindows(self: *Command, arena: Allocator) !void {
     };
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
-    windows.inheritable_spawn_lock.lock();
-    const created = std.os.windows.CreateProcessW(
-        application_name_w,
-        if (command_line_w) |w| w.ptr else null,
-        null,
-        null,
-        windows.TRUE,
-        flags,
-        if (env_w) |w| w.ptr else null,
-        if (cwd_w) |w| w.ptr else null,
-        @ptrCast(&startup_info_ex.StartupInfo),
-        &process_information,
-    );
-    windows.inheritable_spawn_lock.unlock();
-    try created;
+    {
+        windows.inheritable_spawn_lock.lock();
+        defer windows.inheritable_spawn_lock.unlock();
+        try std.os.windows.CreateProcessW(
+            application_name_w,
+            if (command_line_w) |w| w.ptr else null,
+            null,
+            null,
+            windows.TRUE,
+            flags,
+            if (env_w) |w| w.ptr else null,
+            if (cwd_w) |w| w.ptr else null,
+            @ptrCast(&startup_info_ex.StartupInfo),
+            &process_information,
+        );
+    }
     // Past this point a child was created. Everything below can still fail
     // and unwind through the errdefer below, which attempts to terminate it
     // — but whatever the outcome of that attempt, "no child process was

@@ -2,6 +2,7 @@
 //! bound DNS/TCP/TLS, response-head and body waits without a second update worker.
 //! Cancellation waits for HANDLE_CLOSING before freeing any callback or buffer.
 const std = @import("std");
+const builtin = @import("builtin");
 const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 const Handle = *anyopaque;
@@ -12,6 +13,27 @@ const status_read_complete = 0x00080000;
 const status_data_available = 0x00040000;
 const status_request_error = 0x00200000;
 const status_handle_closing = 0x00000800;
+
+// winhttp.h
+const access_type_no_proxy = 1;
+const flag_async = 0x10000000;
+const flag_secure = 0x00800000;
+const secure_protocol_tls1_2 = 0x00000800;
+const secure_protocol_tls1_3 = 0x00002000;
+const option_context_value = 45;
+const option_disable_feature = 63;
+const option_secure_protocols = 84;
+const option_max_response_header_size = 91;
+const disable_cookies = 0x00000001;
+const disable_redirects = 0x00000002;
+const disable_authentication = 0x00000004;
+const query_status_code = 19;
+const query_flag_number = 0x20000000;
+pub const query_content_encoding = 29;
+pub const query_location = 33;
+const error_winhttp_timeout = 12002; // WINHTTP_ERROR_BASE + 2
+const error_winhttp_header_not_found = 12150; // WINHTTP_ERROR_BASE + 150
+const error_invalid_parameter = 87; // winerror.h
 
 pub const timeout_ms: i32 = 30_000;
 pub const user_agent = "noctty-updater";
@@ -81,17 +103,13 @@ pub const Response = struct {
     status: std.http.Status,
 
     pub fn open(alloc: Allocator, uri: std.Uri, headers: []const std.http.Header) !Response {
-        return openWithTimeout(alloc, uri, headers, timeout_ms);
-    }
-
-    fn openWithTimeout(alloc: Allocator, uri: std.Uri, headers: []const std.http.Header, limit_ms: i32) !Response {
-        return openImpl(alloc, uri, headers, limit_ms, true);
+        return openImpl(alloc, uri, headers, timeout_ms, true);
     }
 
     // Only the in-module wire tests use plaintext, avoiding any certificate
     // bypass or changes to the machine's trust store for the fake feed.
     fn openImpl(alloc: Allocator, uri: std.Uri, headers: []const std.http.Header, limit_ms: i32, secure: bool) !Response {
-        if (!secure and !@import("builtin").is_test) unreachable;
+        if (!secure and !builtin.is_test) unreachable;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, if (secure) "https" else "http") or uri.user != null or uri.password != null)
             return error.InvalidUpdateUrl;
         var host_buf: [std.Uri.host_name_max]u8 = undefined;
@@ -107,19 +125,19 @@ pub const Response = struct {
         // Match the old client's direct connection: no ambient proxy, cookies,
         // automatic credentials, or automatic redirects. Certificate and host
         // validation remain WinHTTP's secure defaults; no ignore flags are set.
-        const session = WinHttpOpen(std.unicode.utf8ToUtf16LeStringLiteral(user_agent), 1, null, null, 0x10000000) orelse return failure();
+        const session = WinHttpOpen(std.unicode.utf8ToUtf16LeStringLiteral(user_agent), access_type_no_proxy, null, null, flag_async) orelse return failure();
         errdefer _ = WinHttpCloseHandle(session);
         if (WinHttpSetTimeouts(session, limit_ms, limit_ms, limit_ms, limit_ms) == 0) return failure();
         // Preserve the old TLS floor. Older Windows builds may reject TLS 1.3.
-        var protocols: u32 = 0x800 | 0x2000;
-        if (WinHttpSetOption(session, 84, &protocols, @sizeOf(u32)) == 0) {
-            if (@intFromEnum(windows.kernel32.GetLastError()) != 87) return failure();
-            protocols = 0x800;
-            if (WinHttpSetOption(session, 84, &protocols, @sizeOf(u32)) == 0) return failure();
+        var protocols: u32 = secure_protocol_tls1_2 | secure_protocol_tls1_3;
+        if (WinHttpSetOption(session, option_secure_protocols, &protocols, @sizeOf(u32)) == 0) {
+            if (@intFromEnum(windows.kernel32.GetLastError()) != error_invalid_parameter) return failure();
+            protocols = secure_protocol_tls1_2;
+            if (WinHttpSetOption(session, option_secure_protocols, &protocols, @sizeOf(u32)) == 0) return failure();
         }
         const connection = WinHttpConnect(session, host_w.ptr, uri.port orelse 443, 0) orelse return failure();
         errdefer _ = WinHttpCloseHandle(connection);
-        const request = WinHttpOpenRequest(connection, std.unicode.utf8ToUtf16LeStringLiteral("GET"), target_w.ptr, null, null, null, if (secure) 0x00800000 else 0) orelse return failure();
+        const request = WinHttpOpenRequest(connection, std.unicode.utf8ToUtf16LeStringLiteral("GET"), target_w.ptr, null, null, null, if (secure) flag_secure else 0) orelse return failure();
         const context = alloc.create(Context) catch |err| {
             _ = WinHttpCloseHandle(request);
             return err;
@@ -131,14 +149,14 @@ pub const Response = struct {
             _ = WinHttpCloseHandle(request);
         };
         var context_value = @intFromPtr(context);
-        if (WinHttpSetOption(request, 45, &context_value, @sizeOf(usize)) == 0) return failure();
+        if (WinHttpSetOption(request, option_context_value, &context_value, @sizeOf(usize)) == 0) return failure();
         const old_callback = WinHttpSetStatusCallback(request, Context.callback, status_send_complete | status_headers_available | status_read_complete | status_data_available | status_request_error | status_handle_closing, 0);
         if (old_callback != null and @intFromPtr(old_callback.?) == std.math.maxInt(usize)) return failure();
         callback_bound = true;
-        var disable: u32 = 1 | 2 | 4; // cookies, redirects, authentication
-        if (WinHttpSetOption(request, 63, &disable, @sizeOf(u32)) == 0) return failure();
+        var disable: u32 = disable_cookies | disable_redirects | disable_authentication;
+        if (WinHttpSetOption(request, option_disable_feature, &disable, @sizeOf(u32)) == 0) return failure();
         var head_limit: u32 = 8192;
-        if (WinHttpSetOption(request, 91, &head_limit, @sizeOf(u32)) == 0) return failure();
+        if (WinHttpSetOption(request, option_max_response_header_size, &head_limit, @sizeOf(u32)) == 0) return failure();
         var header_text: std.Io.Writer.Allocating = .init(alloc);
         defer header_text.deinit();
         try header_text.writer.writeAll("Accept-Encoding: gzip, deflate, identity\r\n");
@@ -157,7 +175,7 @@ pub const Response = struct {
         try context.wait(request);
         var status: u32 = 0;
         var status_len: u32 = @sizeOf(u32);
-        if (WinHttpQueryHeaders(request, 19 | 0x20000000, null, &status, &status_len, null) == 0) return failure();
+        if (WinHttpQueryHeaders(request, query_status_code | query_flag_number, null, &status, &status_len, null) == 0) return failure();
         if (status > 999) return error.InvalidHttpStatus;
         return .{ .session = session, .connection = connection, .request = request, .context = context, .allocator = alloc, .status = @enumFromInt(status) };
     }
@@ -175,14 +193,14 @@ pub const Response = struct {
         var buffer: [8192]u16 = undefined;
         var len: u32 = @sizeOf(@TypeOf(buffer));
         if (WinHttpQueryHeaders(self.request, query, null, &buffer, &len, null) == 0) {
-            if (@intFromEnum(windows.kernel32.GetLastError()) == 12150) return null;
+            if (@intFromEnum(windows.kernel32.GetLastError()) == error_winhttp_header_not_found) return null;
             return failure();
         }
         return try std.unicode.utf16LeToUtf8Alloc(alloc, buffer[0 .. len / 2]);
     }
 
     pub fn streamBody(self: *Response, alloc: Allocator, writer: *std.Io.Writer, max_bytes: u64) !void {
-        const encoding_text = try self.header(alloc, 29);
+        const encoding_text = try self.header(alloc, query_content_encoding);
         defer if (encoding_text) |text| alloc.free(text);
         const encoding: std.http.ContentEncoding = if (encoding_text) |text|
             std.http.ContentEncoding.fromString(text) orelse return error.UnsupportedCompressionMethod
@@ -245,6 +263,31 @@ pub fn streamBounded(
     }
 }
 
+test "bounded response streaming refuses an oversized body" {
+    const alloc = std.testing.allocator;
+    const body = "0123456789";
+
+    // Exactly at the cap is accepted.
+    {
+        var reader: std.Io.Reader = .fixed(body);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try streamBounded(&reader, &out.writer, body.len);
+        try std.testing.expectEqualStrings(body, out.written());
+    }
+
+    // One byte over the cap is refused.
+    {
+        var reader: std.Io.Reader = .fixed(body);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.testing.expectError(
+            error.HttpResponseTooLarge,
+            streamBounded(&reader, &out.writer, body.len - 1),
+        );
+    }
+}
+
 const BodyReader = struct {
     response: *Response,
     err: ?anyerror = null,
@@ -268,7 +311,7 @@ fn failure() error{ UpdateHttpTimeout, UpdateHttpTransportFailed } {
 }
 
 fn failureCode(code: u32) error{ UpdateHttpTimeout, UpdateHttpTransportFailed } {
-    return if (code == 12002)
+    return if (code == error_winhttp_timeout)
         error.UpdateHttpTimeout
     else
         error.UpdateHttpTransportFailed;
@@ -349,6 +392,10 @@ const FakePeer = struct {
         self.stop.timedWait(2 * std.time.ns_per_s) catch {};
     }
 
+    fn listenLoopback() !std.net.Server {
+        return (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{});
+    }
+
     fn finish(self: *FakePeer, thread: std.Thread) void {
         self.stop.set();
         // Also release accept if request setup failed before connecting.
@@ -365,23 +412,34 @@ const FakePeer = struct {
     }
 };
 
+/// `cap` is either the decoded body's length, which streams it whole, or one
+/// byte short of it, which is refused.
+fn expectBodyWithinCap(response: *Response, out: *std.Io.Writer.Allocating, contents: []const u8, cap: u64) !void {
+    if (cap == contents.len) {
+        try response.streamBody(out.allocator, &out.writer, cap);
+        try std.testing.expectEqualSlices(u8, contents, out.written());
+    } else {
+        try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(out.allocator, &out.writer, cap));
+    }
+}
+
 test "update HTTPS timeout interrupts stalled TLS and permits another request" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     for (0..2) |_| {
-        var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .tls };
+        var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = .tls };
         const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
         defer peer.finish(thread);
         var url: [256]u8 = undefined;
         var timer = try std.time.Timer.start();
-        try std.testing.expectError(error.UpdateHttpTimeout, Response.openWithTimeout(std.testing.allocator, try peer.uri(&url), &.{}, 100));
+        try std.testing.expectError(error.UpdateHttpTimeout, Response.openImpl(std.testing.allocator, try peer.uri(&url), &.{}, 100, true));
         try std.testing.expect(timer.read() < 1500 * std.time.ns_per_ms);
     }
 }
 
 test "update HTTP timeout interrupts stalled response headers and body" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     inline for (.{ .head, .body }) |mode| {
-        var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = mode };
+        var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = mode };
         const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
         defer peer.finish(thread);
         var url: [256]u8 = undefined;
@@ -401,8 +459,8 @@ test "update HTTP timeout interrupts stalled response headers and body" {
 }
 
 test "update requests send exactly one User-Agent through the production transport" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .capture };
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = .capture };
     const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
     var finished = false;
     defer if (!finished) peer.finish(thread);
@@ -426,7 +484,7 @@ test "update requests send exactly one User-Agent through the production transpo
 }
 
 test "update HTTP transport decodes gzip aliases and deflate with the decompressed cap" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const contents = "fake update metadata";
     const gzip_bytes = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x4b\xcc\x4e\x55\x28\x2d\x48\x49\x2c\x49\x55\xc8\x4d\x2d\x49\x04\x32\x12\x01\xb6\x57\x0f\xe1\x14\x00\x00\x00";
@@ -439,7 +497,7 @@ test "update HTTP transport decodes gzip aliases and deflate with the decompress
         for ([_]u64{ contents.len, contents.len - 1 }) |cap| {
             const reply = try std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case.encoding, case.bytes.len, case.bytes });
             defer alloc.free(reply);
-            var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .capture, .response = reply };
+            var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = .capture, .response = reply };
             const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
             defer peer.finish(thread);
             var url: [256]u8 = undefined;
@@ -447,18 +505,13 @@ test "update HTTP transport decodes gzip aliases and deflate with the decompress
             defer response.deinit();
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
-            if (cap == contents.len) {
-                try response.streamBody(alloc, &out.writer, cap);
-                try std.testing.expectEqualStrings(contents, out.written());
-            } else {
-                try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
-            }
+            try expectBodyWithinCap(&response, &out, contents, cap);
         }
     }
 }
 
 test "update HTTP transport decodes a large gzip body across reader boundaries" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const contents = try alloc.alloc(u8, 48 * 1024 + 17);
     defer alloc.free(contents);
@@ -484,7 +537,7 @@ test "update HTTP transport decodes a large gzip body across reader boundaries" 
     const reply = try std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ compressed.written().len, compressed.written() });
     defer alloc.free(reply);
     for ([_]usize{ contents.len, contents.len - 1 }) |cap| {
-        var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .capture, .response = reply };
+        var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = .capture, .response = reply };
         const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
         defer peer.finish(thread);
         var url: [256]u8 = undefined;
@@ -492,17 +545,12 @@ test "update HTTP transport decodes a large gzip body across reader boundaries" 
         defer response.deinit();
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        if (cap == contents.len) {
-            try response.streamBody(alloc, &out.writer, cap);
-            try std.testing.expectEqualSlices(u8, contents, out.written());
-        } else {
-            try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
-        }
+        try expectBodyWithinCap(&response, &out, contents, cap);
     }
 }
 
 test "update HTTP transport decodes fragmented chunked replies across reader boundaries" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const contents = try alloc.alloc(u8, 48 * 1024 + 17);
     defer alloc.free(contents);
@@ -521,7 +569,7 @@ test "update HTTP transport decodes fragmented chunked replies across reader bou
     try reply.writer.writeAll("0\r\n\r\n");
     for ([_]usize{ contents.len, contents.len - 1 }) |cap| {
         var peer: FakePeer = .{
-            .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}),
+            .server = try FakePeer.listenLoopback(),
             .mode = .capture,
             .response = reply.written(),
             // Split chunk lengths, CRLFs and payloads across separate writes.
@@ -536,21 +584,16 @@ test "update HTTP transport decodes fragmented chunked replies across reader bou
         defer response.deinit();
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        if (cap == contents.len) {
-            try response.streamBody(alloc, &out.writer, cap);
-            try std.testing.expectEqualSlices(u8, contents, out.written());
-        } else {
-            try std.testing.expectError(error.HttpResponseTooLarge, response.streamBody(alloc, &out.writer, cap));
-        }
+        try expectBodyWithinCap(&response, &out, contents, cap);
     }
 }
 
 test "update HTTP transport bounds aggregate headers and leaves redirects to HTTPS policy" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |oversized| {
         var peer: FakePeer = .{
-            .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}),
+            .server = try FakePeer.listenLoopback(),
             .mode = .capture,
             .response = if (oversized)
                 "HTTP/1.1 200 OK\r\nX-Padding: " ++ "x" ** 9000 ++ "\r\nContent-Length: 0\r\n\r\n"
@@ -566,7 +609,7 @@ test "update HTTP transport bounds aggregate headers and leaves redirects to HTT
             var response = try Response.openImpl(alloc, try peer.uri(&url), &.{}, 1000, false);
             defer response.deinit();
             try std.testing.expectEqual(std.http.Status.found, response.status);
-            const location = (try response.header(alloc, 33)).?;
+            const location = (try response.header(alloc, query_location)).?;
             defer alloc.free(location);
             try std.testing.expectEqualStrings("http://example.invalid/no-plaintext-redirect", location);
         }
@@ -574,9 +617,9 @@ test "update HTTP transport bounds aggregate headers and leaves redirects to HTT
 }
 
 test "update HTTP body reads reset the deadline while a slow fake feed progresses" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var peer: FakePeer = .{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{}), .mode = .progress };
+    var peer: FakePeer = .{ .server = try FakePeer.listenLoopback(), .mode = .progress };
     const thread = try std.Thread.spawn(.{}, FakePeer.serve, .{&peer});
     defer peer.finish(thread);
     var url: [256]u8 = undefined;

@@ -1005,6 +1005,13 @@ const RemovedArguments = struct {
         self.profile_keys.deinit(alloc);
         self.* = .{};
     }
+
+    /// Whether the user removed `item`'s link, matched by its profile key
+    /// or by its arguments.
+    fn includesProfile(self: *const RemovedArguments, item: ProfileItem) bool {
+        return self.profile_keys.contains(item.key) or
+            containsArguments(self.items.items, item.arguments);
+    }
 };
 
 const ProfileItem = struct {
@@ -1620,10 +1627,10 @@ pub const JumpList = struct {
             .arena = undefined,
             .seq = self.rebuild_seq,
             .exe_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, exe_path),
-            .recents = try copyRecentList(alloc, &self.recents),
-            .recent_uses = try copyRecentList(alloc, &self.pending_recent_uses),
-            .hidden_profiles = try copyTombstones(alloc, &self.hidden_profiles),
-            .profile_uses = try copyTombstones(alloc, &self.pending_profile_uses),
+            .recents = try copyStringList(RecentList, alloc, &self.recents),
+            .recent_uses = try copyStringList(RecentList, alloc, &self.pending_recent_uses),
+            .hidden_profiles = try copyStringList(ProfileTombstones, alloc, &self.hidden_profiles),
+            .profile_uses = try copyStringList(ProfileTombstones, alloc, &self.pending_profile_uses),
             .profiles = try alloc.alloc(ProfileItem, self.profiles.items.len),
         };
         for (self.profiles.items, job.profiles) |item, *copy| copy.* = .{
@@ -1710,8 +1717,7 @@ pub const JumpList = struct {
             self.persist_retry_count = 0;
         }
         for (self.profiles.items) |item| {
-            if (!removed.profile_keys.contains(item.key) and
-                !containsArguments(removed.items.items, item.arguments)) continue;
+            if (!removed.includesProfile(item)) continue;
             if (self.pending_profile_uses.contains(item.key)) continue;
             if (try self.hidden_profiles.insert(self.alloc, item.key)) {
                 _ = try self.pending_profile_hides.insert(self.alloc, item.key);
@@ -1801,8 +1807,7 @@ pub const RebuildJob = struct {
         var removals: RecentList = .{};
         _ = try self.recents.removeArguments(alloc, self.removed.items.items, &self.recent_uses, &removals);
         for (self.profiles) |item| {
-            if (!self.removed.profile_keys.contains(item.key) and
-                !containsArguments(self.removed.items.items, item.arguments)) continue;
+            if (!self.removed.includesProfile(item)) continue;
             if (self.profile_uses.contains(item.key)) continue;
             _ = try self.hidden_profiles.insert(alloc, item.key);
         }
@@ -1877,17 +1882,12 @@ pub const RebuildJob = struct {
     }
 };
 
-fn copyRecentList(alloc: Allocator, list: *const RecentList) !RecentList {
-    var copy: RecentList = .{};
+/// A copy of `list`, a `RecentList` or `ProfileTombstones`, whose strings
+/// `alloc` owns.
+fn copyStringList(comptime List: type, alloc: Allocator, list: *const List) !List {
+    var copy: List = .{};
     try copy.items.ensureTotalCapacity(alloc, list.items.items.len);
     for (list.items.items) |item| copy.items.appendAssumeCapacity(try alloc.dupe(u8, item));
-    return copy;
-}
-
-fn copyTombstones(alloc: Allocator, tombstones: *const ProfileTombstones) !ProfileTombstones {
-    var copy: ProfileTombstones = .{};
-    try copy.items.ensureTotalCapacity(alloc, tombstones.items.items.len);
-    for (tombstones.items.items) |item| copy.items.appendAssumeCapacity(try alloc.dupe(u8, item));
     return copy;
 }
 
@@ -1979,62 +1979,18 @@ fn readRemovedArguments(
         const link = IShellLinkW.fromRaw(raw_link.?);
         defer link.release();
 
-        @memset(arguments_buffer, 0);
-        if (link.vtbl.GetArguments(
-            link.asRaw(),
-            arguments_buffer.ptr,
-            @intCast(arguments_buffer.len),
-        ) < 0) {
-            log.debug("jump list removed link arguments unavailable index={d}", .{index});
+        const arguments = try readRemovedLinkText(alloc, link, "GetArguments", "arguments", arguments_buffer, index) orelse {
             result.complete = false;
             continue;
-        }
-        const arguments_len = std.mem.indexOfScalar(u16, arguments_buffer, 0) orelse {
-            log.debug("jump list removed link arguments too long index={d}", .{index});
-            result.complete = false;
-            continue;
-        };
-        const arguments = std.unicode.utf16LeToUtf8Alloc(
-            alloc,
-            arguments_buffer[0..arguments_len],
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                log.debug("jump list removed link arguments invalid index={d} err={}", .{ index, err });
-                result.complete = false;
-                continue;
-            },
         };
         var arguments_owned = true;
         errdefer if (arguments_owned) alloc.free(arguments);
         try result.items.append(alloc, arguments);
         arguments_owned = false;
 
-        @memset(arguments_buffer, 0);
-        if (link.vtbl.GetDescription(
-            link.asRaw(),
-            arguments_buffer.ptr,
-            @intCast(arguments_buffer.len),
-        ) < 0) {
-            log.debug("jump list removed link description unavailable index={d}", .{index});
+        const description = try readRemovedLinkText(alloc, link, "GetDescription", "description", arguments_buffer, index) orelse {
             result.complete = false;
             continue;
-        }
-        const description_len = std.mem.indexOfScalar(u16, arguments_buffer, 0) orelse {
-            log.debug("jump list removed link description too long index={d}", .{index});
-            result.complete = false;
-            continue;
-        };
-        const description = std.unicode.utf16LeToUtf8Alloc(
-            alloc,
-            arguments_buffer[0..description_len],
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                log.debug("jump list removed link description invalid index={d} err={}", .{ index, err });
-                result.complete = false;
-                continue;
-            },
         };
         defer alloc.free(description);
         if (std.mem.startsWith(u8, description, profile_description_prefix)) {
@@ -2043,6 +1999,35 @@ fn readRemovedArguments(
         }
     }
     return result;
+}
+
+/// One string of a removed link (`getter` is `GetArguments` or
+/// `GetDescription`), read through `buffer`. Null, logged as `what`, when it
+/// cannot be read, is longer than `buffer` or is not valid UTF-16.
+fn readRemovedLinkText(
+    alloc: Allocator,
+    link: *IShellLinkW,
+    comptime getter: []const u8,
+    comptime what: []const u8,
+    buffer: []u16,
+    index: usize,
+) Allocator.Error!?[]u8 {
+    @memset(buffer, 0);
+    if (@field(link.vtbl, getter)(link.asRaw(), buffer.ptr, @intCast(buffer.len)) < 0) {
+        log.debug("jump list removed link " ++ what ++ " unavailable index={d}", .{index});
+        return null;
+    }
+    const len = std.mem.indexOfScalar(u16, buffer, 0) orelse {
+        log.debug("jump list removed link " ++ what ++ " too long index={d}", .{index});
+        return null;
+    };
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buffer[0..len]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            log.debug("jump list removed link " ++ what ++ " invalid index={d} err={}", .{ index, err });
+            return null;
+        },
+    };
 }
 
 fn createShellLink(

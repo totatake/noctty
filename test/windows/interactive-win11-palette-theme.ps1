@@ -1,5 +1,10 @@
 [CmdletBinding()]
 param([switch]$Rebuild, [switch]$ResetState, [switch]$ExerciseHighContrast, [int]$TimeoutSeconds = 60)
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-palette-theme.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 # Settling delay after restoring palette-theme presentation state.
 $script:PALETTE_THEME_SETTLE_MS = 750
@@ -131,6 +136,10 @@ try {
         $originalHc = [InteractiveWin11WindowNative+HIGHCONTRAST]::new(); $originalHc.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($originalHc)
         if (-not [InteractiveWin11WindowNative]::SystemParametersInfo(0x42, $originalHc.cbSize, [ref]$originalHc, 0)) { throw 'SPI_GETHIGHCONTRAST failed.' }
     }
+    # In the release job the accessibility harness turns High Contrast off just
+    # before this one runs. Prove that a fresh process presents the configured
+    # theme before the first pixel assertion, retrying once with a new process.
+    Invoke-PostHighContrastPresentationCanary 'palette-theme-preflight-canary' $draculaRgb
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $run = Start-StatefulApp $layout $exe $repoRoot 'palette-theme-normal'; $runs.Add($run)
     $hostHwnd = Wait-StatefulHost $run $deadline
@@ -332,3 +341,7 @@ finally {
 }
 if ($null -ne $primaryError) { throw $primaryError }
 Write-Host "interactive-win11 palette-theme validation: PASS (config=$configPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

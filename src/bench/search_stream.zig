@@ -128,6 +128,11 @@ fn initTerminal(alloc: std.mem.Allocator, args: Args) !Terminal {
 fn writeAll(t: *Terminal, bytes: []const u8) void {
     var stream = t.vtStream();
     defer stream.deinit();
+    nextSliceChunked(&stream, bytes);
+}
+
+/// Feed `bytes` to `stream` in 4 KiB writes.
+fn nextSliceChunked(stream: anytype, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = @min(offset + 4096, bytes.len);
@@ -160,6 +165,25 @@ const Sink = struct {
         }
     }
 };
+
+/// Feed the search, then run the search thread's loop until it completes.
+fn searchUntilComplete(
+    alloc: std.mem.Allocator,
+    search: *ThreadSearch,
+    t: *Terminal,
+    mutex: *std.Thread.Mutex,
+    sink: *Sink,
+) void {
+    search.feed(alloc, t);
+    while (true) {
+        search.notify(alloc, &Sink.callback, 1, sink, false);
+        if (search.isComplete()) break;
+        switch (search.tick(mutex)) {
+            .complete, .progress => {},
+            .blocked => search.feed(alloc, t),
+        }
+    }
+}
 
 fn runFeed(
     alloc: std.mem.Allocator,
@@ -209,15 +233,7 @@ fn runFeed(
         // `changeQuery`'s initial feed, then the search thread's loop until
         // the search completes.
         var timer = try std.time.Timer.start();
-        search.feed(alloc, &t);
-        while (true) {
-            search.notify(alloc, &Sink.callback, 1, &sink, false);
-            if (search.isComplete()) break;
-            switch (search.tick(&mutex)) {
-                .complete, .progress => {},
-                .blocked => search.feed(alloc, &t),
-            }
-        }
+        searchUntilComplete(alloc, &search, &t, &mutex, &sink);
         initial_ms[run] = nsToMs(timer.read());
 
         // Streaming with a refresh after every `refresh_bytes` of output.
@@ -227,27 +243,14 @@ fn runFeed(
         var offset: usize = 0;
         while (offset < streamed.len) {
             const end = @min(offset + refresh_bytes, streamed.len);
-            var chunk = offset;
-            while (chunk < end) {
-                const chunk_end = @min(chunk + 4096, end);
-                stream.nextSlice(streamed[chunk..chunk_end]);
-                chunk = chunk_end;
-            }
+            nextSliceChunked(&stream, streamed[offset..end]);
             offset = end;
 
             // What the renderer does on a dirty frame.
             t.flags.search_viewport_dirty = true;
 
             var refresh_timer = try std.time.Timer.start();
-            search.feed(alloc, &t);
-            while (true) {
-                search.notify(alloc, &Sink.callback, 1, &sink, false);
-                if (search.isComplete()) break;
-                switch (search.tick(&mutex)) {
-                    .complete, .progress => {},
-                    .blocked => search.feed(alloc, &t),
-                }
-            }
+            searchUntilComplete(alloc, &search, &t, &mutex, &sink);
             try refresh_all.append(alloc, nsToMs(refresh_timer.read()));
         }
         stream_ms[run] = nsToMs(stream_timer.read());
@@ -260,10 +263,9 @@ fn runFeed(
         row_messages = sink.row_messages;
     }
 
-    std.mem.sort(f64, initial_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, stream_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, baseline_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, refresh_all.items, {}, std.sort.asc(f64));
+    for ([_][]f64{ initial_ms, stream_ms, baseline_ms, refresh_all.items }) |samples| {
+        std.mem.sort(f64, samples, {}, std.sort.asc(f64));
+    }
 
     var out_buf: [4096]u8 = undefined;
     var out_writer = std.fs.File.stdout().writer(&out_buf);

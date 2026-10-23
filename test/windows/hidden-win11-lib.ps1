@@ -11,13 +11,16 @@
 #     bundled and in-box ConPTY host placement has been observed there.
 #   * Every noctty is a copy with a `noctty.portable` marker, with LOCALAPPDATA
 #     and APPDATA redirected into the run directory.
-#   * The real startup-attempts.json and the real PSReadLine history file are
-#     checked by size, time and hash before and after, never read.
+#   * The real startup-attempts.json is checked by size, time and hash, and both real
+#     PSReadLine history files by size and time only (scripts/windows-harness-history.ps1),
+#     before and after, never read.
 #   * The clipboard sequence number is logged before and after. Nothing here
 #     can copy (no selection, no copy key, no OSC 52 answer).
 #   * A noctty with the product AppUserModelID would replace the real taskbar
 #     jump list, so the binary must carry the measurement AUMID unless
 #     -AllowProductAumid says the machine is an ephemeral runner.
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 
 if (-not ('HiddenWin' -as [type])) {
 Add-Type @'
@@ -493,14 +496,12 @@ function Test-SameFingerprint($A, $B) {
     return $A.Exists -eq $B.Exists -and $A.Hash -eq $B.Hash -and $A.Modified -eq $B.Modified
 }
 
-# The state a run must not touch on the machine it runs on: the real recovery ledger and the
-# real PowerShell history file (a pwsh in a test pane loads PSReadLine). Metadata and a hash
-# only; their contents are never read into the output.
+# The real recovery ledger a run must not touch: its hash and time, never its contents. The real
+# PowerShell history (a pwsh in a test pane loads PSReadLine) is guarded by size and time only,
+# through Start-/Assert-WindowsHarnessHistoryGuard; it is never hashed.
 function Get-RealStateFingerprints {
-    $history = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
     return @{
         Startup = Get-FileFingerprint (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json')
-        History = Get-FileFingerprint $history
     }
 }
 
@@ -549,6 +550,7 @@ function Invoke-HiddenDriver {
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Bin must contain noctty.exe.' }
     $before = Get-RealStateFingerprints
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness (Split-Path -Leaf $Script)
     $clipboardBefore = [HiddenWin]::GetClipboardSequenceNumber()
     [void](New-Item -ItemType Directory -Path $Run)
     Copy-PortableBin $Bin (Join-Path $Run 'source\bin')
@@ -599,11 +601,13 @@ function Invoke-HiddenDriver {
         $after = Get-RealStateFingerprints
         $clipboardAfter = [HiddenWin]::GetClipboardSequenceNumber()
         $startupUnchanged = Test-SameFingerprint $before.Startup $after.Startup
-        $historyUnchanged = Test-SameFingerprint $before.History $after.History
+        $historyFailure = $null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure = $_ }
+        $historyUnchanged = $null -eq $historyFailure
         @{ Before = $before; After = $after; StartupUnchanged = $startupUnchanged; HistoryUnchanged = $historyUnchanged; OwnedJobCleanedUp = ($null -eq $cleanupError); OwnedProcessCount = $ownedProcessCount; ClipboardSequenceBefore = $clipboardBefore; ClipboardSequenceAfter = $clipboardAfter } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Run 'real-state.json')
         if (-not $startupUnchanged) { throw 'Real startup-attempts.json changed; stop launches and report it.' }
-        if (-not $historyUnchanged) { throw 'The real PowerShell history file changed; stop launches and report it.' }
+        if (-not $historyUnchanged) { throw ('The real PowerShell history file changed; stop launches and report it. ' + $historyFailure.Exception.Message) }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
         if ($cleanupError) { throw $cleanupError }
     }

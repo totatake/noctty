@@ -73,6 +73,13 @@ pub fn main() !MainReturn {
         build_config.app_runtime == .win32)
     {
         if (try apprt.win32.preflightPortableUpdateStartup(std.heap.page_allocator)) return;
+
+        // CLI actions above attach to their caller's console and retain its
+        // control-event policy. The GUI has no console, but its children still
+        // inherit a launcher's Ctrl+C ignore flag (for example `start /b`).
+        process_shared.enableGuiChildCtrlC() catch |err| {
+            std.log.warn("failed to enable Ctrl+C for GUI children err={}", .{err});
+        };
     }
 
     // Create our app state

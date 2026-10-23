@@ -114,13 +114,16 @@ pub fn initTarget(self: *const Direct3D11, width: usize, height: usize, custom: 
 
 pub fn present(self: *Direct3D11, target: Target) !void {
     if (target.width == 0 or target.height == 0) return;
-    const hr = api.noctty_d3d11_present(self.device, target.handle, @intFromBool(self.vsync_enabled));
-    try api.check(hr);
-    if (hr == 0) self.rt_surface.noteSuccessfulPresent();
+    try self.notePresentResult(api.noctty_d3d11_present(self.device, target.handle, @intFromBool(self.vsync_enabled)));
 }
 
 pub fn presentLastTarget(self: *Direct3D11) !void {
-    const hr = api.noctty_d3d11_present_last(self.device, @intFromBool(self.vsync_enabled));
+    try self.notePresentResult(api.noctty_d3d11_present_last(self.device, @intFromBool(self.vsync_enabled)));
+}
+
+/// The bridge returns S_OK for a frame it presented; S_FALSE (nothing to
+/// show) and DXGI_STATUS_OCCLUDED succeed without presenting one.
+fn notePresentResult(self: *Direct3D11, hr: i32) !void {
     try api.check(hr);
     if (hr == 0) self.rt_surface.noteSuccessfulPresent();
 }
@@ -167,15 +170,11 @@ pub fn textureOptions(self: Direct3D11) Texture.Options {
 pub fn samplerOptions(_: Direct3D11) Sampler.Options {
     return .{};
 }
-pub const ImageTextureFormat = enum { gray, rgba, bgra };
+pub const ImageTextureFormat = Texture.Format;
 pub fn imageTextureOptions(self: Direct3D11, format: ImageTextureFormat, srgb: bool) Texture.Options {
     return .{
         .device = self.device,
-        .format = switch (format) {
-            .gray => .gray,
-            .rgba => .rgba,
-            .bgra => .bgra,
-        },
+        .format = format,
         .srgb = srgb,
         .unsupported_image = true,
     };

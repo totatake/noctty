@@ -30,6 +30,21 @@ pub fn ComObject(
     };
 }
 
+/// The final-release policy of a provider that holds no other references:
+/// the last `Release` frees the provider through its own allocator.
+pub fn destroyOnLastRelease(comptime Owner: type) fn (*Owner) u32 {
+    return struct {
+        fn release(self: *Owner) u32 {
+            const previous = self.refcount.fetchSub(1, .acq_rel);
+            if (previous == 1) {
+                self.alloc.destroy(self);
+                return 0;
+            }
+            return previous - 1;
+        }
+    }.release;
+}
+
 /// Each property query transfers a fresh BSTR to its caller.
 pub fn frameworkId(out: *com.VARIANT) com.HRESULT {
     out.* = com.VARIANT.empty();

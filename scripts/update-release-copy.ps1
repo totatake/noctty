@@ -25,8 +25,7 @@ foreach ($relative in @(
     'README.md',
     'docs/getting-started.md',
     'site/index.html',
-    'site/version.js',
-    'site/terminal.js'
+    'site/version.js'
 )) {
     $path = Join-Path $repoRoot $relative
     $text = [System.IO.File]::ReadAllText($path).Replace($previous, $Version)

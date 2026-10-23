@@ -16,8 +16,9 @@ the same key messages to both and compares every KEY_EVENT record field.
 
 A second phase types into PSReadLine inside noctty and checks that Shift+Enter
 adds a continuation line instead of running the line (one history entry for
-two lines). PSReadLine's history file is redirected and set to SaveNothing;
-the real one is hashed before and after.
+two lines). PSReadLine's history file is redirected into the run and set to
+SaveNothing before its first read; the real files' size and time are checked
+before and after (metadata only, never hashed or read).
 
 -Observe records every failure and returns success (infrastructure failures
 still fail). -CompileOnly validates the C/C# harness without launching
@@ -36,6 +37,7 @@ param(
     [ValidateRange(10,600)] [int] $DriverTimeoutSeconds = 300
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -267,19 +269,6 @@ function Startup-Fingerprint {
     if(-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false; Hash=$null; Modified=$null } }
     return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
 }
-function History-Fingerprints {
-    # PSReadLine's history file ignores APPDATA redirection in some versions;
-    # both real locations are hashed before and after the PSReadLine phase.
-    $roots=@([Environment]::GetFolderPath('ApplicationData'))
-    $result=@{}
-    foreach($rel in @('Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt','Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt')) {
-        foreach($root in $roots) {
-            $path=Join-Path $root $rel
-            $result[$path]=if(Test-Path -LiteralPath $path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()+'|'+(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') } else { 'missing' }
-        }
-    }
-    return $result
-}
 function Assert-AdoptedStartup($Fingerprint) {
     if(($BaselineHash -and $Fingerprint.Hash -ne $BaselineHash.ToLowerInvariant()) -or
         ($BaselineModifiedUtc -and (-not $Fingerprint.Exists -or
@@ -311,7 +300,7 @@ if(-not $Driver) {
         if($cp) { [void][KeyRecords]::CloseHandle($cp.thread); [void][KeyRecords]::CloseHandle($cp.process) }
     }
     if($CompileOnly) { Write-Host 'Console key record harness C/C# compilation: PASS; no launches.'; exit }
-    $before=Startup-Fingerprint; Assert-AdoptedStartup $before; $historyBefore=History-Fingerprints
+    $before=Startup-Fingerprint; Assert-AdoptedStartup $before; $historyGuard=Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-console-key-records.ps1'
     $portable=Join-Path $Run 'source\bin'; [void](New-Item -ItemType Directory -Path $portable)
     Get-ChildItem -LiteralPath $Bin -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $portable }
     $share=Join-Path (Split-Path -Parent $Bin) 'share'
@@ -341,15 +330,15 @@ if(-not $Driver) {
         if($job -ne [IntPtr]::Zero) { try { $owned=[KeyRecords]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
         if($pi) { [void][KeyRecords]::CloseHandle($pi.thread); [void][KeyRecords]::CloseHandle($pi.process) }
         [void][KeyRecords]::CloseDesktop($desktop)
-        $after=Startup-Fingerprint; $historyAfter=History-Fingerprints
+        $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        $historyUnchanged=$true
-        foreach($k in $historyBefore.Keys) { if($historyBefore[$k] -ne $historyAfter[$k]) { $historyUnchanged=$false } }
-        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryBefore=$historyBefore;HistoryAfter=$historyAfter;HistoryUnchanged=$historyUnchanged;
+        $historyFailure=$null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure=$_ }
+        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryUnchanged=($null -eq $historyFailure);
             OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$owned} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if($historyFailure) { throw $historyFailure }
         if(-not $unchanged) { throw 'Real startup state changed; stop launches.' }; Assert-AdoptedStartup $after
-        if(-not $historyUnchanged) { throw 'Real PSReadLine history changed; stop launches.' }
         if($cleanupError) { throw $cleanupError }
     }
     if($code -ne 0) { throw "Console key record driver failed ($code); inspect results.json in Run." }
@@ -571,7 +560,10 @@ try {
         # Phase 2: PSReadLine. Shift+Enter must add a line, not run the line.
         $shellReady=Join-Path $Run 'shell-ready.txt'; $count=Join-Path $Run 'history-count.txt'
         $pwshExe=(Get-Command pwsh.exe).Source
-        $shellCommand='"{0}" --config-file="{1}" -e "{2}" -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySaveStyle SaveNothing; Set-Content -LiteralPath ''{3}'' -Value ready"' -f $exe,$config,$pwshExe,$shellReady
+        # History goes to a run-local file and is never saved, before the first read. The ready file
+        # is written only once both options read back, so nothing is typed into an unisolated pwsh.
+        $shellHistory=Join-Path $Run 'shell-history.txt'
+        $shellCommand='"{0}" --config-file="{1}" -e "{2}" -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySavePath ''{4}'' -HistorySaveStyle SaveNothing; if((Get-PSReadLineOption).HistorySaveStyle -eq ''SaveNothing'' -and (Get-PSReadLineOption).HistorySavePath -ceq ''{4}'') {{ Set-Content -LiteralPath ''{3}'' -Value ready }}"' -f $exe,$config,$pwshExe,$shellReady,$shellHistory
         $shell=[KeyRecords]::Launch($exe,$shellCommand,$Bin,"WinSta0\$driverDesktop",$job,0x08000000)
         $deadline=[datetime]::UtcNow.AddSeconds(60); $shellSurface=[IntPtr]::Zero
         do {

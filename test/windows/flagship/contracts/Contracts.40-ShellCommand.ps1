@@ -15,6 +15,11 @@ param(
     [string] $BinDir
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-shell-command.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -192,6 +197,10 @@ if (-not $outputText.Contains($ExpectedText)) {
 }
 
 Write-Host "shell launcher validation: PASS (shell=$Shell, args=$argsDisplay)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}
 '@
 if ((($cliShellHarnessText -replace "\r\n?", "`n") -replace '\n+\z', '') -cne
     (($expectedCliShellHarnessText -replace "\r\n?", "`n") -replace '\n+\z', '')) {
@@ -206,6 +215,7 @@ $cliShellAst = [System.Management.Automation.Language.Parser]::ParseInput(
 )
 if ($cliShellErrors.Count -ne 0) { throw 'CLI shell harness must parse without errors.' }
 Assert-CommandResolutionContract -Ast $cliShellAst -Tokens $cliShellTokens -Context $cliShellHarness -ExpectedDotSources @(
+    ". (Join-Path `$PSScriptRoot '..\..\scripts\windows-harness-history.ps1')"
     ". (Join-Path `$repoRoot 'scripts\interactive-win11-lib.ps1')"
 ) -ExpectedAmpersandCommands @(
     '& $cmdExe /d /c "set ""PATH=$envPath""&& where noctty"'

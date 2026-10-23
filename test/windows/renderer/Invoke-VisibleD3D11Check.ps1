@@ -4,6 +4,11 @@ param(
     [string]$OutputDirectory = (Join-Path $env:TEMP ('noctty-visible-d3d11-' + [guid]::NewGuid().ToString('N'))),
     [switch]$PrepareOnly
 )
+
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Invoke-VisibleD3D11Check.ps1'
+try {
+
 # Maintainer-only, interactive five-minute check. Agents use -PrepareOnly.
 # This intentionally shows one isolated terminal when the maintainer runs it.
 $ErrorActionPreference = 'Stop'
@@ -99,12 +104,21 @@ function Step([string]$Name,[string]$Instruction) {
 try {
     AssertProfile
     $shell = (Get-Command pwsh).Source
-    $proc = Start-Process -FilePath (Join-Path $bin 'noctty.exe') -ArgumentList @('--single-instance=false','-e',('"'+$shell+'"'),'-NoProfile') -WorkingDirectory $bin -Environment $environment -PassThru
+    # This fixture asks the maintainer to type PowerShell. Configure history
+    # during startup, before PSReadLine can read or save the first command.
+    $historyBootstrap = Join-Path $bin 'history-bootstrap.ps1'
+    $historyPath = (Join-Path $bin 'history.txt').Replace("'", "''")
+    $historyReady = Join-Path $bin ('history-ready-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $historyReadyLiteral = $historyReady.Replace("'", "''")
+    [IO.File]::WriteAllText($historyBootstrap, "try {`nImport-Module PSReadLine -ErrorAction Stop`nSet-PSReadLineOption -HistorySavePath '$historyPath' -HistorySaveStyle SaveNothing -ErrorAction Stop`nif ((Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing' -or (Get-PSReadLineOption).HistorySavePath -cne '$historyPath') { exit 1 }`n[IO.File]::WriteAllText('$historyReadyLiteral', 'isolated')`n} catch { exit 1 }`n")
+    $proc = Start-Process -FilePath (Join-Path $bin 'noctty.exe') -ArgumentList @('--single-instance=false','-e',('"'+$shell+'"'),'-NoProfile','-NoExit','-File',('"'+$historyBootstrap+'"')) -WorkingDirectory $bin -Environment $environment -PassThru
     $identity = $proc.StartTime
     Write-Host "Visible test PID=$($proc.Id), portable run=$OutputDirectory"
     $deadline=[DateTime]::UtcNow.AddSeconds(40);$hostWindow=[IntPtr]::Zero
     while ($hostWindow -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $deadline) { $proc.Refresh();if($proc.HasExited){throw 'Test app exited.'};$hostWindow=[RendererNative]::Host($proc.Id);Start-Sleep -Milliseconds 100 }
     if ($hostWindow -eq [IntPtr]::Zero) { throw 'Test host did not appear.' }
+    while (-not [IO.File]::Exists($historyReady) -and [DateTime]::UtcNow -lt $deadline) { $proc.Refresh(); if ($proc.HasExited) { throw 'Test app exited before history isolation.' }; Start-Sleep -Milliseconds 100 }
+    if (-not [IO.File]::Exists($historyReady)) { throw 'PowerShell history isolation was not acknowledged; do not type into the test pane.' }
     Step 'initial' 'Confirm the banner says D3D11 hardware or WARP. In the test pane run: 1..100 | ForEach-Object { "VISIBLE ROW $_ https://example.com" }. Check new text is visible.'
     Step 'palette' 'Press Ctrl+Shift+P. Check the palette list is fully visible over terminal text. Close it with Escape.'
     Step 'paste-confirm' "Paste these two lines into the test pane, inspect the full confirmation preview and Allow/Cancel buttons, then CANCEL:`nWrite-Output 'SAFE FIRST LINE'`nWrite-Output 'SAFE SECOND LINE'"
@@ -127,3 +141,7 @@ try {
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json')
 }
 Write-Output "Visible check $($result.status): $(Join-Path $OutputDirectory 'result.json')"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

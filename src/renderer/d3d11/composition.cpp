@@ -11,6 +11,14 @@ typedef HRESULT (WINAPI *CreateCompositionDevice)(IDXGIDevice *, REFIID, void **
 static INIT_ONCE composition_library_once = INIT_ONCE_STATIC_INIT;
 static CreateCompositionDevice create_composition_device;
 
+/* Fail the load, keeping the error that FreeLibrary could overwrite. */
+static BOOL fail_load(HMODULE library) {
+    DWORD error = GetLastError();
+    FreeLibrary(library);
+    SetLastError(error);
+    return FALSE;
+}
+
 static BOOL CALLBACK load_composition_library(PINIT_ONCE once, PVOID parameter,
     PVOID *context) {
     (void)once; (void)parameter; (void)context;
@@ -18,12 +26,7 @@ static BOOL CALLBACK load_composition_library(PINIT_ONCE once, PVOID parameter,
     if (!library) return FALSE;
 
     FARPROC create = GetProcAddress(library, "DCompositionCreateDevice");
-    if (!create) {
-        DWORD error = GetLastError();
-        FreeLibrary(library);
-        SetLastError(error);
-        return FALSE;
-    }
+    if (!create) return fail_load(library);
 
     /* All composition interfaces use this module's vtables. Pin the verified
      * System32 module for process lifetime before publishing its factory. */
@@ -31,10 +34,7 @@ static BOOL CALLBACK load_composition_library(PINIT_ONCE once, PVOID parameter,
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         reinterpret_cast<LPCWSTR>(library), &pinned)) {
-        DWORD error = GetLastError();
-        FreeLibrary(library);
-        SetLastError(error);
-        return FALSE;
+        return fail_load(library);
     }
     create_composition_device = reinterpret_cast<CreateCompositionDevice>(create);
     FreeLibrary(library);

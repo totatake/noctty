@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 18
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-ime-candidate.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Settling delay for IME candidate-window observation.
 $script:IME_CANDIDATE_SETTLE_MS = 700
@@ -470,3 +475,7 @@ finally {
 }
 
 Write-Host ("interactive-win11 IME candidate validation: PASS (surface={0}x{1}, poison={2},{3}, ime-pos={4},{5},{6},{7}, composition={8},{9}, candidate={10},{11}, exclude={12},{13},{14},{15}, trace={16}, result={17}, stderr={18})" -f $surfaceRect.Width, $surfaceRect.Height, $poisonX, $poisonY, $trace.ime_pos.x, $trace.ime_pos.y, $trace.ime_pos.width, $trace.ime_pos.height, $forms.Composition.ptCurrentPos.X, $forms.Composition.ptCurrentPos.Y, $forms.Candidate.ptCurrentPos.X, $forms.Candidate.ptCurrentPos.Y, $forms.Candidate.rcArea.Left, $forms.Candidate.rcArea.Top, $forms.Candidate.rcArea.Right, $forms.Candidate.rcArea.Bottom, $tracePath, $resultPath, $stderrPath)
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

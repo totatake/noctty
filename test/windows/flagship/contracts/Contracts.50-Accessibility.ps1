@@ -1573,8 +1573,12 @@ if ($idleSoakStartCommands.Count -ne 1 -or
 
 $settingsSourcePins = @(
     @{
-        Pattern = 'const settings_header_control_count = 7;'
-        Description = 'settings clipped-control header cardinality'
+        Pattern = 'const settings_header_control_count = settings_action_controls\.len;'
+        Description = 'settings clipped-control header cardinality derives from action descriptors'
+    },
+    @{
+        Pattern = '(?s)const settings_control_specs = specs: \{.*?var result: \[field_model\.form_fields\.len \+ settings_form_actions\.len \+ settings_action_controls\.len\]FormControl.*?for \(field_model\.form_fields, 0\.\.\).*?@memcpy\(result\[field_model\.form_fields\.len\.\.\]\[0\.\.settings_form_actions\.len\], &settings_form_actions\);\s*@memcpy\(result\[field_model\.form_fields\.len \+ settings_form_actions\.len \.\.\], &settings_action_controls\);.*?const settings_control_count = settings_control_specs\.len;'
+        Description = 'generated editable and display rows precede the unclipped action descriptors'
     },
     @{
         Pattern = 'const settings_clipped_control_count = settings_control_count - settings_header_control_count;'
@@ -1601,6 +1605,17 @@ foreach ($pin in $settingsSourcePins) {
     if ($win32SettingsText -notmatch $pin.Pattern) {
         throw "Settings source invariant missing: $($pin.Description)."
     }
+}
+# The derivation above replaces a literal seven; retain the independent action
+# set so accidentally dropping an action cannot silently shrink the header.
+$settingsActionSpec = [regex]::Match($win32SettingsText, '(?ms)^const settings_action_controls = \[_\]FormControl\{(?<Rows>.*?)^\};')
+$settingsActionIds = @([regex]::Matches($settingsActionSpec.Groups['Rows'].Value, '\.id = (BTN_\w+)') | ForEach-Object { $_.Groups[1].Value })
+$expectedSettingsActionIds = @('BTN_SAVE', 'BTN_CONFLICT_KEEP', 'BTN_CONFLICT_USE_DISK', 'BTN_CLOSE_SAVE', 'BTN_CLOSE_DISCARD', 'BTN_CLOSE_KEEP_EDITING', 'BTN_DISCARD_CHANGES')
+if (-not $settingsActionSpec.Success -or
+    ($settingsActionIds -join ',') -cne ($expectedSettingsActionIds -join ',') -or
+    [regex]::Matches($settingsActionSpec.Groups['Rows'].Value, '\.role\s*=').Count -ne $expectedSettingsActionIds.Count -or
+    [regex]::Matches($settingsActionSpec.Groups['Rows'].Value, '\.role = \.button').Count -ne $expectedSettingsActionIds.Count) {
+    throw 'Settings unclipped action descriptors must retain all seven independently expected button IDs.'
 }
 if ($win32SettingsText -match 'for\s*\(0\.\.27\)') {
     throw 'Settings clipped-control traversal must use settings_header_control_count, never the stale 0..27 magic number.'

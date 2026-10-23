@@ -5,6 +5,11 @@ param(
     [int] $TimeoutSeconds = 12
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-command-finish.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Poll cadence while waiting for command-finish evidence.
 $script:COMMAND_FINISH_POLL_MS = 250
@@ -117,7 +122,8 @@ Start-Sleep -Seconds 4
 "@ | Set-Content -LiteralPath $payloadPath -Encoding UTF8
 
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$aumid = 'io.github.amanthanvi.noctty'
+$aumid = Get-InteractiveWin11ToastAumid
+$processAumid = Get-InteractiveWin11ProcessAumid
 $toastMgr = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
 $notifier = $toastMgr::CreateToastNotifier($aumid)
 $setting = $notifier.Setting
@@ -223,4 +229,8 @@ $stderrTail
 "@
 }
 
-Write-Host "interactive-win11 command-finish validation: PASS (setting=$settingText, stderr=$stderrPath)"
+Write-Host "interactive-win11 command-finish validation: PASS (notifier-aumid=$aumid, process-aumid=$processAumid, setting=$settingText, stderr=$stderrPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

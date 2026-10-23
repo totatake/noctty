@@ -4,12 +4,11 @@ const std = @import("std");
 const windows = std.os.windows;
 const os_windows = @import("../../os/windows.zig");
 const shell = @import("../../config/windows_shell.zig");
+const sys = @import("sys.zig");
 
 const OBJ_DONT_REPARSE = 0x1000;
 const STATUS_REPARSE_POINT_ENCOUNTERED = 0xc000050b;
 const IO_REPARSE_TAG_CLOUD = 0x9000001a;
-
-extern "kernel32" fn GetFinalPathNameByHandleW(handle: windows.HANDLE, path: [*]u16, size: u32, flags: u32) callconv(.winapi) u32;
 
 pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs.File {
     const root_len = localRoot(path) orelse return null;
@@ -18,7 +17,7 @@ pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs
     // Resolve only that alias; all filesystem components retain the guard.
     if (root_len == 3 and !os_windows.directVolumePath(&wide)) return null;
     var handle: windows.HANDLE = undefined;
-    const status = create(wide.span(), null, OBJ_DONT_REPARSE, false, read_data, false, &handle);
+    const status = create(wide.span(), null, OBJ_DONT_REPARSE, .{ .read_data = read_data }, &handle);
     if (status == .SUCCESS) return .{ .handle = handle };
     if (@intFromEnum(status) != STATUS_REPARSE_POINT_ENCOUNTERED) return null;
 
@@ -34,7 +33,14 @@ pub fn open(alloc: std.mem.Allocator, path: []const u8, read_data: bool) ?std.fs
     return file;
 }
 
-fn create(name_w: []const u16, parent: ?windows.HANDLE, attributes: u32, no_follow: bool, read_data: bool, pin_reparse: bool, handle: *windows.HANDLE) windows.NTSTATUS {
+const CreateOptions = struct {
+    /// Open a reparse point itself instead of what it points at.
+    no_follow: bool = false,
+    read_data: bool = false,
+    pin_reparse: bool = false,
+};
+
+fn create(name_w: []const u16, parent: ?windows.HANDLE, attributes: u32, options: CreateOptions, handle: *windows.HANDLE) windows.NTSTATUS {
     var name: windows.UNICODE_STRING = .{
         .Length = @intCast(name_w.len * 2),
         .MaximumLength = @intCast(name_w.len * 2),
@@ -51,16 +57,16 @@ fn create(name_w: []const u16, parent: ?windows.HANDLE, attributes: u32, no_foll
     var io: windows.IO_STATUS_BLOCK = undefined;
     return windows.ntdll.NtCreateFile(
         handle,
-        windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE | (if (read_data) @as(u32, windows.FILE_READ_DATA) else 0),
+        windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE | (if (options.read_data) @as(u32, windows.FILE_READ_DATA) else 0),
         &attrs,
         &io,
         null,
         windows.FILE_ATTRIBUTE_NORMAL,
         // Pin only reparse objects against replacement and reparse-data writes.
         // Ordinary files (including actively written logs) retain shared access.
-        if (pin_reparse) windows.FILE_SHARE_READ else windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        if (options.pin_reparse) windows.FILE_SHARE_READ else windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
         windows.FILE_OPEN,
-        windows.FILE_SYNCHRONOUS_IO_NONALERT | (if (no_follow) @as(u32, windows.FILE_OPEN_REPARSE_POINT) else 0),
+        windows.FILE_SYNCHRONOUS_IO_NONALERT | (if (options.no_follow) @as(u32, windows.FILE_OPEN_REPARSE_POINT) else 0),
         null,
         0,
     );
@@ -86,15 +92,11 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
         root_w.data[root_w.len] = 0;
     }
     var parent: windows.HANDLE = undefined;
-    if (create(root_w.span(), null, OBJ_DONT_REPARSE, true, false, false, &parent) != .SUCCESS) return null;
+    if (create(root_w.span(), null, OBJ_DONT_REPARSE, .{ .no_follow = true }, &parent) != .SUCCESS) return null;
     var own_parent = true;
     defer if (own_parent) windows.CloseHandle(parent);
-    {
-        var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-        var io: windows.IO_STATUS_BLOCK = undefined;
-        if (windows.ntdll.NtQueryInformationFile(parent, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS or
-            info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 or !hasLocalFinalPath(parent)) return null;
-    }
+    const root_info = attributeTag(parent) orelse return null;
+    if (root_info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 or !hasLocalFinalPath(parent)) return null;
     var start = root_len;
     while (start < path.len) {
         if (remaining.* == 0) return null;
@@ -104,19 +106,18 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
         const name_w = std.unicode.utf8ToUtf16LeAlloc(alloc, path[start..end]) catch return null;
         defer alloc.free(name_w);
         var child: windows.HANDLE = undefined;
-        if (create(name_w, parent, 0, true, last and read_data, false, &child) != .SUCCESS) return null;
+        if (create(name_w, parent, 0, .{ .no_follow = true, .read_data = last and read_data }, &child) != .SUCCESS) return null;
         var own_child = true;
         defer if (own_child) windows.CloseHandle(child);
-        var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-        var io: windows.IO_STATUS_BLOCK = undefined;
-        if (windows.ntdll.NtQueryInformationFile(child, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS) return null;
+        const info = attributeTag(child) orelse return null;
         if (info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) {
             var pinned: windows.HANDLE = undefined;
-            if (create(name_w, parent, 0, true, last and read_data, true, &pinned) != .SUCCESS) return null;
-            var pinned_info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-            if (windows.ntdll.NtQueryInformationFile(pinned, &io, &pinned_info, @sizeOf(@TypeOf(pinned_info)), .FileAttributeTagInformation) != .SUCCESS or
-                pinned_info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 or pinned_info.ReparseTag != info.ReparseTag)
-            {
+            if (create(name_w, parent, 0, .{ .no_follow = true, .read_data = last and read_data, .pin_reparse = true }, &pinned) != .SUCCESS) return null;
+            const still_same = if (attributeTag(pinned)) |pinned_info|
+                pinned_info.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 and pinned_info.ReparseTag == info.ReparseTag
+            else
+                false;
+            if (!still_same) {
                 windows.CloseHandle(pinned);
                 return null;
             }
@@ -137,7 +138,7 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
             // this component relative to the pinned parent, then verify locality.
             if (!isCloudTag(info.ReparseTag)) return null;
             var hydrated: windows.HANDLE = undefined;
-            if (create(name_w, parent, 0, false, last and read_data, false, &hydrated) != .SUCCESS) return null;
+            if (create(name_w, parent, 0, .{ .read_data = last and read_data }, &hydrated) != .SUCCESS) return null;
             windows.CloseHandle(child);
             child = hydrated;
             if (!hasLocalFinalPath(child)) return null;
@@ -153,6 +154,13 @@ fn walk(alloc: std.mem.Allocator, path: []const u8, read_data: bool, depth: usiz
     }
     own_parent = false;
     return .{ .handle = parent };
+}
+
+fn attributeTag(handle: windows.HANDLE) ?windows.FILE_ATTRIBUTE_TAG_INFO {
+    var info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
+    var io: windows.IO_STATUS_BLOCK = undefined;
+    if (windows.ntdll.NtQueryInformationFile(handle, &io, &info, @sizeOf(@TypeOf(info)), .FileAttributeTagInformation) != .SUCCESS) return null;
+    return info;
 }
 
 fn isCloudTag(tag: u32) bool {
@@ -212,8 +220,8 @@ fn hasLocalFinalPath(handle: windows.HANDLE) bool {
     var buffer: [windows.PATH_MAX_WIDE]u16 = undefined;
     // VOLUME_NAME_DOS normally gives a drive path. A mounted local volume may
     // have no drive letter; VOLUME_NAME_GUID still identifies its local root.
-    var count = GetFinalPathNameByHandleW(handle, &buffer, buffer.len, 0);
-    if (count == 0) count = GetFinalPathNameByHandleW(handle, &buffer, buffer.len, 1);
+    var count = sys.GetFinalPathNameByHandleW(handle, &buffer, buffer.len, 0);
+    if (count == 0) count = sys.GetFinalPathNameByHandleW(handle, &buffer, buffer.len, 1);
     if (count == 0 or count >= buffer.len) return false;
     const name = std.unicode.utf16LeToUtf8Alloc(std.heap.page_allocator, buffer[0..count]) catch return false;
     defer std.heap.page_allocator.free(name);
@@ -235,6 +243,11 @@ fn testProductionDosMapping(comptime walked: bool) !void {
             return null;
         }
     };
+    const Opener = struct {
+        fn run(alloc: std.mem.Allocator, path: []const u8, remaining: *usize) ?std.fs.File {
+            return if (walked) walk(alloc, path, true, 0, remaining) else open(alloc, path, true);
+        }
+    };
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -245,17 +258,17 @@ fn testProductionDosMapping(comptime walked: bool) !void {
     // Enter the actual production path, injecting only the OS device query.
     os_windows.TestHooks.direct_volume_mapping = Reject.map;
     defer os_windows.TestHooks.direct_volume_mapping = null;
-    const refused = if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true);
+    const refused = Opener.run(alloc, path, &remaining);
     defer if (refused) |file| file.close();
     try std.testing.expectEqual(null, refused);
     // Consulting a mapped copy but opening the original DOS path must fail
     // too, even on Windows 11 where that original path would open normally.
     os_windows.TestHooks.direct_volume_mapping = os_windows.TestHooks.unavailableVolume;
-    const redirected = if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true);
+    const redirected = Opener.run(alloc, path, &remaining);
     defer if (redirected) |file| file.close();
     try std.testing.expectEqual(null, redirected);
     os_windows.TestHooks.direct_volume_mapping = null;
-    const opened = (if (walked) walk(alloc, path, true, 0, &remaining) else open(alloc, path, true)) orelse return error.TestUnexpectedResult;
+    const opened = Opener.run(alloc, path, &remaining) orelse return error.TestUnexpectedResult;
     defer opened.close();
     var data: [4]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), try opened.read(&data));
@@ -280,7 +293,7 @@ test "link opener walks local volume GUID mount targets" {
     const file = try tmp.dir.openFile("safe.txt", .{});
     defer file.close();
     var wide: [windows.PATH_MAX_WIDE]u16 = undefined;
-    const count = GetFinalPathNameByHandleW(file.handle, &wide, wide.len, 1);
+    const count = sys.GetFinalPathNameByHandleW(file.handle, &wide, wide.len, 1);
     try std.testing.expect(count > 0 and count < wide.len);
     const name = try std.unicode.utf16LeToUtf8Alloc(alloc, wide[0..count]);
     defer alloc.free(name);

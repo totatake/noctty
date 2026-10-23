@@ -2,7 +2,7 @@
 // refreshes from GitHub Releases when the browser is idle. Never downgrades
 // below the compiled version.
 
-const DEFAULT_NC_VERSION = '1.3.133';
+const DEFAULT_NC_VERSION = '1.3.134';
 const NC_REPO = 'amanthanvi/noctty';
 const CACHE_KEY = 'nc-latest-release-v1';
 const CACHE_TTL_MS = 30 * 60 * 1000;
@@ -50,7 +50,7 @@ function renderVersion(version) {
   if (versionEl) versionEl.textContent = `v${version}`;
   const summary = document.getElementById('nc-version-summary');
   if (summary) {
-    summary.textContent = `Version ${version}, latest release, for Windows 10 and 11 on x64 and ARM64, MIT licensed.`;
+    summary.textContent = `Version ${version}, latest release, for Windows 11, and Windows 10 version 1809 or later (supported, not tested), on x64 and ARM64.`;
   }
 }
 

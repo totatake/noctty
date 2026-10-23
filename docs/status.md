@@ -173,7 +173,11 @@ Win32-validated VT protocol coverage is tracked in
 - Session restore via `window-save-state`: windows, tabs, splits, profiles,
   working directories, and explicit titles come back; child processes do
   not. The opt-in `window-save-state-scrollback` line count also restores
-  bounded, clearly marked plain-text pane snapshots. Only one noctty process
+  bounded, clearly marked plain-text pane snapshots. The next launch restores
+  what was open when the session ended: what the last window held when it
+  went, however it went (its close, its last tab or pane, its last shell
+  exiting), or every window a quit closed. Undo history is not saved. Only
+  one noctty process
   owns `session-state.json`; a second instance, a forwarded launch, `-e` and
   `--working-directory` launches neither restore nor save it.
 - Named layouts (C17): save the focused window's tabs, splits, profiles,
@@ -265,11 +269,15 @@ Win32-validated VT protocol coverage is tracked in
 ### Windows package managers
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
-- Chocolatey package id: `noctty` (the release workflow builds it and its
-  last step runs after WinGet, but the publish script skips the push while no
-  `CHOCO_API_KEY` secret is configured, as in 1.3.132; community.chocolatey.org
-  had no `noctty` package on 2026-10-16). The first submission then waits in
-  moderation for weeks, and later pushes get `403` until a version is
+- Chocolatey package id: `noctty`, with no approved version on
+  community.chocolatey.org. The release workflow builds the package and its
+  last step, after WinGet, pushes it. The community maintainer `virtualex`,
+  who submitted `noctty` 1.3.131 on 2026-10-16, added `amanthanvi` as a
+  maintainer on 2026-10-20, stayed on as a co-maintainer, and rejected 1.3.131.
+  The Chocolatey Publish workflow pushed 1.3.134 on 2026-10-21, and it is
+  waiting in moderation. chocolatey.org refuses every new version while a
+  version is in moderation and none is approved, so the repository variable
+  `CHOCOLATEY_PUBLISH = off` skips the release step until a version is
   approved; see [chocolatey-publishing.md](chocolatey-publishing.md). A
   released version is pushed with the manual Chocolatey Publish workflow.
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
@@ -287,7 +295,10 @@ Win32-validated VT protocol coverage is tracked in
   startup failures fall back to safe mode (a launch that ends only because
   OpenGL cannot start is not counted). A saved session that keeps ending
   the process during restore is renamed to `session-state.json.restore-failed`
-  instead of being restored again. Details in
+  instead of being restored again. A restored session whose programs all
+  ended by themselves before anyone used it is renamed to
+  `session-state.json.restore-ended` instead of being saved back.
+  Details in
   [windows.md](windows.md#session-restore-and-recovery).
 - `+diagnostic-bundle` exports are explicit and redact terminal content,
   environment, and config values by default.
@@ -444,6 +455,15 @@ lands incrementally.
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
+- Since 1.3.132 (#335) noctty sends keys to ConPTY as Win32 input records
+  (unless the program asked for the Kitty keyboard protocol). A record's text
+  is Windows' translation of the key against the keyboard state at key-down,
+  not a `WM_CHAR` that follows it. So a tool that types into noctty by sending
+  `WM_KEYDOWN` and then `WM_CHAR` to its window (`SendMessage`) without setting
+  that keyboard state (for example with `AttachThreadInput` and
+  `SetKeyboardState`) gets a Shift chord's unshifted character: Shift+.
+  arrives as `.`, and the tool's `WM_CHAR` is dropped. Real keys, `SendInput`
+  and IME commits are unaffected.
 - A Japanese IME commit of 【】 freezes input in a `wslc exec -it` session
   (#395); reading wslc's source points at `wslc.exe` itself, not noctty (not
   reproduced with a real IME or container).

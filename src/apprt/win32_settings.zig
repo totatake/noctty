@@ -31,6 +31,7 @@ const settings_transaction = @import("win32_settings_transaction.zig");
 const sys = @import("win32/sys.zig");
 const config_problems = @import("win32/config_problems.zig");
 const field_model = @import("win32_settings_fields.zig");
+const bench_trace = @import("win32/bench_trace.zig");
 const SetFocus = sys.SetFocus;
 
 /// Minimal set of Win32 aliases + externs we need here. Shared ABI structs
@@ -176,7 +177,7 @@ const BS_PUSHLIKE: u32 = 0x1000;
 const BS_OWNERDRAW: u32 = 0xB;
 const SS_LEFT: u32 = 0x0000;
 const SS_NOPREFIX: u32 = 0x0080;
-const BTN_OPEN_EDITOR: usize = 101;
+const BTN_OPEN_EDITOR: usize = displayFieldId("btn_open_editor");
 const BTN_SECTION_APPEARANCE: usize = 201;
 const BTN_SECTION_TERMINAL: usize = 202;
 const BTN_SECTION_SHELL: usize = 203;
@@ -185,7 +186,7 @@ const BTN_SECTION_ADVANCED: usize = 205;
 const BTN_SECTION_PRIVACY: usize = 206;
 const BTN_SECTION_UPDATES: usize = 207;
 const BTN_SAVE: usize = 301;
-const BTN_KEYBINDINGS_EDITOR: usize = 302;
+const BTN_KEYBINDINGS_EDITOR: usize = displayFieldId("btn_keybindings_editor");
 const BTN_CONFLICT_KEEP: usize = 303;
 const BTN_CONFLICT_USE_DISK: usize = 304;
 const BTN_CLOSE_SAVE: usize = 305;
@@ -196,32 +197,19 @@ const BTN_DISCARD_CHANGES: usize = 307;
 // close prompt's "Keep editing" button owns that ID.
 const IDCANCEL: usize = 2;
 const BTN_CLOSE_KEEP_EDITING: usize = IDCANCEL;
-const EDIT_SCROLLBACK: usize = 401;
-const EDIT_FONT_SIZE: usize = 402;
-const COMBO_CONFIRM_CLOSE: usize = 403;
-const COMBO_COPY_ON_SELECT: usize = 404;
-const COMBO_WINDOW_THEME: usize = 405;
-const COMBO_SHELL_INTEG: usize = 406;
-const CHK_TRIM_TRAIL: usize = 407;
-const EDIT_BG_OPACITY: usize = 408;
-const COMBO_CURSOR_STYLE: usize = 409;
-const CHK_BG_BLUR: usize = 410;
-const COMBO_PAD_BALANCE: usize = 411;
-const EDIT_FONT_FAMILY: usize = 412;
-const EDIT_THEME: usize = 413;
-const EDIT_COMMAND: usize = 414;
-const EDIT_PAD_X: usize = 415;
-const EDIT_PAD_Y: usize = 416;
-const CHK_DESKTOP_NOTIFICATIONS: usize = 417;
-const CHK_APP_NOTIFY_CLIPBOARD: usize = 418;
-const CHK_APP_NOTIFY_CONFIG: usize = 419;
-const COMBO_AUTO_UPDATE: usize = 420;
-const COMBO_AUTO_UPDATE_CHANNEL: usize = 421;
-const COMBO_CLIPBOARD_READ: usize = 422;
-const COMBO_CLIPBOARD_WRITE: usize = 423;
-const COMBO_LINK_URL: usize = 424;
-const COMBO_LINK_PREVIEWS: usize = 425;
-const CHK_ACCENT_FOLLOW: usize = 426;
+fn nativeFieldId(comptime binding: []const u8) usize {
+    for (field_model.form_fields) |row| if (std.mem.eql(u8, row.native.binding, binding)) return row.native.id;
+    @compileError("Missing Settings native control: " ++ binding);
+}
+fn displayFieldId(comptime binding: []const u8) usize {
+    for (field_model.display_rows) |row| if (std.mem.eql(u8, row.native.binding, binding)) return row.native.id;
+    @compileError("Missing Settings display row: " ++ binding);
+}
+const EDIT_SCROLLBACK: usize = nativeFieldId("edit_scrollback");
+const EDIT_FONT_SIZE: usize = nativeFieldId("edit_font_size");
+const EDIT_BG_OPACITY: usize = nativeFieldId("edit_bg_opacity");
+const EDIT_PAD_X: usize = nativeFieldId("edit_pad_x");
+const EDIT_PAD_Y: usize = nativeFieldId("edit_pad_y");
 const ES_NUMBER: u32 = 0x2000;
 const ES_AUTOHSCROLL: u32 = 0x80;
 const EN_CHANGE: u16 = 0x0300;
@@ -262,7 +250,6 @@ const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const SWP_NOSIZE: UINT = 0x0001;
 const SWP_NOMOVE: UINT = 0x0002;
 const SWP_NOZORDER: UINT = 0x0004;
-const SWP_NOREDRAW: UINT = 0x0008;
 const SWP_NOACTIVATE: UINT = 0x0010;
 const SWP_FRAMECHANGED: UINT = 0x0020;
 const SWP_NOCOPYBITS: UINT = 0x0100;
@@ -383,9 +370,6 @@ fn backgroundBlurFromCheckbox(
     };
 }
 
-const PaddingAxis = enum { x, y };
-const AppNotificationField = enum { clipboard, config };
-
 /// Ownership-safe native settings tracked by the transaction model. The three
 /// arena-backed edit fields use a parallel tracker below because transaction
 /// values must not borrow slices from replaceable Config snapshots.
@@ -433,7 +417,7 @@ test "settings field model round trips every descriptor" {
     try field_model.testRoundTrips(std.testing.allocator);
 }
 
-// Name contracts protect a future generated form from silently using palette
+// Name contracts protect the generated form from silently using palette
 // wording for UIA or the longer visible field captions. Providers stay intact.
 fn expectNativeFieldNames(names: field_model.NativeNames, kind: field_model.Kind, section: field_model.Section) !void {
     var control_index: ?usize = null;
@@ -472,6 +456,145 @@ fn expectNativeFieldNames(names: field_model.NativeNames, kind: field_model.Kind
     try std.testing.expectEqual(@as(usize, 1), form_uses);
 }
 
+/// Native notifications keep their existing typed/arena-owned adapters. This
+/// independent set is checked against the descriptor and persistence allowlist;
+/// a displayed row never silently grants permission to save a new Config key.
+const FieldAdapter = struct {
+    display: *const fn (*SettingsWindow) void,
+    changed: *const fn (*SettingsWindow) void,
+    left: ?*const fn (*SettingsWindow) void = null,
+    /// The typed field a generic adapter edits through its own descriptor's
+    /// control; checked against the row the adapter is keyed by.
+    field: ?SettingField = null,
+};
+fn ownedEditChanged(comptime field: OwnedSettingField, comptime binding: []const u8) *const fn (*SettingsWindow) void {
+    return struct {
+        fn changed(self: *SettingsWindow) void {
+            if (@field(self.fields, binding)) |edit| self.markOwnedTextChanged(field, edit);
+        }
+    }.changed;
+}
+fn display_edit_font_family(self: *SettingsWindow) void {
+    if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.font_family)]) self.displayFontFamilyInEdit();
+}
+fn display_edit_theme(self: *SettingsWindow) void {
+    if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.theme)]) self.displayThemeInEdit();
+}
+fn display_edit_command(self: *SettingsWindow) void {
+    if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.command)]) self.displayCommandInEdit();
+}
+/// A dropdown whose items are the field's curated `Combo` options.
+fn comboAdapter(comptime field: SettingField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayCombo(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncCombo(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field };
+}
+/// A checkbox for a plain bool field or a bool projection.
+fn checkboxAdapter(comptime field: SettingField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayCheckbox(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncCheckbox(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field };
+}
+/// A number text field (scrollback, font size, opacity).
+fn numberAdapter(comptime field: RawScalarField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayNumberInEdit(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncNumberFromEdit(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field.setting() };
+}
+/// A window padding text field: one value or a comma-separated pair.
+fn paddingAdapter(comptime field: RawScalarField) FieldAdapter {
+    const bound = struct {
+        fn display(self: *SettingsWindow) void {
+            self.displayPaddingInEdit(field);
+        }
+        fn changed(self: *SettingsWindow) void {
+            self.syncPaddingFromEdit(field);
+        }
+    };
+    return .{ .display = bound.display, .changed = bound.changed, .field = field.setting() };
+}
+const field_adapters = .{
+    .edit_scrollback = numberAdapter(.scrollback_limit),
+    .edit_font_size = numberAdapter(.font_size),
+    .edit_bg_opacity = numberAdapter(.background_opacity),
+    .chk_trim_trail = checkboxAdapter(.trim_trailing_spaces),
+    .chk_desktop_notifications = checkboxAdapter(.desktop_notifications),
+    .combo_confirm_close = comboAdapter(.confirm_close),
+    .combo_copy_on_select = comboAdapter(.copy_on_select),
+    .combo_link_url = comboAdapter(.link_url),
+    .combo_link_previews = comboAdapter(.link_previews),
+    .combo_window_theme = comboAdapter(.window_theme),
+    .combo_shell_integ = comboAdapter(.shell_integration),
+    .combo_cursor_style = comboAdapter(.cursor_style),
+    .chk_accent_follow = checkboxAdapter(.accent_follow_system),
+    .chk_bg_blur = FieldAdapter{ .display = SettingsWindow.displayBgBlurInCheckbox, .changed = SettingsWindow.syncBgBlurFromCheckbox },
+    .combo_pad_balance = comboAdapter(.padding_balance),
+    .combo_auto_update = comboAdapter(.auto_update),
+    .combo_auto_update_channel = comboAdapter(.auto_update_channel),
+    .edit_font_family = FieldAdapter{ .display = display_edit_font_family, .changed = ownedEditChanged(.font_family, "edit_font_family"), .left = SettingsWindow.syncFontFamilyFromEdit },
+    .edit_theme = FieldAdapter{ .display = display_edit_theme, .changed = ownedEditChanged(.theme, "edit_theme"), .left = SettingsWindow.syncThemeFromEdit },
+    .edit_command = FieldAdapter{ .display = display_edit_command, .changed = ownedEditChanged(.command, "edit_command"), .left = SettingsWindow.syncCommandFromEdit },
+    .edit_pad_x = paddingAdapter(.window_padding_x),
+    .edit_pad_y = paddingAdapter(.window_padding_y),
+    .chk_app_notify_clipboard = checkboxAdapter(.app_notify_clipboard),
+    .chk_app_notify_config = checkboxAdapter(.app_notify_config),
+    .combo_clipboard_read = comboAdapter(.clipboard_read),
+    .combo_clipboard_write = comboAdapter(.clipboard_write),
+};
+
+comptime {
+    field_model.assertCoverage(editable_keys);
+    for (field_model.form_fields) |row| {
+        if (!@hasField(@TypeOf(field_adapters), row.native.binding))
+            @compileError("Editable Settings descriptor has no native adapter: " ++ row.native.binding);
+        if (@field(field_adapters, row.native.binding).field) |field| {
+            if (row.field == null or row.field.? != field)
+                @compileError("Settings adapter edits another field than its row: " ++ row.native.binding);
+        }
+        // A scalar/projection uses the value-safe transaction; an owned field
+        // must have the matching explicit arena-owned adapter.
+        if (row.field == null) {
+            var matches: usize = 0;
+            for (std.enums.values(OwnedSettingField)) |owned| {
+                if (owned.descriptor().key == row.descriptor.key) matches += 1;
+            }
+            if (matches != 1) @compileError("Owned Settings descriptor needs exactly one adapter");
+        }
+    }
+    for (std.meta.fields(@TypeOf(field_adapters))) |adapter| {
+        var matches: usize = 0;
+        for (field_model.form_fields) |row| {
+            if (std.mem.eql(u8, adapter.name, row.native.binding)) matches += 1;
+        }
+        if (matches != 1) @compileError("Settings adapter needs exactly one editable descriptor: " ++ adapter.name);
+    }
+    for (std.enums.values(OwnedSettingField)) |owned| {
+        var matches: usize = 0;
+        for (field_model.form_fields) |row| if (row.field == null and row.descriptor.key == owned.descriptor().key) {
+            matches += 1;
+        };
+        if (matches != 1) @compileError("Owned Settings adapter needs exactly one editable descriptor");
+    }
+}
+
 /// The complete persistence allowlist. Effective config contains derived fields
 /// and expanded include/shader paths which the native form does not edit.
 pub const editable_keys = .{
@@ -486,10 +609,6 @@ pub const editable_keys = .{
     Config.Key.@"accent-follow-system",
 };
 
-comptime {
-    field_model.assertCoverage(editable_keys);
-}
-
 /// Scalar EDIT controls whose raw text can temporarily be invalid and
 /// therefore cannot yet be represented by the typed settings transaction.
 const RawScalarField = enum {
@@ -499,10 +618,15 @@ const RawScalarField = enum {
     window_padding_x,
     window_padding_y,
 
-    fn section(self: RawScalarField) Section {
+    /// The typed field the text parses into once it is valid.
+    fn setting(self: RawScalarField) SettingField {
         return switch (self) {
-            inline else => |field| nativeSection(field_model.descriptor(@field(SettingField, @tagName(field))).section),
+            inline else => |field| @field(SettingField, @tagName(field)),
         };
+    }
+
+    fn section(self: RawScalarField) Section {
+        return nativeSection(field_model.descriptor(self.setting()).section);
     }
 };
 
@@ -673,6 +797,11 @@ pub const ApplyId = SettingsTransaction.ApplyId;
 
 const settingValue = field_model.settingValue;
 pub const setSettingValue = field_model.setSettingValue;
+
+/// `field`'s value in `config`, unwrapped from the transaction's union.
+fn fieldValue(config: *const Config, comptime field: SettingField) @FieldType(SettingValue, @tagName(field)) {
+    return @field(settingValue(config, field), @tagName(field));
+}
 
 /// `text` without its backticks. The CLI help is written for Markdown; the
 /// Settings window shows plain text, where a backtick is just noise.
@@ -884,159 +1013,198 @@ const edit_text_max_utf8: usize = edit_text_max_code_units * 3;
 /// The accessible name stays the prefix, "Scrollback limit".
 const scrollback_label = field_model.forKey(.@"scrollback-limit").?.native.?.form_label.?;
 
-const settings_label_specs = [_][]const u8{
-    scrollback_label,
-    "Close confirmation",
-    "Copy on select",
-    "Font family fallbacks (comma-separated)",
-    "Font size (pt)",
-    "Terminal theme name, absolute path, or light/dark pair",
-    "Background opacity (0.0 .. 1.0)",
-    "Window theme",
-    "Cursor style",
-    "Window padding X (left/right or single value)",
-    "Window padding Y (top/bottom or single value)",
-    "Window padding balance",
-    "Default command (blank = auto-detect)",
-    "Shell integration",
-    "OSC 52 clipboard read requests",
-    "OSC 52 clipboard write requests",
-    "Clickable URL opening",
-    link_previews_label,
-    "Notifications",
-    "Auto-update mode",
-    "Auto-update channel",
-    "Keybind configuration",
-    "Full config editor",
+const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
+const FormControl = struct {
+    role: SettingsControlRole,
+    name: []const u8,
+    binding: []const u8,
+    id: usize,
+    section: ?Section = null,
+    order: usize = 0,
+    label: ?[]const u8 = null,
+    caption: ?[]const u8 = null,
+    help: []const u8 = "",
 };
 
-const settings_text_count = 5 + settings_label_specs.len;
-/// Positions in `SettingsWindow.textHwnd`.
-const text_status_index = 2;
-const text_close_prompt_index = 3;
-const background_blur_label = field_model.descriptor(.background_blur).nativeNames().?.caption.?;
-const link_previews_label = field_model.descriptor(.link_previews).nativeNames().?.form_label.?;
-/// A file-level constant: `open` already spends its comptime branch quota on
-/// the other labels, and one more literal there fails the build.
-const accent_follow_caption = "Follow Windows accent color";
-const accent_follow_label = std.unicode.utf8ToUtf16LeStringLiteral(accent_follow_caption);
-const trim_trailing_label = "Trim trailing spaces on copy";
-const desktop_notifications_label = "Allow terminal desktop notifications";
-const notify_clipboard_label = "Notify when clipboard copy completes";
-const notify_config_label = "Notify after config reload";
-// Indexed like settings_control_specs; only native checkbox controls have captions.
-const checkbox_captions = captions: {
-    var result: [settings_control_count]?[]const u8 = @splat(null);
-    result[3] = trim_trailing_label;
-    result[13] = background_blur_label;
-    result[20] = desktop_notifications_label;
-    result[21] = notify_clipboard_label;
-    result[22] = notify_config_label;
-    result[27] = accent_follow_caption;
-    break :captions result;
+fn fieldRole(kind: field_model.Kind) SettingsControlRole {
+    return switch (kind) {
+        .boolean, .blur => .check_box,
+        .choice => .combo_box,
+        else => .edit,
+    };
+}
+
+fn displayRowSpec(row: field_model.DisplayRow) FormControl {
+    return .{
+        .role = if (row.kind == .action) .button else .text,
+        .name = row.native.accessible_name,
+        .binding = row.native.binding,
+        .id = row.native.id,
+        .section = nativeSection(row.section),
+        .order = row.native.order,
+        .label = row.native.form_label,
+        .caption = row.native.caption,
+        .help = row.help,
+    };
+}
+
+/// `style` adds the window's final visibility and group (`WS_VISIBLE`, `WS_GROUP`).
+fn makeDisplayControl(parent: HWND, hinstance: HINSTANCE, comptime spec: FormControl, style: u32) ?HWND {
+    return switch (comptime spec.role) {
+        .button => sys.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | style, 0, 0, settings_field_max_width, settings_control_height, parent, @ptrFromInt(spec.id), hinstance, null),
+        .text => blk: {
+            const text = makeStatic(parent, hinstance, spec.caption orelse spec.name, style);
+            if (text) |control| _ = sys.SetWindowLongPtrW(control, -12, @intCast(spec.id)); // GWLP_ID
+            break :blk text;
+        },
+        else => @compileError("Display-only Settings rows cannot create editable controls"),
+    };
+}
+
+// Display-only rows are independent of persistence ownership and edit adapters.
+const settings_form_actions = rows: {
+    var result: [field_model.display_rows.len]FormControl = undefined;
+    for (field_model.display_rows, 0..) |row, i| result[i] = displayRowSpec(row);
+    break :rows result;
 };
-const SettingsControlRole = win32_uia.SettingsControlProvider.Role;
-const settings_control_specs = [_]struct { role: SettingsControlRole, name: []const u8 }{
-    .{ .role = .edit, .name = "Scrollback limit" },
-    .{ .role = .combo_box, .name = "Close confirmation" },
-    .{ .role = .combo_box, .name = "Copy on select" },
-    .{ .role = .check_box, .name = "Clipboard trimming" },
-    .{ .role = .edit, .name = "Font family fallbacks" },
-    .{ .role = .edit, .name = "Font size" },
-    .{ .role = .edit, .name = "Terminal theme" },
-    .{ .role = .edit, .name = "Background opacity" },
-    .{ .role = .combo_box, .name = "Window theme" },
-    .{ .role = .combo_box, .name = "Cursor style" },
-    .{ .role = .edit, .name = "Window padding X" },
-    .{ .role = .edit, .name = "Window padding Y" },
-    .{ .role = .combo_box, .name = "Window padding balance" },
-    .{ .role = .check_box, .name = background_blur_label },
-    .{ .role = .edit, .name = "Default command" },
-    .{ .role = .combo_box, .name = "Shell integration" },
-    .{ .role = .combo_box, .name = "OSC 52 clipboard read requests" },
-    .{ .role = .combo_box, .name = "OSC 52 clipboard write requests" },
-    .{ .role = .combo_box, .name = "Clickable URL opening" },
-    .{ .role = .combo_box, .name = link_previews_label },
-    .{ .role = .check_box, .name = "Terminal notifications" },
-    .{ .role = .check_box, .name = "Clipboard-copy notification" },
-    .{ .role = .check_box, .name = "Config-reload notification" },
-    .{ .role = .combo_box, .name = "Auto-update mode" },
-    .{ .role = .combo_box, .name = "Auto-update channel" },
-    .{ .role = .button, .name = "Keybind configuration" },
-    .{ .role = .button, .name = "Full config editor" },
-    .{ .role = .check_box, .name = "Follow Windows accent color" },
-    .{ .role = .button, .name = "Save" },
-    .{ .role = .button, .name = "Keep mine" },
-    .{ .role = .button, .name = "Use disk" },
-    .{ .role = .button, .name = "Save and close" },
-    .{ .role = .button, .name = "Discard changes" },
-    .{ .role = .button, .name = "Keep editing" },
-    // The same words as the close prompt's button, which is hidden whenever
-    // this one shows (and the other way round).
-    .{ .role = .button, .name = "Discard changes" },
+const settings_action_controls = [_]FormControl{
+    .{ .role = .button, .name = "Save", .binding = "btn_save", .id = BTN_SAVE },
+    .{ .role = .button, .name = "Keep mine", .binding = "btn_conflict_keep", .id = BTN_CONFLICT_KEEP },
+    .{ .role = .button, .name = "Use disk", .binding = "btn_conflict_use_disk", .id = BTN_CONFLICT_USE_DISK },
+    .{ .role = .button, .name = "Save and close", .binding = "btn_close_save", .id = BTN_CLOSE_SAVE },
+    .{ .role = .button, .name = "Discard changes", .binding = "btn_close_discard", .id = BTN_CLOSE_DISCARD },
+    .{ .role = .button, .name = "Keep editing", .binding = "btn_close_keep_editing", .id = BTN_CLOSE_KEEP_EDITING },
+    .{ .role = .button, .name = "Discard changes", .binding = "btn_discard_changes", .id = BTN_DISCARD_CHANGES },
+};
+const settings_control_specs = specs: {
+    @setEvalBranchQuota(20000);
+    var result: [field_model.form_fields.len + settings_form_actions.len + settings_action_controls.len]FormControl = undefined;
+    for (field_model.form_fields, 0..) |row, i| result[i] = .{
+        .role = fieldRole(row.kind()),
+        .name = row.native.accessible_name,
+        .binding = row.native.binding,
+        .id = row.native.id,
+        .section = nativeSection(row.descriptor.section),
+        .order = row.native.order,
+        .label = row.native.form_label,
+        .caption = row.native.caption,
+        .help = row.descriptor.helpText(),
+    };
+    @memcpy(result[field_model.form_fields.len..][0..settings_form_actions.len], &settings_form_actions);
+    @memcpy(result[field_model.form_fields.len + settings_form_actions.len ..], &settings_action_controls);
+    break :specs result;
 };
 const settings_control_count = settings_control_specs.len;
-// Save, conflict resolution, discard and dirty-close actions remain fixed in
-// the action bar; only the leading content controls are clipped to the viewport.
-const settings_header_control_count = 7;
+const settings_header_control_count = settings_action_controls.len;
 const settings_clipped_control_count = settings_control_count - settings_header_control_count;
+
+comptime {
+    for (settings_control_specs, 0..) |spec, i| {
+        if (spec.id <= 1) @compileError("Settings control ID is reserved for static/default dialog controls");
+        for (settings_control_specs[0..i]) |other| {
+            if (spec.id == other.id) @compileError("Duplicate Settings control ID");
+            if (spec.section != null and spec.section == other.section and spec.order == other.order)
+                @compileError("Duplicate Settings form row position");
+        }
+        for (.{ BTN_SECTION_APPEARANCE, BTN_SECTION_TERMINAL, BTN_SECTION_SHELL, BTN_SECTION_KEYBINDINGS, BTN_SECTION_ADVANCED, BTN_SECTION_PRIVACY, BTN_SECTION_UPDATES }) |id| {
+            if (spec.id == id) @compileError("Settings form ID collides with section navigation");
+        }
+    }
+}
+
+const FieldWindows = handles: {
+    const empty: ?HWND = null;
+    var members: [settings_clipped_control_count]std.builtin.Type.StructField = undefined;
+    for (settings_control_specs[0..settings_clipped_control_count], 0..) |row, i| members[i] = .{
+        .name = row.binding ++ "\x00",
+        .type = ?HWND,
+        .default_value_ptr = @ptrCast(&empty),
+        .is_comptime = false,
+        .alignment = @alignOf(?HWND),
+    };
+    break :handles @Type(.{ .@"struct" = .{ .layout = .auto, .fields = &members, .decls = &.{}, .is_tuple = false } });
+};
+
+const settings_label_specs = labels: {
+    var count: usize = 0;
+    for (settings_control_specs) |spec| if (spec.label != null) {
+        count += 1;
+    };
+    var result: [count][]const u8 = undefined;
+    var index: usize = 0;
+    for (settings_control_specs) |spec| if (spec.label) |label| {
+        result[index] = label;
+        index += 1;
+    };
+    break :labels result;
+};
+const checkbox_captions = captions: {
+    var result: [settings_control_count]?[]const u8 = @splat(null);
+    for (settings_control_specs, 0..) |spec, i| if (spec.role == .check_box) {
+        result[i] = spec.caption;
+    };
+    break :captions result;
+};
+/// Indices of the text providers: the header texts, then the field labels.
+const text_header_index = 0;
+const text_summary_index = 1;
+const text_status_index = 2;
+const text_close_prompt_index = 3;
+const text_help_index = 4;
+const text_first_label_index = 5;
+const settings_text_count = text_first_label_index + settings_label_specs.len;
+const background_blur_label = field_model.descriptor(.background_blur).nativeNames().?.caption.?;
 
 const FormItem = struct {
     control_index: usize,
     label_index: ?usize = null,
     checkbox: bool = false,
 };
-const terminal_form_items = [_]FormItem{
-    .{ .control_index = 0, .label_index = 0 },
-    .{ .control_index = 1, .label_index = 1 },
-    .{ .control_index = 2, .label_index = 2 },
-    .{ .control_index = 3, .checkbox = true },
+const section_form_items = forms: {
+    @setEvalBranchQuota(20000);
+    var result: [section_count][settings_clipped_control_count]FormItem = undefined;
+    for (std.enums.values(Section), 0..) |section, section_index| {
+        var count: usize = 0;
+        var label_index: usize = 0;
+        for (settings_control_specs, 0..) |spec, i| {
+            if (spec.section == section) {
+                result[section_index][count] = .{ .control_index = i, .label_index = if (spec.label != null) label_index else null, .checkbox = spec.role == .check_box };
+                count += 1;
+            }
+            if (spec.label != null) label_index += 1;
+        }
+        // Section order is descriptor data; no parallel per-section indices.
+        for (0..count) |i| for (i + 1..count) |j| {
+            if (settings_control_specs[result[section_index][j].control_index].order <
+                settings_control_specs[result[section_index][i].control_index].order)
+                std.mem.swap(FormItem, &result[section_index][i], &result[section_index][j]);
+        };
+    }
+    break :forms result;
 };
-const appearance_form_items = [_]FormItem{
-    .{ .control_index = 4, .label_index = 3 },
-    .{ .control_index = 5, .label_index = 4 },
-    .{ .control_index = 6, .label_index = 5 },
-    .{ .control_index = 7, .label_index = 6 },
-    .{ .control_index = 8, .label_index = 7 },
-    .{ .control_index = 9, .label_index = 8 },
-    .{ .control_index = 10, .label_index = 9 },
-    .{ .control_index = 11, .label_index = 10 },
-    .{ .control_index = 12, .label_index = 11 },
-    .{ .control_index = 27, .checkbox = true },
-    .{ .control_index = 13, .checkbox = true },
-};
-const shell_form_items = [_]FormItem{
-    .{ .control_index = 14, .label_index = 12 },
-    .{ .control_index = 15, .label_index = 13 },
-};
-const privacy_form_items = [_]FormItem{
-    .{ .control_index = 16, .label_index = 14 },
-    .{ .control_index = 17, .label_index = 15 },
-    .{ .control_index = 18, .label_index = 16 },
-    .{ .control_index = 19, .label_index = 17 },
-    .{ .control_index = 20, .label_index = 18, .checkbox = true },
-    .{ .control_index = 21, .checkbox = true },
-    .{ .control_index = 22, .checkbox = true },
-};
-const updates_form_items = [_]FormItem{
-    .{ .control_index = 23, .label_index = 19 },
-    .{ .control_index = 24, .label_index = 20 },
-};
-const keybindings_form_items = [_]FormItem{.{ .control_index = 25, .label_index = 21 }};
-const advanced_form_items = [_]FormItem{.{ .control_index = 26, .label_index = 22 }};
-fn formItemsForSection(section: Section) []const FormItem {
-    return switch (section) {
-        .terminal => &terminal_form_items,
-        .appearance => &appearance_form_items,
-        .shell => &shell_form_items,
-        .privacy => &privacy_form_items,
-        .updates => &updates_form_items,
-        .keybindings => &keybindings_form_items,
-        .advanced => &advanced_form_items,
+fn formItemCount(section: Section) usize {
+    var count: usize = 0;
+    for (settings_control_specs) |spec| if (spec.section == section) {
+        count += 1;
     };
+    return count;
 }
+fn formItemsForSection(section: Section) []const FormItem {
+    return section_form_items[@intFromEnum(section)][0..formItemCount(section)];
+}
+const settings_max_form_items = maximum: {
+    var result: usize = 0;
+    for (std.enums.values(Section)) |section| result = @max(result, formItemCount(section));
+    break :maximum result;
+};
 
-const settings_max_form_items = appearance_form_items.len;
+fn controlCountForRole(role: SettingsControlRole) usize {
+    var count: usize = 0;
+    for (settings_control_specs) |spec| if (spec.role == role) {
+        count += 1;
+    };
+    return count;
+}
 
 fn controlIndexIsCheckbox(index: usize) bool {
     for (std.enums.values(Section)) |section| for (formItemsForSection(section)) |item| {
@@ -1184,10 +1352,17 @@ const SettingsThemeAdapter = struct {
         self.button_brush = null;
     }
 
+    /// What `apply` reaches: the window alone (its brushes, DWM attributes
+    /// and own theme), for `open`, whose children are themed as they are
+    /// created (`SettingsWindow.finishChild`); or every child as well, for a
+    /// theme that changed under existing windows.
+    const Scope = enum { frame, window };
+
     fn apply(
         self: *SettingsThemeAdapter,
         hwnd: HWND,
         colors: win32_theme.SettingsColors,
+        scope: Scope,
     ) void {
         if (self.applying) return;
         self.applying = true;
@@ -1201,6 +1376,7 @@ const SettingsThemeAdapter = struct {
 
         win32_theme.WindowThemeAdapter.applySettings(hwnd, colors);
         applyNativeControlTheme(hwnd, colors);
+        if (scope == .frame) return;
         _ = sys.EnumChildWindows(
             hwnd,
             applyNativeControlThemeToChild,
@@ -1350,6 +1526,10 @@ pub const AppHandle = struct {
 
 pub const SettingsWindow = struct {
     handle: AppHandle,
+    combo_trace: bench_trace.SettingsComboTrace = .{},
+    /// How long each step of the last `open` took, when the App's
+    /// `NOCTTY_SETTINGS_OPEN_TRACE` is on; the App writes and empties it.
+    creation_stamps: bench_trace.SettingsCreationStamps = .{},
     hwnd: ?HWND = null,
     /// The form's own window (`viewport_class_name`): every field, its label
     /// and the help text are its children, so its client area is what clips
@@ -1418,40 +1598,20 @@ pub const SettingsWindow = struct {
     emphasis_font: HGDIOBJ = null,
     header_font: HGDIOBJ = null,
     theme_adapter: SettingsThemeAdapter = .{},
-    /// DPI the UI fonts were last built for, and how many times `themeChanged`
-    /// has actually re-themed the window (a test reads the latter).
+    /// DPI the UI fonts were last built for, how many times `themeChanged`
+    /// has actually re-themed the window and how many times the fonts were
+    /// built (tests read the counts).
     ui_font_dpi: u32 = 0,
     theme_applications: u32 = 0,
+    font_builds: u32 = 0,
     close_prompt_measure_width: i32 = -1,
     close_prompt_measure_dpi: u32 = 0,
     close_prompt_measure_quitting: bool = false,
     close_prompt_measure_height: i32 = 0,
-    edit_scrollback: ?HWND = null,
-    edit_font_family: ?HWND = null,
-    edit_font_size: ?HWND = null,
-    edit_theme: ?HWND = null,
-    edit_bg_opacity: ?HWND = null,
-    edit_command: ?HWND = null,
-    edit_pad_x: ?HWND = null,
-    edit_pad_y: ?HWND = null,
-    combo_confirm_close: ?HWND = null,
-    combo_copy_on_select: ?HWND = null,
-    combo_window_theme: ?HWND = null,
-    combo_shell_integ: ?HWND = null,
-    chk_trim_trail: ?HWND = null,
-    chk_desktop_notifications: ?HWND = null,
-    chk_app_notify_clipboard: ?HWND = null,
-    chk_app_notify_config: ?HWND = null,
-    combo_clipboard_read: ?HWND = null,
-    combo_clipboard_write: ?HWND = null,
-    combo_link_url: ?HWND = null,
-    combo_link_previews: ?HWND = null,
-    combo_cursor_style: ?HWND = null,
-    chk_bg_blur: ?HWND = null,
-    chk_accent_follow: ?HWND = null,
-    combo_pad_balance: ?HWND = null,
-    combo_auto_update: ?HWND = null,
-    combo_auto_update_channel: ?HWND = null,
+    fields: FieldWindows = std.mem.zeroes(FieldWindows),
+    /// The sections whose rows exist. `open` makes the selected section's; the
+    /// others are made the first time they are shown (`materializeSection`).
+    materialized: std.EnumSet(Section) = .initEmpty(),
     active_section: Section = .appearance,
     dpi: u32 = 96,
     /// Class atoms lazily registered the first time `open` runs.
@@ -1551,7 +1711,7 @@ pub const SettingsWindow = struct {
     wheel_lines_override: ?u32 = null,
 
     pub fn init(handle: AppHandle) SettingsWindow {
-        return .{ .handle = handle };
+        return .{ .handle = handle, .combo_trace = bench_trace.SettingsComboTrace.init(handle.alloc) };
     }
 
     fn canInitializeCustomUiaProviders(self: *const SettingsWindow) bool {
@@ -1626,6 +1786,7 @@ pub const SettingsWindow = struct {
     }
 
     pub fn deinit(self: *SettingsWindow) void {
+        defer self.combo_trace.deinit();
         self.freeNoteText();
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) _ = sys.DestroyWindow(h);
@@ -1637,7 +1798,6 @@ pub const SettingsWindow = struct {
         self.forgetFormWindows();
         self.deleteUiFont();
         self.theme_adapter.deinit();
-        self.btn_open_editor = null;
         self.btn_section_appearance = null;
         self.btn_section_terminal = null;
         self.btn_section_shell = null;
@@ -1655,39 +1815,12 @@ pub const SettingsWindow = struct {
         self.text_uia_prev_proc = null;
         self.btn_save = null;
         self.btn_discard_changes = null;
-        self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
         self.btn_close_save = null;
         self.btn_close_discard = null;
         self.btn_close_keep_editing = null;
         self.text_close_prompt = null;
-        self.edit_scrollback = null;
-        self.edit_font_family = null;
-        self.edit_font_size = null;
-        self.edit_theme = null;
-        self.edit_bg_opacity = null;
-        self.edit_command = null;
-        self.edit_pad_x = null;
-        self.edit_pad_y = null;
-        self.combo_confirm_close = null;
-        self.combo_copy_on_select = null;
-        self.combo_window_theme = null;
-        self.combo_shell_integ = null;
-        self.chk_trim_trail = null;
-        self.chk_desktop_notifications = null;
-        self.chk_app_notify_clipboard = null;
-        self.chk_app_notify_config = null;
-        self.combo_clipboard_read = null;
-        self.combo_clipboard_write = null;
-        self.combo_link_url = null;
-        self.combo_link_previews = null;
-        self.combo_cursor_style = null;
-        self.chk_bg_blur = null;
-        self.chk_accent_follow = null;
-        self.combo_pad_balance = null;
-        self.combo_auto_update = null;
-        self.combo_auto_update_channel = null;
         self.resetClosePromptState();
         self.quit_after_close = false;
         self.clearPending();
@@ -1813,9 +1946,8 @@ pub const SettingsWindow = struct {
         if (self.transaction) |transaction| for (transaction.entries) |entry| {
             fields[@intFromEnum(entry.field)] = entry.dirty or entry.conflict;
         };
-        inline for (comptime std.enums.values(RawScalarField)) |field| {
-            if (self.raw_scalar_dirty[@intFromEnum(field)])
-                fields[@intFromEnum(@field(SettingField, @tagName(field)))] = true;
+        for (std.enums.values(RawScalarField)) |field| {
+            if (self.raw_scalar_dirty[@intFromEnum(field)]) fields[@intFromEnum(field.setting())] = true;
         }
         var count: usize = 0;
         for (fields) |changed| count += @intFromBool(changed);
@@ -2050,12 +2182,16 @@ pub const SettingsWindow = struct {
 
     fn rawScalarEdit(self: *const SettingsWindow, field: RawScalarField) ?HWND {
         return switch (field) {
-            .scrollback_limit => self.edit_scrollback,
-            .font_size => self.edit_font_size,
-            .background_opacity => self.edit_bg_opacity,
-            .window_padding_x => self.edit_pad_x,
-            .window_padding_y => self.edit_pad_y,
+            inline else => |raw| self.fieldControl(raw.setting()),
         };
+    }
+
+    /// The native control of `field`, by the binding its descriptor names.
+    fn fieldControl(self: *const SettingsWindow, comptime field: SettingField) ?HWND {
+        inline for (field_model.form_fields) |row| if (comptime row.field == field) {
+            return @field(self.fields, row.native.binding);
+        };
+        @compileError("No Settings control edits " ++ @tagName(field));
     }
 
     fn rawScalarDestination(self: *const SettingsWindow, field: RawScalarField) struct { section: Section, hwnd: ?HWND } {
@@ -2064,9 +2200,7 @@ pub const SettingsWindow = struct {
 
     fn ownedEdit(self: *const SettingsWindow, field: OwnedSettingField) ?HWND {
         return switch (field) {
-            .font_family => self.edit_font_family,
-            .theme => self.edit_theme,
-            .command => self.edit_command,
+            inline else => |owned| @field(self.fields, owned.descriptor().native.?.binding),
         };
     }
 
@@ -2164,13 +2298,7 @@ pub const SettingsWindow = struct {
                     _ = SetFocus(control);
                 }
             },
-            .conflict => |field| {
-                self.active_raw_validation = null;
-                self.validation_control = null;
-                var buf: [256]u8 = undefined;
-                self.setStatus(conflictStatusText(&buf, field.label()));
-            },
-            .owned_conflict => |field| {
+            inline .conflict, .owned_conflict => |field| {
                 self.active_raw_validation = null;
                 self.validation_control = null;
                 var buf: [256]u8 = undefined;
@@ -2523,7 +2651,6 @@ pub const SettingsWindow = struct {
         self.text_help = null;
         self.field_labels = [_]?HWND{null} ** settings_label_specs.len;
         self.deleteUiFont();
-        self.btn_open_editor = null;
         self.btn_section_appearance = null;
         self.btn_section_terminal = null;
         self.btn_section_shell = null;
@@ -2537,38 +2664,12 @@ pub const SettingsWindow = struct {
         self.focus_before_deactivate = null;
         self.btn_save = null;
         self.btn_discard_changes = null;
-        self.btn_keybindings_editor = null;
         self.btn_conflict_keep = null;
         self.btn_conflict_use_disk = null;
         self.btn_close_save = null;
         self.btn_close_discard = null;
         self.btn_close_keep_editing = null;
-        self.edit_scrollback = null;
-        self.edit_font_family = null;
-        self.edit_font_size = null;
-        self.edit_theme = null;
-        self.edit_bg_opacity = null;
-        self.edit_command = null;
-        self.edit_pad_x = null;
-        self.edit_pad_y = null;
-        self.combo_confirm_close = null;
-        self.combo_copy_on_select = null;
-        self.combo_window_theme = null;
-        self.combo_shell_integ = null;
-        self.chk_trim_trail = null;
-        self.chk_desktop_notifications = null;
-        self.chk_app_notify_clipboard = null;
-        self.chk_app_notify_config = null;
-        self.combo_clipboard_read = null;
-        self.combo_clipboard_write = null;
-        self.combo_link_url = null;
-        self.combo_link_previews = null;
-        self.combo_cursor_style = null;
-        self.chk_bg_blur = null;
-        self.chk_accent_follow = null;
-        self.combo_pad_balance = null;
-        self.combo_auto_update = null;
-        self.combo_auto_update_channel = null;
+        self.fields = std.mem.zeroes(FieldWindows);
         self.resetClosePromptState();
         self.clearPending();
     }
@@ -2611,12 +2712,12 @@ pub const SettingsWindow = struct {
 
     fn textHwnd(self: *const SettingsWindow, index: usize) ?HWND {
         return switch (index) {
-            0 => self.text_header,
-            1 => self.text_summary,
+            text_header_index => self.text_header,
+            text_summary_index => self.text_summary,
             text_status_index => self.text_status,
             text_close_prompt_index => self.text_close_prompt,
-            4 => self.text_help,
-            else => if (index - 5 < self.field_labels.len) self.field_labels[index - 5] else null,
+            text_help_index => self.text_help,
+            else => if (index - text_first_label_index < self.field_labels.len) self.field_labels[index - text_first_label_index] else null,
         };
     }
 
@@ -2647,37 +2748,41 @@ pub const SettingsWindow = struct {
         self.releaseTextUiaProviders();
         self.text_uia_prev_proc = null;
         if (!self.canInitializeCustomUiaProviders()) return;
-        for (0..settings_text_count) |index| {
-            const text = self.textHwnd(index) orelse continue;
-            const role: SettingsControlRole = switch (index) {
-                text_status_index, text_close_prompt_index => .live_text,
-                else => .text,
-            };
-            const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, role, null) catch |err| {
-                std.log.warn("settings text UIA provider unavailable index={} err={}", .{ index, err });
-                continue;
-            };
-            const previous = sys.SetWindowLongPtrW(
-                text,
-                GWLP_WNDPROC,
-                @as(LONG_PTR, @intCast(@intFromPtr(&settingsTextProc))),
-            );
-            if (previous == 0) {
-                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                continue;
-            }
-            const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
-            if (self.text_uia_prev_proc) |existing| {
-                if (existing != proc) {
-                    _ = sys.SetWindowLongPtrW(text, GWLP_WNDPROC, previous);
-                    _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                    continue;
-                }
-            } else {
-                self.text_uia_prev_proc = proc;
-            }
-            self.text_uia_providers[index] = provider;
+        for (0..settings_text_count) |index| self.attachTextUiaProvider(index);
+    }
+
+    /// The UIA provider of text `index`, if that text exists. The caller
+    /// checks that custom providers are enabled.
+    fn attachTextUiaProvider(self: *SettingsWindow, index: usize) void {
+        const text = self.textHwnd(index) orelse return;
+        const role: SettingsControlRole = switch (index) {
+            text_status_index, text_close_prompt_index => .live_text,
+            else => .text,
+        };
+        const provider = win32_uia.SettingsControlProvider.create(std.heap.page_allocator, text, role, null) catch |err| {
+            std.log.warn("settings text UIA provider unavailable index={} err={}", .{ index, err });
+            return;
+        };
+        const previous = sys.SetWindowLongPtrW(
+            text,
+            GWLP_WNDPROC,
+            @as(LONG_PTR, @intCast(@intFromPtr(&settingsTextProc))),
+        );
+        if (previous == 0) {
+            _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+            return;
         }
+        const proc: *const anyopaque = @ptrFromInt(@as(usize, @intCast(previous)));
+        if (self.text_uia_prev_proc) |existing| {
+            if (existing != proc) {
+                _ = sys.SetWindowLongPtrW(text, GWLP_WNDPROC, previous);
+                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+                return;
+            }
+        } else {
+            self.text_uia_prev_proc = proc;
+        }
+        self.text_uia_providers[index] = provider;
     }
 
     fn releaseControlUiaProviders(self: *SettingsWindow) void {
@@ -2702,6 +2807,8 @@ pub const SettingsWindow = struct {
     /// The viewport and the state the layout and the field frames keep about
     /// it, for a window that is gone.
     fn forgetFormWindows(self: *SettingsWindow) void {
+        self.fields = .{};
+        self.materialized = .initEmpty();
         self.viewport = null;
         self.framed_invalid_field = null;
         self.help_shown = false;
@@ -2726,44 +2833,10 @@ pub const SettingsWindow = struct {
     }
 
     fn controlHwnd(self: *const SettingsWindow, index: usize) ?HWND {
-        return switch (index) {
-            0 => self.edit_scrollback,
-            1 => self.combo_confirm_close,
-            2 => self.combo_copy_on_select,
-            3 => self.chk_trim_trail,
-            4 => self.edit_font_family,
-            5 => self.edit_font_size,
-            6 => self.edit_theme,
-            7 => self.edit_bg_opacity,
-            8 => self.combo_window_theme,
-            9 => self.combo_cursor_style,
-            10 => self.edit_pad_x,
-            11 => self.edit_pad_y,
-            12 => self.combo_pad_balance,
-            13 => self.chk_bg_blur,
-            14 => self.edit_command,
-            15 => self.combo_shell_integ,
-            16 => self.combo_clipboard_read,
-            17 => self.combo_clipboard_write,
-            18 => self.combo_link_url,
-            19 => self.combo_link_previews,
-            20 => self.chk_desktop_notifications,
-            21 => self.chk_app_notify_clipboard,
-            22 => self.chk_app_notify_config,
-            23 => self.combo_auto_update,
-            24 => self.combo_auto_update_channel,
-            25 => self.btn_keybindings_editor,
-            26 => self.btn_open_editor,
-            27 => self.chk_accent_follow,
-            28 => self.btn_save,
-            29 => self.btn_conflict_keep,
-            30 => self.btn_conflict_use_disk,
-            31 => self.btn_close_save,
-            32 => self.btn_close_discard,
-            33 => self.btn_close_keep_editing,
-            34 => self.btn_discard_changes,
-            else => null,
+        inline for (settings_control_specs, 0..) |spec, i| if (index == i) {
+            return if (comptime i < settings_clipped_control_count) @field(self.fields, spec.binding) else @field(self, spec.binding);
         };
+        return null;
     }
 
     fn controlIndex(self: *const SettingsWindow, hwnd: HWND) ?usize {
@@ -2777,6 +2850,21 @@ pub const SettingsWindow = struct {
 
     fn formItems(self: *const SettingsWindow) []const FormItem {
         return formItemsForSection(self.active_section);
+    }
+
+    const ActiveFormRows = struct {
+        controls: [settings_clipped_control_count]bool = @splat(false),
+        labels: [settings_label_specs.len]bool = @splat(false),
+    };
+
+    /// Which controls and labels belong to the section on show.
+    fn activeFormRows(self: *const SettingsWindow) ActiveFormRows {
+        var rows: ActiveFormRows = .{};
+        for (self.formItems()) |item| {
+            rows.controls[item.control_index] = true;
+            if (item.label_index) |index| rows.labels[index] = true;
+        }
+        return rows;
     }
 
     fn controlSection(self: *const SettingsWindow, control_index: usize) ?Section {
@@ -2802,30 +2890,38 @@ pub const SettingsWindow = struct {
                 break :blk null;
             };
         }
-        for (settings_control_specs, 0..) |spec, index| {
-            const control = self.controlHwnd(index) orelse continue;
-            const provider = win32_uia.SettingsControlProvider.create(
-                std.heap.page_allocator,
-                control,
-                spec.role,
-                spec.name,
-            ) catch |err| {
-                std.log.warn("settings control UIA provider unavailable index={} err={}", .{ index, err });
-                continue;
-            };
-            const previous = sys.SetWindowLongPtrW(
-                control,
-                GWLP_WNDPROC,
-                @as(LONG_PTR, @intCast(@intFromPtr(&settingsControlProc))),
-            );
-            if (previous == 0) {
-                _ = win32_uia.SettingsControlProvider.Release(&provider.base);
-                continue;
-            }
-            self.control_uia_prev_procs[index] = @ptrFromInt(@as(usize, @intCast(previous)));
-            self.control_uia_providers[index] = provider;
-            if (spec.role == .combo_box) SettingsComboPopup.attach(control);
+        for (0..settings_control_count) |index| self.attachControlUiaProvider(index);
+    }
+
+    /// The UIA provider of control `index`, if that control exists. It
+    /// subclasses the control, so a dropdown's or a text field's own subclass
+    /// has to be installed first. The caller checks that custom providers are
+    /// enabled.
+    fn attachControlUiaProvider(self: *SettingsWindow, index: usize) void {
+        const control = self.controlHwnd(index) orelse return;
+        const spec = settings_control_specs[index];
+        const provider = win32_uia.SettingsControlProvider.create(
+            std.heap.page_allocator,
+            control,
+            spec.role,
+            spec.name,
+        ) catch |err| {
+            std.log.warn("settings control UIA provider unavailable index={} err={}", .{ index, err });
+            return;
+        };
+        const previous = sys.SetWindowLongPtrW(
+            control,
+            GWLP_WNDPROC,
+            @as(LONG_PTR, @intCast(@intFromPtr(&settingsControlProc))),
+        );
+        if (previous == 0) {
+            _ = win32_uia.SettingsControlProvider.Release(&provider.base);
+            return;
         }
+        provider.help_text = spec.help;
+        self.control_uia_prev_procs[index] = @ptrFromInt(@as(usize, @intCast(previous)));
+        self.control_uia_providers[index] = provider;
+        if (spec.role == .combo_box) SettingsComboPopup.attach(control);
     }
 
     fn sectionButton(self: *const SettingsWindow, section: Section) ?HWND {
@@ -2909,8 +3005,10 @@ pub const SettingsWindow = struct {
     /// they are still hidden, swapped in for the old ones, and painted before
     /// this returns, so no frame shows a field that has not drawn itself yet.
     /// Only the form and the header text repaint; the frame window does not.
+    /// The first time a section is shown its rows are made here, hidden.
     fn setActiveSection(self: *SettingsWindow, next: Section) void {
         const changed = self.active_section != next;
+        self.materializeSection(next);
         self.active_section = next;
         if (self.section_uia_group) |group| group.setSelected(@intFromEnum(next));
         self.content_scroll_y = 0;
@@ -2987,21 +3085,16 @@ pub const SettingsWindow = struct {
         const viewport = self.viewport orelse return;
         var client: RECT = undefined;
         if (GetClientRect(viewport, &client) == 0) return;
-        var active_controls = [_]bool{false} ** settings_clipped_control_count;
-        var active_labels = [_]bool{false} ** settings_label_specs.len;
-        for (self.formItems()) |item| {
-            active_controls[item.control_index] = true;
-            if (item.label_index) |index| active_labels[index] = true;
-        }
+        const active = self.activeFormRows();
         for (0..settings_clipped_control_count) |index| if (self.control_uia_providers[index]) |provider| {
-            provider.setViewportFullyClipped(!active_controls[index] or
+            provider.setViewportFullyClipped(!active.controls[index] or
                 viewportHidesChild(viewport, self.controlHwnd(index), client.bottom));
         };
-        if (self.text_uia_providers[4]) |provider| {
+        if (self.text_uia_providers[text_help_index]) |provider| {
             provider.setViewportFullyClipped(!self.help_shown or viewportHidesChild(viewport, self.text_help, client.bottom));
         }
-        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[index + 5]) |provider| {
-            provider.setViewportFullyClipped(!active_labels[index] or viewportHidesChild(viewport, label, client.bottom));
+        for (self.field_labels, 0..) |label, index| if (self.text_uia_providers[text_first_label_index + index]) |provider| {
+            provider.setViewportFullyClipped(!active.labels[index] or viewportHidesChild(viewport, label, client.bottom));
         };
     }
 
@@ -3092,51 +3185,24 @@ pub const SettingsWindow = struct {
         if (self.sectionButton(self.active_section)) |button| _ = SetFocus(button);
     }
 
-    /// Put the controls in the order Tab should visit them: the rail, then each
-    /// section's fields as laid out, then the action bar. Tab follows z-order,
-    /// which is creation order, and creation order is by control type with Save
-    /// before every field. Moving each control to the bottom in turn leaves the
-    /// z-order (and with it the UIA sibling order) equal to the visual order.
-    ///
-    /// Only the Appearance rail button starts a dialog group, so without more
-    /// the arrow-key group of the rail would run on into the fields and Save:
-    /// each section's first field and the action bar start their own.
-    fn applyTabOrder(self: *SettingsWindow) void {
-        for (std.enums.values(Section)) |section| for (formItemsForSection(section), 0..) |item, index| {
-            const control = self.controlHwnd(item.control_index) orelse continue;
-            sendToBottom(control);
-            if (index == 0) startGroup(control);
-        };
-        // Conflict choices and Discard sit left of Save (never together); the
-        // close prompt replaces them all.
-        var first_action = true;
-        for ([_]?HWND{
-            self.btn_conflict_keep,
-            self.btn_conflict_use_disk,
-            self.btn_discard_changes,
-            self.btn_save,
-            self.btn_close_save,
-            self.btn_close_discard,
-            self.btn_close_keep_editing,
-        }) |button| if (button) |control| {
-            sendToBottom(control);
-            if (first_action) startGroup(control);
-            first_action = false;
-        };
-    }
-
     fn refreshNativeSectionText(self: *SettingsWindow) void {
         setWindowTextUtf8(self.text_header, self.active_section.headerText());
         setWindowTextUtf8(self.text_summary, self.active_section.placeholderText());
-        // A static text holds 2047 UTF-16 units, so the page is built in as
-        // many bytes.
-        var help_buf: [2047]u8 = undefined;
-        const help = switch (self.active_section) {
+        var help_buf: [help_text_bytes]u8 = undefined;
+        setWindowTextUtf8(self.text_help, self.helpText(&help_buf));
+    }
+
+    /// A static text holds 2047 UTF-16 units, so the page is built in as many
+    /// bytes.
+    const help_text_bytes = 2047;
+
+    /// The text above the form: Keybindings and Advanced have one.
+    fn helpText(self: *const SettingsWindow, buf: *[help_text_bytes]u8) []const u8 {
+        return switch (self.active_section) {
             .keybindings => keybindingsHelpText(),
-            .advanced => self.advancedHelpText(&help_buf),
+            .advanced => self.advancedHelpText(buf),
             else => "",
         };
-        setWindowTextUtf8(self.text_help, help);
     }
 
     /// The app loaded the config again, so what the Advanced page lists as
@@ -3209,31 +3275,50 @@ pub const SettingsWindow = struct {
         return bar.status_separate != self.status_row_separate or bar.status_height != self.status_row_height;
     }
 
+    /// Build the fonts for the current DPI and give them to every child: a DPI
+    /// or theme change. A child `open` creates gets its font as it is made.
     fn recreateUiFont(self: *SettingsWindow) void {
-        const hwnd = self.hwnd orelse return;
+        const replaced = self.buildUiFonts() orelse return;
+        self.applyUiFonts();
+        replaced.delete();
+    }
+
+    const UiFonts = struct {
+        handles: [4]HGDIOBJ,
+
+        fn delete(self: UiFonts) void {
+            for (self.handles) |font| if (font) |handle| {
+                _ = DeleteObject(handle);
+            };
+        }
+    };
+
+    /// The window's four fonts for `self.dpi`, and the line height the text
+    /// fields centre on. Returns the fonts they replace, for the caller to
+    /// delete once no child draws with them; null when a font could not be
+    /// made, leaving the old ones in place.
+    fn buildUiFonts(self: *SettingsWindow) ?UiFonts {
+        const hwnd = self.hwnd orelse return null;
         const variable_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Variable Text");
         const fallback_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
         const face = if (fontFaceAvailable(hwnd, variable_face)) variable_face else fallback_face;
-        const next = createSettingsFont(self.dpi, 13, 400, face) orelse return;
+        const next = createSettingsFont(self.dpi, 13, 400, face) orelse return null;
         const next_secondary = createSettingsFont(self.dpi, 12, 400, face) orelse {
             _ = DeleteObject(next);
-            return;
+            return null;
         };
         const next_emphasis = createSettingsFont(self.dpi, 13, 600, face) orelse {
             _ = DeleteObject(next_secondary);
             _ = DeleteObject(next);
-            return;
+            return null;
         };
         const next_header = createSettingsFont(self.dpi, 16, 600, face) orelse {
             _ = DeleteObject(next_emphasis);
             _ = DeleteObject(next_secondary);
             _ = DeleteObject(next);
-            return;
+            return null;
         };
-        const previous = self.ui_font;
-        const previous_secondary = self.secondary_font;
-        const previous_emphasis = self.emphasis_font;
-        const previous_header = self.header_font;
+        const replaced: UiFonts = .{ .handles = .{ self.ui_font, self.secondary_font, self.emphasis_font, self.header_font } };
         self.ui_font_dpi = self.dpi;
         self.ui_font = next;
         self.secondary_font = next_secondary;
@@ -3242,37 +3327,62 @@ pub const SettingsWindow = struct {
         self.close_prompt_measure_width = -1;
         self.close_prompt_measure_height = 0;
         self.status_measure_width = -1;
-        _ = EnumChildWindows(hwnd, applyChildFont, @bitCast(@intFromPtr(next)));
-        if (self.text_header) |header| _ = SendMessageW(header, WM_SETFONT, @intFromPtr(next_header), 1);
-        if (self.text_summary) |text| _ = SendMessageW(text, WM_SETFONT, @intFromPtr(next_secondary), 1);
+        self.field_text_height = fontLineHeight(hwnd, next);
+        self.font_builds +%= 1;
+        return replaced;
+    }
+
+    fn applyUiFonts(self: *SettingsWindow) void {
+        const hwnd = self.hwnd orelse return;
+        _ = EnumChildWindows(hwnd, applyChildFont, @bitCast(@intFromPtr(self.ui_font)));
+        if (self.text_header) |header| _ = SendMessageW(header, WM_SETFONT, @intFromPtr(self.header_font), 1);
+        if (self.text_summary) |text| _ = SendMessageW(text, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         for (self.field_labels) |label| {
-            if (label) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(next_secondary), 1);
+            if (label) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         }
         for (0..settings_clipped_control_count) |index| if (controlIndexIsCheckbox(index)) {
-            if (self.controlHwnd(index)) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(next_secondary), 1);
+            if (self.controlHwnd(index)) |control| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(self.secondary_font), 1);
         };
-        if (self.text_close_prompt) |prompt| _ = SendMessageW(prompt, WM_SETFONT, @intFromPtr(next_emphasis), 1);
+        if (self.text_close_prompt) |prompt| _ = SendMessageW(prompt, WM_SETFONT, @intFromPtr(self.emphasis_font), 1);
         self.syncStatusFont();
-        if (previous) |font| _ = DeleteObject(font);
-        if (previous_secondary) |font| _ = DeleteObject(font);
-        if (previous_emphasis) |font| _ = DeleteObject(font);
-        if (previous_header) |font| _ = DeleteObject(font);
-        self.field_text_height = fontLineHeight(hwnd, next);
-        // The text fields centre on the new line height and the frame scales
-        // with the DPI: ask each one for its frame again.
+        self.refreshFieldFrames();
+        self.updateComboMetrics();
+    }
+
+    /// The text fields centre on the line height and their frame scales with
+    /// the DPI (`settingsEditProc`): ask each one for its frame again.
+    fn refreshFieldFrames(self: *SettingsWindow) void {
         for (self.editControls()) |edit| if (edit) |control| {
             _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         };
-        self.updateComboMetrics();
+    }
+
+    /// What a child made during `open` needs before it is first drawn: its
+    /// theme and its font, once each, and a dropdown's list item height after
+    /// its font. A theme or DPI change later re-applies all of them to every
+    /// window (`themeChanged`, `recreateUiFont`).
+    fn finishChild(self: *SettingsWindow, child: ?HWND, font: HGDIOBJ, kind: enum { control, combo }) ?HWND {
+        const control = child orelse return null;
+        const colors = self.theme_adapter.colors;
+        switch (kind) {
+            .control => applyNativeControlTheme(control, colors),
+            .combo => win32_theme.WindowThemeAdapter.applyNativeCombo(control, colors),
+        }
+        if (font) |value| _ = SendMessageW(control, WM_SETFONT, @intFromPtr(value), 0);
+        if (kind == .combo) _ = SendMessageW(control, CB_SETITEMHEIGHT, 0, self.px(settings_combo_item_height));
+        return control;
+    }
+
+    fn statusFont(self: *const SettingsWindow) HGDIOBJ {
+        return switch (self.nextStatus()) {
+            .conflict, .owned_conflict => self.emphasis_font,
+            .raw_validation, .owned_validation, .none => self.secondary_font,
+        };
     }
 
     fn syncStatusFont(self: *SettingsWindow) void {
         const status = self.text_status orelse return;
-        const font = switch (self.nextStatus()) {
-            .conflict, .owned_conflict => self.emphasis_font,
-            .raw_validation, .owned_validation, .none => self.secondary_font,
-        };
-        if (font) |value| {
+        if (self.statusFont()) |value| {
             const current: LRESULT = @bitCast(@intFromPtr(value));
             if (SendMessageW(status, WM_GETFONT, 0, 0) != current) {
                 _ = SendMessageW(status, WM_SETFONT, @intFromPtr(value), 1);
@@ -3281,34 +3391,22 @@ pub const SettingsWindow = struct {
         }
     }
 
-    fn comboControls(self: *const SettingsWindow) [12]?HWND {
-        return .{
-            self.combo_confirm_close,
-            self.combo_copy_on_select,
-            self.combo_window_theme,
-            self.combo_shell_integ,
-            self.combo_clipboard_read,
-            self.combo_clipboard_write,
-            self.combo_link_url,
-            self.combo_link_previews,
-            self.combo_cursor_style,
-            self.combo_pad_balance,
-            self.combo_auto_update,
-            self.combo_auto_update_channel,
+    fn controlsForRole(self: *const SettingsWindow, comptime role: SettingsControlRole) [controlCountForRole(role)]?HWND {
+        var result: [controlCountForRole(role)]?HWND = undefined;
+        var index: usize = 0;
+        inline for (settings_control_specs, 0..) |spec, i| if (spec.role == role) {
+            result[index] = self.controlHwnd(i);
+            index += 1;
         };
+        return result;
     }
 
-    fn editControls(self: *const SettingsWindow) [8]?HWND {
-        return .{
-            self.edit_scrollback,
-            self.edit_font_family,
-            self.edit_font_size,
-            self.edit_theme,
-            self.edit_bg_opacity,
-            self.edit_command,
-            self.edit_pad_x,
-            self.edit_pad_y,
-        };
+    fn comboControls(self: *const SettingsWindow) [controlCountForRole(.combo_box)]?HWND {
+        return self.controlsForRole(.combo_box);
+    }
+
+    fn editControls(self: *const SettingsWindow) [controlCountForRole(.edit)]?HWND {
+        return self.controlsForRole(.edit);
     }
 
     fn isEditControl(self: *const SettingsWindow, hwnd: HWND) bool {
@@ -3417,10 +3515,15 @@ pub const SettingsWindow = struct {
     /// font and High Contrast changes arrive under several names.
     pub fn themeChanged(self: *SettingsWindow) void {
         const hwnd = self.hwnd orelse return;
+        // SetWindowTheme synchronously sends WM_THEMECHANGED while the adapter
+        // is still applying. Its caller already follows that work with fonts
+        // and layout; reentering here creates both a second time on each open,
+        // before the initial font can satisfy themeInputsApplied.
+        if (self.theme_adapter.applying) return;
         const colors = self.resolveThemeColors();
         if (self.themeInputsApplied(colors)) return;
         self.theme_applications +%= 1;
-        self.theme_adapter.apply(hwnd, colors);
+        self.theme_adapter.apply(hwnd, colors, .window);
         self.recreateUiFont();
         layoutChildren(self);
         _ = sys.InvalidateRect(hwnd, null, 1);
@@ -3506,64 +3609,58 @@ pub const SettingsWindow = struct {
                 if (next_style != style) _ = sys.SetWindowLongPtrW(button, GWL_STYLE, @intCast(next_style));
             }
         }
-        var active_controls = [_]bool{false} ** settings_clipped_control_count;
-        var active_labels = [_]bool{false} ** settings_label_specs.len;
-        for (self.formItems()) |item| {
-            active_controls[item.control_index] = true;
-            if (item.label_index) |index| active_labels[index] = true;
-        }
+        const active = self.activeFormRows();
         for (0..settings_clipped_control_count) |index| if (self.controlHwnd(index)) |control| {
-            setChildShown(control, active_controls[index]);
+            setChildShown(control, active.controls[index]);
         };
         for (self.field_labels, 0..) |label, index| if (label) |control| {
-            setChildShown(control, active_labels[index]);
+            setChildShown(control, active.labels[index]);
         };
     }
 
-    /// Read the current EDIT text and write the parsed integer into
-    /// the pending draft. Called from EN_CHANGE. Swallows parse
-    /// errors silently — ES_NUMBER style means the text is already
-    /// digits-only, but the empty-string case needs to map to 0 (or
-    /// be ignored).
-    fn syncScrollbackFromEdit(self: *SettingsWindow) void {
+    /// Parse a number field's text (scrollback, font size, opacity) into the
+    /// draft. Called from EN_CHANGE. Text that does not parse keeps the field
+    /// raw (`markRawScalarEdit`) and records its message; the draft keeps the
+    /// last valid value.
+    fn syncNumberFromEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        const setting = comptime field.setting();
+        const label = comptime field_model.descriptor(setting).label;
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const edit = self.edit_scrollback orelse return;
-        self.markRawScalarEdit(.scrollback_limit);
-
+        const edit = self.rawScalarEdit(field) orelse return;
+        self.markRawScalarEdit(field);
         var buf_w: [32]u16 = undefined;
         const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit is required.");
+        if (n <= 0) return self.setRawScalarValidationError(field, edit, label ++ " is required.");
         var utf8_buf: [64]u8 = undefined;
         const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit contains invalid text.");
+            return self.setRawScalarValidationError(field, edit, label ++ " contains invalid text.");
         const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit is required.");
-        const parsed = field_model.parseScalar(.scrollback_limit, trimmed) catch
-            return self.setRawScalarValidationError(.scrollback_limit, edit, "Scrollback limit must be a non-negative whole number.");
-        self.finishRawScalarEdit(.scrollback_limit);
-        p.*.@"scrollback-limit" = parsed;
-        self.trackFieldEdit(.scrollback_limit);
+        if (trimmed.len == 0) return self.setRawScalarValidationError(field, edit, label ++ " is required.");
+        const parsed = field_model.parseScalar(setting, trimmed) catch |err|
+            return self.setRawScalarValidationError(field, edit, switch (comptime field_model.descriptor(setting).validation) {
+                .unsigned_integer => label ++ " must be a non-negative whole number.",
+                else => field_model.scalarValidationMessage(setting, err == error.OutOfRange),
+            });
+        self.finishRawScalarEdit(field);
+        setSettingValue(p, @unionInit(SettingValue, @tagName(setting), parsed));
+        self.trackFieldEdit(setting);
     }
 
-    fn displayScrollbackInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.scrollback_limit)) return;
-        const edit = self.edit_scrollback orelse return;
+    fn displayNumberInEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        if (!self.shouldRefreshRawScalar(field)) return;
+        const edit = self.rawScalarEdit(field) orelse return;
         const p = self.pending orelse return;
         var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"scrollback-limit"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
+        const text = std.fmt.bufPrintZ(&buf, "{d}", .{fieldValue(&p, field.setting())}) catch return;
+        setEditText(edit, text, &self.suppress_edit_events);
     }
 
     fn syncFontFamilyFromEdit(self: *SettingsWindow) void {
         if (self.suppress_edit_events or !self.owned_text_changed[@intFromEnum(OwnedSettingField.font_family)]) return;
         const p = &(self.pending orelse return);
         const arena = p.*._arena.?.allocator();
-        const edit = self.edit_font_family orelse return;
+        const edit = self.fields.edit_font_family orelse return;
         var text_buf: [edit_text_max_utf8]u8 = undefined;
         const text = readEditUtf8(edit, &text_buf) orelse
             return self.setValidationError(edit, "Font family text could not be read.");
@@ -3574,7 +3671,7 @@ pub const SettingsWindow = struct {
     }
 
     fn displayFontFamilyInEdit(self: *SettingsWindow) void {
-        const edit = self.edit_font_family orelse return;
+        const edit = self.fields.edit_font_family orelse return;
         const p = self.pending orelse return;
         var buf: [edit_text_max_utf8]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
@@ -3585,44 +3682,11 @@ pub const SettingsWindow = struct {
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
     }
 
-    fn syncFontSizeFromEdit(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const edit = self.edit_font_size orelse return;
-        self.markRawScalarEdit(.font_size);
-        var buf_w: [32]u16 = undefined;
-        const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.font_size, edit, "Font size is required.");
-        var utf8_buf: [64]u8 = undefined;
-        const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.font_size, edit, "Font size contains invalid text.");
-        const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.font_size, edit, "Font size is required.");
-        const parsed = field_model.parseScalar(.font_size, trimmed) catch |err|
-            return self.setRawScalarValidationError(.font_size, edit, field_model.scalarValidationMessage(.font_size, err == error.OutOfRange));
-        self.finishRawScalarEdit(.font_size);
-        p.*.@"font-size" = parsed;
-        self.trackFieldEdit(.font_size);
-    }
-
-    fn displayFontSizeInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.font_size)) return;
-        const edit = self.edit_font_size orelse return;
-        const p = self.pending orelse return;
-        var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"font-size"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
-    }
-
     fn syncThemeFromEdit(self: *SettingsWindow) void {
         if (self.suppress_edit_events or !self.owned_text_changed[@intFromEnum(OwnedSettingField.theme)]) return;
         const p = &(self.pending orelse return);
         const arena = p.*._arena.?.allocator();
-        const edit = self.edit_theme orelse return;
+        const edit = self.fields.edit_theme orelse return;
         var text_buf: [edit_text_max_utf8]u8 = undefined;
         const text = readEditUtf8(edit, &text_buf) orelse return;
         const trimmed = std.mem.trim(u8, text, " \t");
@@ -3641,7 +3705,7 @@ pub const SettingsWindow = struct {
     }
 
     fn displayThemeInEdit(self: *SettingsWindow) void {
-        const edit = self.edit_theme orelse return;
+        const edit = self.fields.edit_theme orelse return;
         const p = self.pending orelse return;
         var buf: [edit_text_max_utf8]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
@@ -3651,44 +3715,11 @@ pub const SettingsWindow = struct {
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
     }
 
-    fn syncBgOpacityFromEdit(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const edit = self.edit_bg_opacity orelse return;
-        self.markRawScalarEdit(.background_opacity);
-        var buf_w: [32]u16 = undefined;
-        const n = sys.GetWindowTextW(edit, &buf_w, @intCast(buf_w.len));
-        if (n <= 0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity is required.");
-        var utf8_buf: [64]u8 = undefined;
-        const utf8 = std.unicode.utf16LeToUtf8(&utf8_buf, buf_w[0..@intCast(n)]) catch
-            return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity contains invalid text.");
-        const trimmed = std.mem.trim(u8, utf8_buf[0..utf8], " \t");
-        if (trimmed.len == 0) return self.setRawScalarValidationError(.background_opacity, edit, "Background opacity is required.");
-        const parsed = field_model.parseScalar(.background_opacity, trimmed) catch |err|
-            return self.setRawScalarValidationError(.background_opacity, edit, field_model.scalarValidationMessage(.background_opacity, err == error.OutOfRange));
-        self.finishRawScalarEdit(.background_opacity);
-        p.*.@"background-opacity" = parsed;
-        self.trackFieldEdit(.background_opacity);
-    }
-
-    fn displayBgOpacityInEdit(self: *SettingsWindow) void {
-        if (!self.shouldRefreshRawScalar(.background_opacity)) return;
-        const edit = self.edit_bg_opacity orelse return;
-        const p = self.pending orelse return;
-        var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "{d}", .{p.@"background-opacity"}) catch return;
-        var buf_w: [32]u16 = undefined;
-        const w = utf8ToW(&buf_w, text);
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(edit, WM_SETTEXT, 0, @bitCast(@intFromPtr(w)));
-        self.suppress_edit_events = false;
-    }
-
     fn syncCommandFromEdit(self: *SettingsWindow) void {
         if (self.suppress_edit_events or !self.owned_text_changed[@intFromEnum(OwnedSettingField.command)]) return;
         const p = &(self.pending orelse return);
         const arena = p.*._arena.?.allocator();
-        const edit = self.edit_command orelse return;
+        const edit = self.fields.edit_command orelse return;
         var text_buf: [edit_text_max_utf8]u8 = undefined;
         const text = readEditUtf8(edit, &text_buf) orelse return;
         const trimmed = std.mem.trim(u8, text, " \t");
@@ -3708,7 +3739,7 @@ pub const SettingsWindow = struct {
     }
 
     fn displayCommandInEdit(self: *SettingsWindow) void {
-        const edit = self.edit_command orelse return;
+        const edit = self.fields.edit_command orelse return;
         const p = self.pending orelse return;
         var buf: [edit_text_max_utf8]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
@@ -3716,59 +3747,27 @@ pub const SettingsWindow = struct {
         setEditText(edit, writer.buffered(), &self.suppress_edit_events);
     }
 
-    fn syncPaddingFromEdit(self: *SettingsWindow, axis: PaddingAxis) void {
+    fn syncPaddingFromEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        const setting = comptime field.setting();
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const raw_field: RawScalarField = switch (axis) {
-            .x => .window_padding_x,
-            .y => .window_padding_y,
-        };
-        const edit = switch (axis) {
-            .x => self.edit_pad_x,
-            .y => self.edit_pad_y,
-        } orelse return;
-        self.markRawScalarEdit(raw_field);
+        const edit = self.rawScalarEdit(field) orelse return;
+        self.markRawScalarEdit(field);
         var text_buf: [64]u8 = undefined;
         const text = readEditUtf8(edit, &text_buf) orelse
-            return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
-                .x => "Window padding X could not be read.",
-                .y => "Window padding Y could not be read.",
-            });
-        const parsed = (switch (axis) {
-            .x => field_model.parseScalar(.window_padding_x, text),
-            .y => field_model.parseScalar(.window_padding_y, text),
-        }) catch |err| return self.setRawScalarValidationError(raw_field, edit, switch (axis) {
-            .x => field_model.scalarValidationMessage(.window_padding_x, err == error.OutOfRange),
-            .y => field_model.scalarValidationMessage(.window_padding_y, err == error.OutOfRange),
-        });
-        self.finishRawScalarEdit(raw_field);
-        switch (axis) {
-            .x => {
-                p.*.@"window-padding-x" = parsed;
-                self.trackFieldEdit(.window_padding_x);
-            },
-            .y => {
-                p.*.@"window-padding-y" = parsed;
-                self.trackFieldEdit(.window_padding_y);
-            },
-        }
+            return self.setRawScalarValidationError(field, edit, comptime field_model.descriptor(setting).label ++ " could not be read.");
+        const parsed = field_model.parseScalar(setting, text) catch |err|
+            return self.setRawScalarValidationError(field, edit, field_model.scalarValidationMessage(setting, err == error.OutOfRange));
+        self.finishRawScalarEdit(field);
+        setSettingValue(p, @unionInit(SettingValue, @tagName(setting), parsed));
+        self.trackFieldEdit(setting);
     }
 
-    fn displayPaddingInEdit(self: *SettingsWindow, axis: PaddingAxis) void {
-        const raw_field: RawScalarField = switch (axis) {
-            .x => .window_padding_x,
-            .y => .window_padding_y,
-        };
-        if (!self.shouldRefreshRawScalar(raw_field)) return;
-        const edit = switch (axis) {
-            .x => self.edit_pad_x,
-            .y => self.edit_pad_y,
-        } orelse return;
+    fn displayPaddingInEdit(self: *SettingsWindow, comptime field: RawScalarField) void {
+        if (!self.shouldRefreshRawScalar(field)) return;
+        const edit = self.rawScalarEdit(field) orelse return;
         const p = self.pending orelse return;
-        const padding = switch (axis) {
-            .x => p.@"window-padding-x",
-            .y => p.@"window-padding-y",
-        };
+        const padding = fieldValue(&p, field.setting());
         var buf: [64]u8 = undefined;
         const text = if (padding.top_left == padding.bottom_right)
             std.fmt.bufPrint(&buf, "{d}", .{padding.top_left}) catch return
@@ -3777,235 +3776,48 @@ pub const SettingsWindow = struct {
         setEditText(edit, text, &self.suppress_edit_events);
     }
 
-    fn syncTrimTrailFromCheckbox(self: *SettingsWindow) void {
+    /// A checkbox for a bool field, or for one of `app-notifications`' bool
+    /// projections, which writes only its own member.
+    fn syncCheckbox(self: *SettingsWindow, comptime field: SettingField) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const chk = self.chk_trim_trail orelse return;
-        const state = sys.SendMessageW(chk, BM_GETCHECK, 0, 0);
-        p.*.@"clipboard-trim-trailing-spaces" = (state == BST_CHECKED);
-        self.trackFieldEdit(.trim_trailing_spaces);
+        const chk = self.fieldControl(field) orelse return;
+        const checked = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        setSettingValue(p, @unionInit(SettingValue, @tagName(field), checked));
+        self.trackFieldEdit(field);
     }
 
-    fn displayTrimTrailInCheckbox(self: *SettingsWindow) void {
-        const chk = self.chk_trim_trail orelse return;
+    fn displayCheckbox(self: *SettingsWindow, comptime field: SettingField) void {
+        const chk = self.fieldControl(field) orelse return;
         const p = self.pending orelse return;
+        self.showChecked(chk, fieldValue(&p, field));
+    }
+
+    fn showChecked(self: *SettingsWindow, chk: HWND, checked: bool) void {
         self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (p.@"clipboard-trim-trailing-spaces") BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
+        _ = sys.SendMessageW(chk, BM_SETCHECK, if (checked) BST_CHECKED else BST_UNCHECKED, 0);
         self.suppress_edit_events = false;
     }
 
-    fn syncDesktopNotificationsFromCheckbox(self: *SettingsWindow) void {
+    /// A dropdown. Its item positions are the field's `Combo` options, which
+    /// map an index to the config value and back.
+    fn syncCombo(self: *SettingsWindow, comptime field: SettingField) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const chk = self.chk_desktop_notifications orelse return;
-        p.*.@"desktop-notifications" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackFieldEdit(.desktop_notifications);
-    }
-
-    fn displayDesktopNotificationsInCheckbox(self: *SettingsWindow) void {
-        const chk = self.chk_desktop_notifications orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (p.@"desktop-notifications") BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAppNotificationsFromCheckbox(self: *SettingsWindow, field: AppNotificationField) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const chk = switch (field) {
-            .clipboard => self.chk_app_notify_clipboard,
-            .config => self.chk_app_notify_config,
-        } orelse return;
-        const enabled = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        switch (field) {
-            .clipboard => {
-                p.*.@"app-notifications".@"clipboard-copy" = enabled;
-                self.trackFieldEdit(.app_notify_clipboard);
-            },
-            .config => {
-                p.*.@"app-notifications".@"config-reload" = enabled;
-                self.trackFieldEdit(.app_notify_config);
-            },
-        }
-    }
-
-    fn displayAppNotificationsInCheckbox(self: *SettingsWindow, field: AppNotificationField) void {
-        const chk = switch (field) {
-            .clipboard => self.chk_app_notify_clipboard,
-            .config => self.chk_app_notify_config,
-        } orelse return;
-        const p = self.pending orelse return;
-        const enabled = switch (field) {
-            .clipboard => p.@"app-notifications".@"clipboard-copy",
-            .config => p.@"app-notifications".@"config-reload",
-        };
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(chk, BM_SETCHECK, if (enabled) BST_CHECKED else BST_UNCHECKED, 0);
-        self.suppress_edit_events = false;
-    }
-
-    /// Enum combo helpers. `fromIndex` maps combobox selection to
-    /// config enum value; `toIndex` goes the other direction for
-    /// initial display.
-    fn syncConfirmCloseFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_confirm_close orelse return;
+        const combo = self.fieldControl(field) orelse return;
         const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
         if (idx < 0) return;
-        p.*.@"confirm-close-surface" = confirmCloseFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.confirm_close);
+        const value = field_model.Combo(field).fromIndex(idx) orelse return;
+        setSettingValue(p, @unionInit(SettingValue, @tagName(field), value));
+        self.trackFieldEdit(field);
     }
 
-    fn displayConfirmCloseInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_confirm_close orelse return;
+    fn displayCombo(self: *SettingsWindow, comptime field: SettingField) void {
+        const combo = self.fieldControl(field) orelse return;
         const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromConfirmClose(p.@"confirm-close-surface"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncCopyOnSelectFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_copy_on_select orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"copy-on-select" = copyOnSelectFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.copy_on_select);
-    }
-
-    fn displayCopyOnSelectInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_copy_on_select orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCopyOnSelect(p.@"copy-on-select"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncClipboardAccessFromCombo(self: *SettingsWindow, comptime field_name: []const u8, combo_opt: ?HWND) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = combo_opt orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        @field(p.*, field_name) = clipboardAccessFromComboIndex(idx) orelse return;
-        if (comptime std.mem.eql(u8, field_name, "clipboard-read")) {
-            self.trackFieldEdit(.clipboard_read);
-        } else if (comptime std.mem.eql(u8, field_name, "clipboard-write")) {
-            self.trackFieldEdit(.clipboard_write);
-        }
-    }
-
-    fn displayClipboardAccessInCombo(self: *SettingsWindow, comptime field_name: []const u8, combo_opt: ?HWND) void {
-        const combo = combo_opt orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromClipboardAccess(@field(p, field_name));
+        const idx = field_model.Combo(field).toIndex(fieldValue(&p, field));
         self.suppress_edit_events = true;
         _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncLinkUrlFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_link_url orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"link-url" = linkUrlFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.link_url);
-    }
-
-    fn displayLinkUrlInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_link_url orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromLinkUrl(p.@"link-url");
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncLinkPreviewsFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_link_previews orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"link-previews" = linkPreviewsFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.link_previews);
-    }
-
-    fn displayLinkPreviewsInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_link_previews orelse return;
-        const p = self.pending orelse return;
-        const idx = comboIndexFromLinkPreviews(p.@"link-previews");
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, idx, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncWindowThemeFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_window_theme orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"window-theme" = windowThemeFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.window_theme);
-    }
-
-    fn displayWindowThemeInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_window_theme orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromWindowTheme(p.@"window-theme"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncShellIntegFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_shell_integ orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"shell-integration" = shellIntegrationFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.shell_integration);
-    }
-
-    fn displayShellIntegInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_shell_integ orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromShellIntegration(p.@"shell-integration"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncCursorStyleFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_cursor_style orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"cursor-style" = cursorStyleFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.cursor_style);
-    }
-
-    fn displayCursorStyleInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_cursor_style orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromCursorStyle(p.@"cursor-style"), 0);
         self.suppress_edit_events = false;
     }
 
@@ -4015,7 +3827,7 @@ pub const SettingsWindow = struct {
     fn syncBgBlurFromCheckbox(self: *SettingsWindow) void {
         if (self.suppress_edit_events) return;
         const p = &(self.pending orelse return);
-        const chk = self.chk_bg_blur orelse return;
+        const chk = self.fields.chk_bg_blur orelse return;
         const state = sys.SendMessageW(chk, BM_GETCHECK, 0, 0);
         p.*.@"background-blur" = backgroundBlurFromCheckbox(
             p.*.@"background-blur",
@@ -4025,118 +3837,18 @@ pub const SettingsWindow = struct {
     }
 
     fn displayBgBlurInCheckbox(self: *SettingsWindow) void {
-        const chk = self.chk_bg_blur orelse return;
+        const chk = self.fields.chk_bg_blur orelse return;
         const p = self.pending orelse return;
-        const enabled = p.@"background-blur".win32BlurRequested();
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(
-            chk,
-            BM_SETCHECK,
-            if (enabled) BST_CHECKED else BST_UNCHECKED,
-            0,
-        );
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAccentFollowFromCheckbox(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const chk = self.chk_accent_follow orelse return;
-        p.*.@"accent-follow-system" = sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        self.trackFieldEdit(.accent_follow_system);
-    }
-
-    fn displayAccentFollowInCheckbox(self: *SettingsWindow) void {
-        const chk = self.chk_accent_follow orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(chk, BM_SETCHECK, if (p.@"accent-follow-system") BST_CHECKED else BST_UNCHECKED, 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncPadBalanceFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_pad_balance orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"window-padding-balance" = paddingBalanceFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.padding_balance);
-    }
-
-    fn displayPadBalanceInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_pad_balance orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromPaddingBalance(p.@"window-padding-balance"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAutoUpdateFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_auto_update orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"auto-update" = autoUpdateFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.auto_update);
-    }
-
-    fn displayAutoUpdateInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_auto_update orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdate(p.@"auto-update"), 0);
-        self.suppress_edit_events = false;
-    }
-
-    fn syncAutoUpdateChannelFromCombo(self: *SettingsWindow) void {
-        if (self.suppress_edit_events) return;
-        const p = &(self.pending orelse return);
-        const combo = self.combo_auto_update_channel orelse return;
-        const idx = sys.SendMessageW(combo, CB_GETCURSEL, 0, 0);
-        if (idx < 0) return;
-        p.*.@"auto-update-channel" = autoUpdateChannelFromComboIndex(idx) orelse return;
-        self.trackFieldEdit(.auto_update_channel);
-    }
-
-    fn displayAutoUpdateChannelInCombo(self: *SettingsWindow) void {
-        const combo = self.combo_auto_update_channel orelse return;
-        const p = self.pending orelse return;
-        self.suppress_edit_events = true;
-        _ = sys.SendMessageW(combo, CB_SETCURSEL, comboIndexFromAutoUpdateChannel(p.@"auto-update-channel"), 0);
-        self.suppress_edit_events = false;
+        self.showChecked(chk, p.@"background-blur".win32BlurRequested());
     }
 
     /// Refresh every control from the pending draft. Called after
     /// `adoptCurrentConfig` and after a successful save.
     fn refreshAllControls(self: *SettingsWindow) void {
-        self.displayScrollbackInEdit();
-        if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.font_family)]) self.displayFontFamilyInEdit();
-        self.displayFontSizeInEdit();
-        if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.theme)]) self.displayThemeInEdit();
-        self.displayBgOpacityInEdit();
-        if (!self.owned_text_changed[@intFromEnum(OwnedSettingField.command)]) self.displayCommandInEdit();
-        self.displayPaddingInEdit(.x);
-        self.displayPaddingInEdit(.y);
-        self.displayTrimTrailInCheckbox();
-        self.displayDesktopNotificationsInCheckbox();
-        self.displayAppNotificationsInCheckbox(.clipboard);
-        self.displayAppNotificationsInCheckbox(.config);
-        self.displayConfirmCloseInCombo();
-        self.displayCopyOnSelectInCombo();
-        self.displayClipboardAccessInCombo("clipboard-read", self.combo_clipboard_read);
-        self.displayClipboardAccessInCombo("clipboard-write", self.combo_clipboard_write);
-        self.displayLinkUrlInCombo();
-        self.displayLinkPreviewsInCombo();
-        self.displayWindowThemeInCombo();
-        self.displayShellIntegInCombo();
-        self.displayCursorStyleInCombo();
-        self.displayBgBlurInCheckbox();
-        self.displayAccentFollowInCheckbox();
-        self.displayPadBalanceInCombo();
-        self.displayAutoUpdateInCombo();
-        self.displayAutoUpdateChannelInCombo();
+        // Typed display adapters retain raw owned edits and never grant ownership.
+        inline for (field_model.form_fields) |row| {
+            @field(field_adapters, row.native.binding).display(self);
+        }
         self.updateSaveEnabled();
     }
 
@@ -4552,39 +4264,19 @@ pub const SettingsWindow = struct {
 
     /// The section and the native control that own `field`.
     fn settingDestination(self: *const SettingsWindow, field: SettingField) struct { section: Section, hwnd: ?HWND } {
-        const hwnd = switch (field) {
-            .font_size => self.edit_font_size,
-            .background_opacity => self.edit_bg_opacity,
-            .window_padding_x => self.edit_pad_x,
-            .window_padding_y => self.edit_pad_y,
-            .window_theme => self.combo_window_theme,
-            .cursor_style => self.combo_cursor_style,
-            .background_blur => self.chk_bg_blur,
-            .accent_follow_system => self.chk_accent_follow,
-            .padding_balance => self.combo_pad_balance,
-            .scrollback_limit => self.edit_scrollback,
-            .trim_trailing_spaces => self.chk_trim_trail,
-            .desktop_notifications => self.chk_desktop_notifications,
-            .app_notify_clipboard => self.chk_app_notify_clipboard,
-            .app_notify_config => self.chk_app_notify_config,
-            .confirm_close => self.combo_confirm_close,
-            .copy_on_select => self.combo_copy_on_select,
-            .clipboard_read => self.combo_clipboard_read,
-            .clipboard_write => self.combo_clipboard_write,
-            .link_url => self.combo_link_url,
-            .link_previews => self.combo_link_previews,
-            .shell_integration => self.combo_shell_integ,
-            .auto_update => self.combo_auto_update,
-            .auto_update_channel => self.combo_auto_update_channel,
+        inline for (field_model.form_fields) |row| if (row.field == field) {
+            return .{ .section = nativeSection(row.descriptor.section), .hwnd = @field(self.fields, row.native.binding) };
         };
-        return .{ .section = nativeSection(field_model.descriptor(field).section), .hwnd = hwnd };
+        unreachable;
     }
 
     /// Open settings at the exact native control that owns `field`.
     pub fn openField(self: *SettingsWindow, field: SettingField) !void {
         try self.open();
+        const section = self.settingDestination(field).section;
+        self.setActiveSection(section);
+        // Asked again: the section's rows may have been made just now.
         const destination = self.settingDestination(field);
-        self.setActiveSection(destination.section);
         if (destination.hwnd) |control| {
             self.ensureControlVisible(control);
             // Unsupported controls are disabled: focus stays on the section.
@@ -4607,6 +4299,10 @@ pub const SettingsWindow = struct {
     /// with a live HWND brings the existing window to the foreground
     /// instead of duplicating it.
     pub fn open(self: *SettingsWindow) !void {
+        // The stamps describe this call alone: a raise leaves none, so an
+        // earlier creation's stamps never read as this one's.
+        const stamps = &self.creation_stamps;
+        stamps.len = 0;
         if (self.hwnd) |h| {
             if (sys.IsWindow(h) != 0) {
                 switch (pendingCloseReopenAction(self.close_posted, self.close_after_save)) {
@@ -4632,6 +4328,7 @@ pub const SettingsWindow = struct {
             }
             self.hwnd = null;
         }
+        stamps.mark(.create_begin);
         self.resetClosePromptState();
         self.close_notified = false;
         self.focus_before_deactivate = null;
@@ -4641,6 +4338,7 @@ pub const SettingsWindow = struct {
         // or atomically refreshed after a successful save.
         self.status_note = .none;
         try self.adoptCurrentConfig();
+        stamps.mark(.create_config);
 
         if (self.class_atom == 0) {
             const wc: WNDCLASSEXW = .{
@@ -4750,398 +4448,264 @@ pub const SettingsWindow = struct {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        stamps.mark(.create_frame);
 
+        // Each window is created once, in its final form: where Tab reaches
+        // it (z-order is creation order), with its final group, tab stop and
+        // visibility, then given its theme and its font (`finishChild`).
+        // Nothing reorders, restyles, re-themes or re-fonts every window
+        // afterwards, so what the colours, brushes and fonts are comes first.
+        // A `WM_DPICHANGED` from the move above already built the fonts for
+        // the new DPI. Fonts before any child: a text field's frame centres on
+        // their line height.
+        self.theme_adapter.apply(hwnd, self.resolveThemeColors(), .frame);
+        stamps.mark(.create_theme);
+        if (self.ui_font == null or self.ui_font_dpi != self.dpi) {
+            if (self.buildUiFonts()) |replaced| replaced.delete();
+        }
+        stamps.mark(.create_fonts);
+
+        const hinstance = self.handle.hinstance;
         const btn_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
-        self.text_header = makeStatic(hwnd, self.handle.hinstance, "Appearance");
-        self.text_summary = makeStatic(hwnd, self.handle.hinstance, Section.appearance.placeholderText());
-        self.text_status = makeStatic(hwnd, self.handle.hinstance, "");
-        self.text_close_prompt = makeStatic(hwnd, self.handle.hinstance, "Save changes before closing?");
-        if (self.text_close_prompt) |text| _ = sys.ShowWindow(text, SW_HIDE);
+        const status_text = switch (self.nextStatus()) {
+            .none => self.idleStatusText(),
+            else => "",
+        };
+        self.text_header = self.finishChild(makeStatic(hwnd, hinstance, self.active_section.headerText(), WS_VISIBLE), self.header_font, .control);
+        self.text_summary = self.finishChild(makeStatic(hwnd, hinstance, self.active_section.placeholderText(), WS_VISIBLE), self.secondary_font, .control);
+        self.text_status = self.finishChild(makeStatic(hwnd, hinstance, status_text, WS_VISIBLE), self.statusFont(), .control);
+        self.text_close_prompt = self.finishChild(makeStatic(hwnd, hinstance, "Save changes before closing?", 0), self.emphasis_font, .control);
 
         // Left-rail section buttons. Clicks arrive via WM_COMMAND on
         // the parent; the id maps back to a `Section` via
         // `Section.fromButtonId`.
-        self.btn_section_appearance = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.appearance);
-        self.btn_section_terminal = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.terminal);
-        self.btn_section_shell = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.shell);
-        self.btn_section_privacy = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.privacy);
-        self.btn_section_updates = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.updates);
-        self.btn_section_keybindings = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.keybindings);
-        self.btn_section_advanced = makeSectionButton(hwnd, self.handle.hinstance, btn_class, Section.advanced);
+        const selected = self.active_section;
+        self.btn_section_appearance = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .appearance, selected), self.ui_font, .control);
+        self.btn_section_terminal = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .terminal, selected), self.ui_font, .control);
+        self.btn_section_shell = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .shell, selected), self.ui_font, .control);
+        self.btn_section_privacy = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .privacy, selected), self.ui_font, .control);
+        self.btn_section_updates = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .updates, selected), self.ui_font, .control);
+        self.btn_section_keybindings = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .keybindings, selected), self.ui_font, .control);
+        self.btn_section_advanced = self.finishChild(makeSectionButton(hwnd, hinstance, btn_class, .advanced, selected), self.ui_font, .control);
+        if (self.sectionButton(selected)) |button| _ = sys.SendMessageW(button, BM_SETCHECK, BST_CHECKED, 0);
         self.subclassSectionButtons();
         self.initializeSectionUiaProviders();
+        stamps.mark(.create_rail);
 
         // The form: every field, its label and the help text live in the
         // viewport, after the rail in z-order so Tab goes rail, fields, action
         // bar. WS_EX_CONTROLPARENT lets the dialog manager walk into it.
         // WM_COMMAND and WM_CTLCOLOR* from the fields are forwarded here.
+        // No scroll bar yet: the layout gives it one when the form overflows
+        // (`SetScrollInfo`, `ShowScrollBar`).
         const form = sys.CreateWindowExW(
             WS_EX_CONTROLPARENT,
             viewport_class_name,
             std.unicode.utf8ToUtf16LeStringLiteral(""),
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             0,
             0,
             1,
             1,
             hwnd,
             null,
-            self.handle.hinstance,
+            hinstance,
             self,
         ) orelse {
             const err = windows.kernel32.GetLastError();
             _ = sys.DestroyWindow(hwnd);
             return windows.unexpectedError(err);
         };
-        self.viewport = form;
-        self.text_help = makeStatic(form, self.handle.hinstance, "");
+        // Its scroll bar takes the theme; it draws no text.
+        self.viewport = self.finishChild(form, null, .control);
         // The arrow keys walk a group from window to window and step into the
         // viewport, ignoring a group style on the viewport itself: its first
         // child has to end the rail's group, or Down from the last section
-        // would run on into the labels.
-        if (self.text_help) |help| startGroup(help);
-        for (settings_label_specs, 0..) |spec, i| {
-            self.field_labels[i] = makeStatic(form, self.handle.hinstance, spec);
-        }
+        // would run on into the labels. The layout shows it on the pages that
+        // have help.
+        var help_buf: [help_text_bytes]u8 = undefined;
+        self.text_help = self.finishChild(makeStatic(form, hinstance, self.helpText(&help_buf), WS_GROUP), self.ui_font, .control);
+        // Only the selected section's rows: the others are made the first
+        // time they are shown (`materializeSection`).
+        self.createSectionRows(selected, true);
         self.initializeTextUiaProviders();
+        stamps.mark(.create_form);
 
-        // "Open in default editor" button — escape hatch for users
-        // who prefer text-editing the config file directly. Lives
-        // in the Advanced section; hidden when another section is
-        // active.
-        const btn_label = std.unicode.utf8ToUtf16LeStringLiteral("Open in default editor");
-        self.btn_open_editor = sys.CreateWindowExW(
-            0,
-            btn_class,
-            btn_label,
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            settings_field_max_width,
-            32,
-            form,
-            @ptrFromInt(BTN_OPEN_EDITOR),
-            self.handle.hinstance,
-            null,
-        );
-        // "Save" button — always visible; writes `pending` to disk
-        // and fires a hard reload. Save errors are logged and the draft
-        // remains in memory for retry.
-        const btn_save_label = std.unicode.utf8ToUtf16LeStringLiteral("Save");
-        self.btn_save = sys.CreateWindowExW(
-            0,
-            btn_class,
-            btn_save_label,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            96,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_SAVE),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_discard_changes = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Discard changes"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            128,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_DISCARD_CHANGES),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_conflict_keep = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Keep mine"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CONFLICT_KEEP),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_conflict_use_disk = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Use disk"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CONFLICT_USE_DISK),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_save = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Save and close"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            120,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_SAVE),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_discard = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Discard changes"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            128,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_DISCARD),
-            self.handle.hinstance,
-            null,
-        );
-        self.btn_close_keep_editing = sys.CreateWindowExW(
-            0,
-            btn_class,
-            std.unicode.utf8ToUtf16LeStringLiteral("Keep editing"),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            112,
-            32,
-            hwnd,
-            @ptrFromInt(BTN_CLOSE_KEEP_EDITING),
-            self.handle.hinstance,
-            null,
-        );
+        // The action bar, in the order Tab reaches it: the conflict choices
+        // and Discard sit left of Save (never together), and the close
+        // prompt's three replace them all. The first starts the bar's group.
+        // All seven exist from the start: Escape reaches the close path only
+        // through the enabled "Keep editing" button, which owns IDCANCEL.
+        // "Save" writes `pending` to disk and fires a hard reload; save
+        // errors are logged and the draft remains in memory for retry.
+        const discard_label = std.unicode.utf8ToUtf16LeStringLiteral("Discard changes");
+        self.btn_conflict_keep = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Keep mine"), BTN_CONFLICT_KEEP, 112, WS_GROUP), self.ui_font, .control);
+        self.btn_conflict_use_disk = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Use disk"), BTN_CONFLICT_USE_DISK, 112, 0), self.ui_font, .control);
+        self.btn_discard_changes = self.finishChild(makePushButton(hwnd, hinstance, discard_label, BTN_DISCARD_CHANGES, 128, WS_VISIBLE), self.ui_font, .control);
+        self.btn_save = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Save"), BTN_SAVE, 96, WS_VISIBLE), self.ui_font, .control);
+        self.btn_close_save = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Save and close"), BTN_CLOSE_SAVE, 120, 0), self.ui_font, .control);
+        self.btn_close_discard = self.finishChild(makePushButton(hwnd, hinstance, discard_label, BTN_CLOSE_DISCARD, 128, 0), self.ui_font, .control);
+        self.btn_close_keep_editing = self.finishChild(makePushButton(hwnd, hinstance, std.unicode.utf8ToUtf16LeStringLiteral("Keep editing"), BTN_CLOSE_KEEP_EDITING, 112, 0), self.ui_font, .control);
+        stamps.mark(.create_actions);
 
-        const btn_keybind_label = std.unicode.utf8ToUtf16LeStringLiteral("Open config for keybinds");
-        self.btn_keybindings_editor = sys.CreateWindowExW(
-            0,
-            btn_class,
-            btn_keybind_label,
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0,
-            0,
-            settings_field_max_width,
-            32,
-            form,
-            @ptrFromInt(BTN_KEYBINDINGS_EDITOR),
-            self.handle.hinstance,
-            null,
-        );
-
-        // Scrollback limit EDIT. Lives in the Terminal section. Digit-
-        // only input via ES_NUMBER; EN_CHANGE syncs into `pending`.
-        self.edit_scrollback = makeEdit(form, self.handle.hinstance, EDIT_SCROLLBACK, ES_NUMBER);
-
-        // font-family EDIT. Comma-separated fallback families.
-        self.edit_font_family = makeEdit(form, self.handle.hinstance, EDIT_FONT_FAMILY, 0);
-
-        // font-size EDIT. Appearance section. We accept floats via a
-        // plain EDIT (not ES_NUMBER — which rejects '.') and validate
-        // on EN_CHANGE.
-        self.edit_font_size = makeEdit(form, self.handle.hinstance, EDIT_FONT_SIZE, 0);
-
-        // theme EDIT. Accepts a built-in/custom name or light/dark pair.
-        self.edit_theme = makeEdit(form, self.handle.hinstance, EDIT_THEME, 0);
-
-        // background-opacity EDIT. Appearance section. 0.0..1.0.
-        self.edit_bg_opacity = makeEdit(form, self.handle.hinstance, EDIT_BG_OPACITY, 0);
-
-        self.edit_command = makeEdit(form, self.handle.hinstance, EDIT_COMMAND, 0);
-
-        self.edit_pad_x = makeEdit(form, self.handle.hinstance, EDIT_PAD_X, 0);
-
-        self.edit_pad_y = makeEdit(form, self.handle.hinstance, EDIT_PAD_Y, 0);
-
-        // clipboard-trim-trailing-spaces checkbox. Terminal section.
-        self.chk_trim_trail = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_TRIM_TRAIL,
-            std.unicode.utf8ToUtf16LeStringLiteral(trim_trailing_label),
-        );
-
-        self.chk_desktop_notifications = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_DESKTOP_NOTIFICATIONS,
-            std.unicode.utf8ToUtf16LeStringLiteral(desktop_notifications_label),
-        );
-
-        self.chk_app_notify_clipboard = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_APP_NOTIFY_CLIPBOARD,
-            std.unicode.utf8ToUtf16LeStringLiteral(notify_clipboard_label),
-        );
-
-        self.chk_app_notify_config = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_APP_NOTIFY_CONFIG,
-            std.unicode.utf8ToUtf16LeStringLiteral(notify_config_label),
-        );
-
-        // Comboboxes for enum fields.
-        self.combo_confirm_close = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_CONFIRM_CLOSE,
-            settings_combo_popup_height,
-            &confirm_close_labels,
-        );
-
-        self.combo_copy_on_select = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_COPY_ON_SELECT,
-            settings_combo_popup_height,
-            &copy_on_select_labels,
-        );
-
-        self.combo_clipboard_read = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_CLIPBOARD_READ,
-            settings_combo_popup_height,
-            &clipboard_access_labels,
-        );
-
-        self.combo_clipboard_write = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_CLIPBOARD_WRITE,
-            settings_combo_popup_height,
-            &clipboard_access_labels,
-        );
-
-        self.combo_link_url = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_LINK_URL,
-            settings_combo_popup_height,
-            &link_url_labels,
-        );
-
-        self.combo_link_previews = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_LINK_PREVIEWS,
-            settings_combo_popup_height,
-            &link_previews_labels,
-        );
-
-        self.combo_window_theme = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_WINDOW_THEME,
-            settings_combo_popup_height,
-            &window_theme_labels,
-        );
-
-        self.combo_shell_integ = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_SHELL_INTEG,
-            settings_combo_popup_height,
-            &shell_integration_labels,
-        );
-
-        self.combo_cursor_style = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_CURSOR_STYLE,
-            settings_combo_popup_height,
-            &cursor_style_labels,
-        );
-
-        self.chk_accent_follow = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_ACCENT_FOLLOW,
-            accent_follow_label,
-        );
-
-        // Nothing in the Win32 runtime can show a backdrop blur (AGENTS.md,
-        // 2026-09-14), so the box is shown for what the config file may say and
-        // cannot be changed here. Its visible and accessible names explain why.
-        self.chk_bg_blur = makeCheckbox(
-            form,
-            self.handle.hinstance,
-            CHK_BG_BLUR,
-            std.unicode.utf8ToUtf16LeStringLiteral(background_blur_label),
-        );
-
-        self.combo_pad_balance = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_PAD_BALANCE,
-            settings_combo_popup_height,
-            &padding_balance_labels,
-        );
-
-        self.combo_auto_update = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_AUTO_UPDATE,
-            settings_combo_popup_height,
-            &auto_update_labels,
-        );
-
-        self.combo_auto_update_channel = makeCombo(
-            form,
-            self.handle.hinstance,
-            COMBO_AUTO_UPDATE_CHANNEL,
-            settings_combo_popup_height,
-            &auto_update_channel_labels,
-        );
-
-        // Support is descriptor data; retain values while disabling unsupported
-        // editors before tab order and accessibility providers are initialized.
-        inline for (field_model.descriptors) |spec| {
-            if (spec.support != .available) {
-                if (spec.field) |field| {
-                    if (self.settingDestination(field).hwnd) |control| _ = sys.EnableWindow(control, 0);
-                }
-            }
-        }
-
-        // Painted field labels keep the native dark visual treatment, while
-        // MSAA annotations give the existing EDIT/COMBO HWNDs stable names
-        // through the UI Automation bridge. Values remain owned by the native
-        // controls and are not conflated with their accessible names.
-        annotateAccessibleControls(self);
-        // Before the UIA providers: they subclass the same HWNDs and call
-        // down to whatever procedure is installed when they arrive.
-        for (self.comboControls()) |combo| if (combo) |control| subclassCombo(control);
-        for (self.editControls()) |edit| if (edit) |control| subclassEdit(control);
-        self.applyTabOrder();
+        self.prepareSectionRows(selected);
+        stamps.mark(.create_annotate);
         // Establish native values before providers cache their initial state.
         self.refreshAllControls();
         self.initializeControlUiaProviders();
-        self.refreshNativeSectionText();
-        self.theme_adapter.apply(hwnd, self.resolveThemeColors());
-        self.recreateUiFont();
+        stamps.mark(.create_refresh);
 
         layoutChildren(self);
-        self.applySectionVisibility();
+        stamps.mark(.create_layout);
         _ = sys.ShowWindow(hwnd, SW_SHOWNORMAL);
+        stamps.mark(.create_show);
         _ = sys.SetForegroundWindow(hwnd);
-        if (self.sectionButton(self.active_section)) |button| _ = sys.SetFocus(button);
+        if (self.sectionButton(selected)) |button| _ = sys.SetFocus(button);
+        stamps.mark(.create_end);
+    }
+
+    /// Make `section`'s rows the first time it is shown, hidden: the caller
+    /// lays them out and shows them with the rest of the section
+    /// (`setActiveSection`). Each row gets what `open` gives the selected
+    /// section's rows, from the window's current draft, theme, fonts and DPI,
+    /// so a section first shown late ends up as one made at open would.
+    fn materializeSection(self: *SettingsWindow, section: Section) void {
+        if (self.materialized.contains(section) or self.viewport == null) return;
+        self.createSectionRows(section, false);
+        const providers = self.canInitializeCustomUiaProviders();
+        if (providers) for (formItemsForSection(section)) |item| {
+            if (item.label_index) |index| self.attachTextUiaProvider(text_first_label_index + index);
+        };
+        self.prepareSectionRows(section);
+        // Values before the providers, which cache their initial state.
+        self.displaySectionRows(section);
+        if (providers) for (formItemsForSection(section)) |item| self.attachControlUiaProvider(item.control_index);
+    }
+
+    /// Make `section`'s labels and controls in the viewport, each in its final
+    /// form (`finishChild`), in the order they are laid out: a label right
+    /// before its control. A section's first row, a label and its control, and
+    /// a row next to text start an arrow-key group, so the arrows never run
+    /// from one section into the next or onto a static row.
+    ///
+    /// Tab and the arrow keys follow z-order, and a new window goes to the
+    /// bottom of it. So when a later section's rows already exist, each new
+    /// row is moved in behind the one before it, starting after the rows of
+    /// the nearest earlier section: in whatever order the sections are first
+    /// shown, the viewport ends up as if they had all been made in order.
+    fn createSectionRows(self: *SettingsWindow, section: Section, visible: bool) void {
+        const form = self.viewport orelse return;
+        const hinstance = self.handle.hinstance;
+        const shown: u32 = if (visible) WS_VISIBLE else 0;
+        var order: RowOrder = if (self.laterSectionMaterialized(section))
+            .{ .insert = true, .after = self.lastFormWindowBefore(section) }
+        else
+            .{ .insert = false, .after = null };
+        var previous_text = false;
+        switch (section) {
+            inline else => |made| inline for (comptime formItemsForSection(made), 0..) |item, index| {
+                const spec = comptime settings_control_specs[item.control_index];
+                const text = comptime spec.role == .text;
+                var group = formGroupStarts(index, previous_text, text);
+                if (item.label_index) |i| {
+                    self.field_labels[i] = self.finishChild(makeStatic(form, hinstance, spec.label.?, shown | WS_GROUP), self.secondary_font, .control);
+                    order.place(self.field_labels[i]);
+                    if (self.field_labels[i] != null) group = true;
+                }
+                const style: u32 = shown | if (group) WS_GROUP else 0;
+                if (comptime item.control_index < field_model.form_fields.len) {
+                    const row = comptime field_model.form_fields[item.control_index];
+                    @field(self.fields, spec.binding) = switch (comptime row.kind()) {
+                        .choice => makeCombo(form, hinstance, spec.id, settings_combo_popup_height, &field_model.Combo(row.field.?).labels, style),
+                        .boolean, .blur => makeCheckbox(form, hinstance, spec.id, std.unicode.utf8ToUtf16LeStringLiteral(spec.caption.?), style),
+                        else => makeEdit(form, hinstance, spec.id, style | if (row.kind() == .integer) ES_NUMBER else 0),
+                    };
+                    if (@field(self.fields, spec.binding)) |control| {
+                        if (row.descriptor.support != .available) _ = sys.EnableWindow(control, 0);
+                        if (spec.role == .edit and row.descriptor.placeholder.len != 0)
+                            _ = sys.SendMessageW(control, 0x1501, 0, @bitCast(@intFromPtr(std.unicode.utf8ToUtf16LeStringLiteral(row.descriptor.placeholder)))); // EM_SETCUEBANNER
+                    }
+                } else {
+                    @field(self.fields, spec.binding) = makeDisplayControl(form, hinstance, spec, style);
+                }
+                const font = if (comptime spec.role == .check_box) self.secondary_font else self.ui_font;
+                if (self.finishChild(@field(self.fields, spec.binding), font, if (comptime spec.role == .combo_box) .combo else .control)) |control| {
+                    order.place(control);
+                    previous_text = text;
+                }
+            },
+        }
+        self.materialized.insert(section);
+    }
+
+    /// Where the next row goes in the viewport's z-order.
+    const RowOrder = struct {
+        /// Rows are moved only when a later section's rows exist; otherwise a
+        /// new window already lands where it belongs, at the bottom.
+        insert: bool,
+        /// The window the next row goes behind.
+        after: ?HWND,
+
+        fn place(self: *RowOrder, window: ?HWND) void {
+            const row = window orelse return;
+            if (!self.insert) return;
+            _ = SetWindowPos(row, self.after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            self.after = row;
+        }
+    };
+
+    fn laterSectionMaterialized(self: *const SettingsWindow, section: Section) bool {
+        for (std.enums.values(Section)) |other| {
+            if (@intFromEnum(other) > @intFromEnum(section) and self.materialized.contains(other)) return true;
+        }
+        return false;
+    }
+
+    /// The viewport window that `section`'s rows follow: the last row of the
+    /// nearest earlier section that has rows, or else the help text, the
+    /// viewport's first window.
+    fn lastFormWindowBefore(self: *const SettingsWindow, section: Section) ?HWND {
+        var earlier = @intFromEnum(section);
+        while (earlier > 0) {
+            earlier -= 1;
+            if (!self.materialized.contains(@enumFromInt(earlier))) continue;
+            const items = formItemsForSection(@enumFromInt(earlier));
+            var index = items.len;
+            while (index > 0) {
+                index -= 1;
+                if (self.controlHwnd(items[index].control_index)) |control| return control;
+                if (items[index].label_index) |label| if (self.field_labels[label]) |window| return window;
+            }
+        }
+        return self.text_help;
+    }
+
+    /// What a section's rows need once they exist: the names MSAA clients
+    /// read for its text fields and dropdowns, then their subclasses, then
+    /// each text field's frame. The subclasses come before the UIA providers,
+    /// which subclass the same windows and call down to whatever procedure is
+    /// installed when they arrive; and the stock EDIT answered the frame
+    /// request at creation, which its subclass owns now.
+    fn prepareSectionRows(self: *SettingsWindow, section: Section) void {
+        annotateAccessibleControls(self, section);
+        const items = formItemsForSection(section);
+        for (items) |item| if (settings_control_specs[item.control_index].role == .combo_box) {
+            if (self.controlHwnd(item.control_index)) |control| subclassKeepingPrevious(control, &settingsComboProc);
+        };
+        for (items) |item| if (settings_control_specs[item.control_index].role == .edit) {
+            if (self.controlHwnd(item.control_index)) |control| subclassKeepingPrevious(control, &settingsEditProc);
+        };
+        for (items) |item| if (settings_control_specs[item.control_index].role == .edit) {
+            if (self.controlHwnd(item.control_index)) |control|
+                _ = SetWindowPos(control, null, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
+    }
+
+    /// Show the draft's values in `section`'s controls.
+    fn displaySectionRows(self: *SettingsWindow, section: Section) void {
+        inline for (field_model.form_fields) |row| {
+            if (nativeSection(row.descriptor.section) == section) @field(field_adapters, row.native.binding).display(self);
+        }
     }
 };
 
@@ -5210,20 +4774,29 @@ fn setAccessibleName(service: *IAccPropServices, hwnd_opt: ?HWND, comptime name:
     }
 }
 
-fn annotateAccessibleControls(self: *SettingsWindow) void {
-    const service = createAccPropServices() orelse {
-        std.log.warn("settings: accessibility annotation service unavailable", .{});
-        return;
-    };
-    defer service.release();
-
+/// Painted field labels keep the native dark visual treatment, while MSAA
+/// annotations give `section`'s EDIT and COMBOBOX windows stable names through
+/// the UI Automation bridge. Values remain owned by the native controls and
+/// are not conflated with their accessible names.
+fn annotateAccessibleControls(self: *SettingsWindow, section: Section) void {
     // The names the custom UIA providers serve, so a client that falls back to
     // MSAA (`customUiaProvidersEnabled` false) hears the same ones. Only for
     // the fields and dropdowns, whose captions are separate labels. A checkbox
     // or button already speaks its own caption, and a name that leaves the
     // caption out breaks voice control ("click Discard changes").
+    const named = for (formItemsForSection(section)) |item| {
+        const role = settings_control_specs[item.control_index].role;
+        if (role == .edit or role == .combo_box) break true;
+    } else false;
+    if (!named) return;
+    const service = createAccPropServices() orelse {
+        std.log.warn("settings: accessibility annotation service unavailable", .{});
+        return;
+    };
+    defer service.release();
     inline for (settings_control_specs, 0..) |spec, index| {
-        if (spec.role == .edit or spec.role == .combo_box) setAccessibleName(service, self.controlHwnd(index), spec.name);
+        if ((spec.role == .edit or spec.role == .combo_box) and spec.section == section)
+            setAccessibleName(service, self.controlHwnd(index), spec.name);
     }
 }
 
@@ -5237,13 +4810,14 @@ fn populateCombo(combo_opt: ?HWND, items: []const []const u8) void {
     }
 }
 
-fn makeStatic(parent: HWND, hinstance: HINSTANCE, text: []const u8) ?HWND {
+/// `style` adds the window's final visibility and group (`WS_VISIBLE`, `WS_GROUP`).
+fn makeStatic(parent: HWND, hinstance: HINSTANCE, text: []const u8, style: u32) ?HWND {
     var text_w: [2048]u16 = undefined;
     return sys.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
         utf8ToW(&text_w, text),
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+        WS_CHILD | SS_LEFT | SS_NOPREFIX | style,
         0,
         0,
         1,
@@ -5320,11 +4894,12 @@ fn createSettingsFont(dpi: u32, logical_height: i32, weight: i32, face: [*:0]con
     );
 }
 
+/// `style` adds the edit styles and the window's final visibility and group.
 fn makeEdit(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
-    extra_style: u32,
+    style: u32,
 ) ?HWND {
     const edit_class = std.unicode.utf8ToUtf16LeStringLiteral("EDIT");
     // No border style: the field draws its own frame (`settingsEditProc`).
@@ -5335,7 +4910,7 @@ fn makeEdit(
         0,
         edit_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | extra_style,
+        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | style,
         0,
         0,
         settings_field_max_width,
@@ -5349,18 +4924,20 @@ fn makeEdit(
     return edit;
 }
 
+/// `style` adds the window's final visibility and group.
 fn makeCheckbox(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
     label: LPCWSTR,
+    style: u32,
 ) ?HWND {
     const btn_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
     return sys.CreateWindowExW(
         0,
         btn_class,
         label,
-        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX | style,
         0,
         0,
         settings_field_max_width,
@@ -5372,19 +4949,21 @@ fn makeCheckbox(
     );
 }
 
+/// `style` adds the window's final visibility and group.
 fn makeCombo(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
     height: i32,
     items: []const []const u8,
+    style: u32,
 ) ?HWND {
     const combo_class = std.unicode.utf8ToUtf16LeStringLiteral("COMBOBOX");
     const combo = sys.CreateWindowExW(
         0,
         combo_class,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS | style,
         0,
         0,
         settings_field_max_width,
@@ -5398,11 +4977,33 @@ fn makeCombo(
     return combo;
 }
 
+/// `style` adds the window's final visibility and group.
+fn makePushButton(parent: HWND, hinstance: HINSTANCE, label: LPCWSTR, id: usize, width: i32, style: u32) ?HWND {
+    return sys.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        label,
+        WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | style,
+        0,
+        0,
+        width,
+        32,
+        parent,
+        @ptrFromInt(id),
+        hinstance,
+        null,
+    );
+}
+
+/// The rail is one arrow-key group, which the first button starts, and the
+/// selected section's button is its tab stop (`applySectionVisibility` moves
+/// it on a switch).
 fn makeSectionButton(
     parent: HWND,
     hinstance: HINSTANCE,
     class: LPCWSTR,
     section: Section,
+    selected: Section,
 ) ?HWND {
     const id: usize = switch (section) {
         .appearance => BTN_SECTION_APPEARANCE,
@@ -5413,12 +5014,13 @@ fn makeSectionButton(
         .keybindings => BTN_SECTION_KEYBINDINGS,
         .advanced => BTN_SECTION_ADVANCED,
     };
-    const group_style: u32 = if (section == .appearance) WS_GROUP | WS_TABSTOP else 0;
+    const group_style: u32 = if (section == .appearance) WS_GROUP else 0;
+    const tab_style: u32 = if (section == selected) WS_TABSTOP else 0;
     return sys.CreateWindowExW(
         0,
         class,
         section.label(),
-        WS_CHILD | WS_VISIBLE | group_style | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
+        WS_CHILD | WS_VISIBLE | group_style | tab_style | BS_AUTORADIOBUTTON | BS_PUSHLIKE,
         0,
         0,
         100,
@@ -5812,11 +5414,10 @@ test "settings save preserves untouched scalar precision and legacy ranges" {
             .handle = .{ .ctx = &capture, .alloc = std.testing.allocator, .hinstance = undefined, .chromeBg = undefined, .textPrimary = undefined, .openInEditor = undefined, .currentConfig = undefined, .saveAndReload = Capture.save, .notifySuccess = undefined, .onClosed = undefined },
             .original = original,
             .pending = pending,
-            .edit_font_size = font_edit,
-            .edit_bg_opacity = opacity_edit,
+            .fields = .{ .edit_font_size = font_edit, .edit_bg_opacity = opacity_edit },
         };
-        settings.displayFontSizeInEdit();
-        settings.displayBgOpacityInEdit();
+        settings.displayNumberInEdit(.font_size);
+        settings.displayNumberInEdit(.background_opacity);
         settings.save();
         try std.testing.expect(capture.saved);
         try std.testing.expectEqual(font_size, capture.font_size);
@@ -5830,7 +5431,7 @@ test "settings untouched owned controls survive focus loss without reparsing" {
     var pending = try Config.default(std.testing.allocator);
     defer pending.deinit();
     try pending.@"font-family".parseCLI(pending._arena.?.allocator(), "Alpha, Beta");
-    var settings: SettingsWindow = .{ .handle = undefined, .pending = pending, .edit_font_family = edit };
+    var settings: SettingsWindow = .{ .handle = undefined, .pending = pending, .fields = .{ .edit_font_family = edit } };
     settings.displayFontFamilyInEdit();
     settings.syncFontFamilyFromEdit(); // The EN_KILLFOCUS production path.
     try std.testing.expectEqual(@as(usize, 1), settings.pending.?.@"font-family".list.items.len);
@@ -5843,14 +5444,14 @@ test "settings numeric edits reject nonfinite floats and excessive padding" {
     defer _ = sys.DestroyWindow(edit);
     var pending = try Config.default(std.testing.allocator);
     defer pending.deinit();
-    var settings: SettingsWindow = .{ .handle = undefined, .pending = pending, .edit_font_size = edit, .edit_bg_opacity = edit, .edit_pad_x = edit };
-    settings.syncFontSizeFromEdit();
+    var settings: SettingsWindow = .{ .handle = undefined, .pending = pending, .fields = .{ .edit_font_size = edit, .edit_bg_opacity = edit, .edit_pad_x = edit } };
+    settings.syncNumberFromEdit(.font_size);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.font_size)] != null);
     try std.testing.expectEqual(@as(f32, 12), settings.pending.?.@"font-size");
-    settings.syncBgOpacityFromEdit();
+    settings.syncNumberFromEdit(.background_opacity);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.background_opacity)] != null);
     _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("4294967295"));
-    settings.syncPaddingFromEdit(.x);
+    settings.syncPaddingFromEdit(.window_padding_x);
     try std.testing.expect(settings.raw_scalar_error[@intFromEnum(RawScalarField.window_padding_x)] != null);
 }
 
@@ -5881,13 +5482,13 @@ test "settings opacity preview is floored while the draft keeps the typed value"
             .current = current,
             .original = try current.clone(std.testing.allocator),
             .pending = try current.clone(std.testing.allocator),
-            .edit_bg_opacity = edit,
+            .fields = .{ .edit_bg_opacity = edit },
         };
         settings.initTransaction();
 
         // Typing 0.85: the intermediate 0 must not turn the window invisible.
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         try std.testing.expectEqual(@as(f64, 0), settings.pending.?.@"background-opacity");
         try std.testing.expectEqual(@as(usize, 1), capture.count);
         try std.testing.expectEqual(case.floor, capture.previews[0]);
@@ -5902,13 +5503,13 @@ test "settings opacity preview is floored while the draft keeps the typed value"
         try std.testing.expectEqual(case.floor, capture.previews[1]);
 
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0.85"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         try std.testing.expectEqual(@as(f64, 0.85), settings.pending.?.@"background-opacity");
         try std.testing.expectEqual(@as(f64, 0.85), capture.previews[2]);
 
         // A rollback restores the saved value exactly, floor or not.
         _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("0"));
-        settings.syncBgOpacityFromEdit();
+        settings.syncNumberFromEdit(.background_opacity);
         settings.clearPending();
         try std.testing.expectEqual(case.saved, capture.previews[capture.count - 1]);
     }
@@ -5952,7 +5553,7 @@ test "settings save checks the file for edits first, and a conflict stops it" {
         .current = current,
         .original = try current.clone(std.testing.allocator),
         .pending = try current.clone(std.testing.allocator),
-        .edit_font_size = edit,
+        .fields = .{ .edit_font_size = edit },
     };
     capture.settings = &settings;
     settings.initTransaction();
@@ -5960,7 +5561,7 @@ test "settings save checks the file for edits first, and a conflict stops it" {
 
     // The draft: font size 14, from a session that started at the default 12.
     _ = sys.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("14"));
-    settings.syncFontSizeFromEdit();
+    settings.syncNumberFromEdit(.font_size);
     try std.testing.expectEqual(@as(f32, 14), settings.pending.?.@"font-size");
 
     // The file is as the session left it: the save goes ahead.
@@ -6130,6 +5731,315 @@ test "settings theme change with unchanged inputs rebuilds nothing" {
     try std.testing.expect(settings.theme_adapter.button_brush != null);
 }
 
+test "settings initial native theme does not reenter font and layout work" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+
+            // SetWindowTheme sends WM_THEMECHANGED synchronously. The open
+            // path already follows the adapter with fonts and layout; handling
+            // that notification again would build both while apply is active.
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+            try std.testing.expect(settings.themeInputsApplied(settings.resolveThemeColors()));
+            // Once open completes, a notification with the same inputs also
+            // keeps the fonts and layout already applied.
+            const fonts = .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font };
+            _ = sys.SendMessageW(fixture.hwnd(), WM_THEMECHANGED, 0, 0);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+            try std.testing.expectEqualDeep(fonts, .{ settings.ui_font, settings.secondary_font, settings.emphasis_font, settings.header_font });
+        }
+    }.body);
+}
+
+test "settings open stamps each creation step once when traced" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            const stamps = &settings.creation_stamps;
+            stamps.enabled = true;
+            try settings.open();
+            const all = comptime std.meta.tags(bench_trace.SettingsCreationStage);
+            try std.testing.expectEqual(all.len, stamps.len);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_begin, stamps.stages[0]);
+            try std.testing.expectEqual(bench_trace.SettingsCreationStage.create_end, stamps.stages[stamps.len - 1]);
+            for (all) |stage| try std.testing.expectEqual(@as(usize, 1), std.mem.count(bench_trace.SettingsCreationStage, stamps.stages[0..stamps.len], &.{stage}));
+            for (stamps.counters[1..stamps.len], stamps.counters[0 .. stamps.len - 1]) |later, earlier| try std.testing.expect(later >= earlier);
+
+            // Raising the open window is not a creation, and keeps none of the
+            // creation's stamps; a disabled trace takes nothing.
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
+            settings.closeNow(fixture.hwnd());
+            stamps.enabled = false;
+            try settings.open();
+            try std.testing.expectEqual(@as(usize, 0), stamps.len);
+        }
+    }.body);
+}
+
+test "settings open and a first visit create each window once in its final form" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const Work = dialog_test.OpenWork;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try Work.measure(settings);
+            try std.testing.expect(!Work.overflowed);
+            const tree = Work.Tree.of(fixture.hwnd());
+            var totals: Work.Counts = .{ .hwnd = fixture.hwnd() };
+            for (tree.slice()) |hwnd| {
+                const counts = Work.of(hwnd);
+                totals.themes += counts.themes;
+                totals.messages += counts.messages;
+            }
+            errdefer {
+                std.debug.print("settings open: {d} windows, {d} messages to them\n", .{ tree.len, totals.messages });
+                Work.print(&tree);
+            }
+            // The frame, its 19 children (one is the viewport), and in the
+            // viewport the help text and Appearance's 11 fields and 9 labels.
+            // The other sections' 31 rows are made when they are first shown.
+            try std.testing.expectEqual(@as(usize, 41), tree.len);
+            for (tree.slice()) |hwnd| {
+                const counts = Work.of(hwnd);
+                try std.testing.expectEqual(@as(u16, 1), counts.created);
+                if (hwnd == fixture.hwnd()) continue;
+                // Created where Tab reaches it, with its final group, tab stop
+                // and visibility: nothing is moved, restyled or hidden again.
+                try std.testing.expectEqual(@as(u16, 0), counts.z_moves);
+                try std.testing.expectEqual(@as(u16, 0), counts.style_rewrites);
+                try std.testing.expectEqual(@as(u16, 0), counts.hidden);
+                try std.testing.expect(counts.shown <= 1);
+                // One font each; the viewport draws no text.
+                try std.testing.expectEqual(@as(u16, if (hwnd == settings.viewport.?) 0 else 1), counts.fonts);
+                // One theme each, when the theme service sends anything at all.
+                if (totals.themes != 0) try std.testing.expectEqual(@as(u16, 1), counts.themes);
+                // A text field asks for its frame once, after its subclass.
+                try std.testing.expectEqual(@as(u16, @intFromBool(settings.isEditControl(hwnd))), counts.frame_changes);
+            }
+            // The fonts are built once, before any child, and the theme
+            // notifications the children send back rebuild nothing.
+            try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+
+            // A section's first visit makes its rows the same way, hidden until
+            // the switch shows them. Privacy comes after every section made so
+            // far, so its rows land where they belong; Terminal comes before
+            // Privacy, so each of its rows is moved in once, behind Appearance's.
+            const visits = [_]struct { section: Section, windows: usize, moved: u16 }{
+                .{ .section = .privacy, .windows = 12, .moved = 0 },
+                .{ .section = .terminal, .windows = 7, .moved = 1 },
+            };
+            for (visits) |visit| {
+                errdefer std.debug.print("settings first visit to {s}\n", .{@tagName(visit.section)});
+                try Work.measureStep(settings, .{ .show = visit.section });
+                try std.testing.expect(!Work.overflowed);
+                var made: usize = 0;
+                var lists: usize = 0;
+                for (Work.created()) |counts| {
+                    errdefer Work.print(&Work.Tree.of(fixture.hwnd()));
+                    try std.testing.expectEqual(@as(u16, 1), counts.created);
+                    // A dropdown's list is a window of its own, outside the tree.
+                    if (IsChild(settings.viewport.?, counts.hwnd) == 0) {
+                        lists += 1;
+                        continue;
+                    }
+                    made += 1;
+                    try std.testing.expectEqual(visit.moved, counts.z_moves);
+                    try std.testing.expectEqual(@as(u16, 0), counts.style_rewrites);
+                    try std.testing.expectEqual(@as(u16, 0), counts.hidden);
+                    try std.testing.expectEqual(@as(u16, 1), counts.shown);
+                    try std.testing.expectEqual(@as(u16, 1), counts.fonts);
+                    if (totals.themes != 0) try std.testing.expectEqual(@as(u16, 1), counts.themes);
+                    try std.testing.expectEqual(@as(u16, @intFromBool(settings.isEditControl(counts.hwnd))), counts.frame_changes);
+                }
+                try std.testing.expectEqual(visit.windows, made);
+                var combos: usize = 0;
+                for (formItemsForSection(visit.section)) |item| combos += @intFromBool(settings_control_specs[item.control_index].role == .combo_box);
+                try std.testing.expectEqual(combos, lists);
+            }
+            // A section shown before makes nothing.
+            try Work.measureStep(settings, .{ .show = .privacy });
+            try std.testing.expectEqual(@as(usize, 0), Work.created().len);
+            // Every section shown: the whole form, and still one font build.
+            for (std.enums.values(Section)) |section| settings.setActiveSection(section);
+            try std.testing.expectEqual(@as(usize, 72), Work.Tree.of(fixture.hwnd()).len);
+            try std.testing.expectEqual(@as(u32, 1), settings.font_builds);
+            try std.testing.expectEqual(@as(u32, 0), settings.theme_applications);
+        }
+    }.body);
+}
+
+test "settings open on any section ends as a switch to it would leave it" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            const fixture = try dialog_test.Fixture.prepare(false);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            // The section survives a close, so Settings can open on any of
+            // them, and `open` alone decides each window's visibility, tab
+            // stop, check, text and font there. The paths a switch and a DPI
+            // change take must find nothing to change.
+            for (std.enums.values(Section)) |section| {
+                settings.active_section = section;
+                try settings.open();
+                const opened = State.of(settings);
+                const help = section == .keybindings or section == .advanced;
+                try std.testing.expectEqual(help, settings.help_shown);
+                try std.testing.expectEqual(help, State.styleOf(settings.text_help.?) & WS_VISIBLE != 0);
+                try std.testing.expectEqual(help, sys.GetWindowTextLengthW(settings.text_help.?) > 0);
+                settings.setActiveSection(section);
+                settings.recreateUiFont();
+                const switched = State.of(settings);
+                errdefer std.debug.print("settings opened on {s}\n", .{@tagName(section)});
+                try std.testing.expectEqual(opened.len, switched.len);
+                for (opened.slice(), switched.slice()) |at_open, after_switch| {
+                    errdefer State.print(at_open, after_switch);
+                    try std.testing.expectEqualDeep(at_open, after_switch);
+                }
+                settings.closeNow(fixture.hwnd());
+            }
+        }
+    }.body);
+}
+
+test "settings sections shown in any order leave the window as one made whole at open" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            // Later sections first, so most rows are moved in behind earlier
+            // ones; then back to where the window opened.
+            const order = [_]Section{ .advanced, .shell, .privacy, .terminal, .keybindings, .updates, .appearance };
+            var states: [2]State = undefined;
+            var providers: [2][settings_control_count + settings_text_count]bool = undefined;
+            for ([_]bool{ true, false }, 0..) |whole, index| {
+                const fixture = try dialog_test.Fixture.startWith(true);
+                defer fixture.finish();
+                const settings = &fixture.settings;
+                // Every section made at open, in order, and every value shown
+                // there, as before sections were made when first shown.
+                if (whole) {
+                    dialog_test.makeAllSections(settings);
+                    settings.refreshAllControls();
+                }
+                for (order) |section| settings.setActiveSection(section);
+                states[index] = State.of(settings);
+                for (0..settings_control_count) |control| providers[index][control] = settings.control_uia_providers[control] != null;
+                for (0..settings_text_count) |text| providers[index][settings_control_count + text] = settings.text_uia_providers[text] != null;
+            }
+            // Every window in the same z-order, with the same styles, place,
+            // client area, check, dropdown heights, text and font, and every
+            // field and text with its UIA provider.
+            try std.testing.expectEqual(@as(usize, 72), states[0].len);
+            try State.expectSame(&states[0], &states[1]);
+            try std.testing.expectEqual(providers[0], providers[1]);
+            for (providers[1]) |provided| try std.testing.expect(provided);
+        }
+    }.body);
+}
+
+test "settings a section first shown after a DPI or High Contrast change looks as one made at open" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const State = dialog_test.OpenState;
+            const Change = enum { dpi, high_contrast };
+            const sections = comptime std.enums.values(Section);
+            for (std.enums.values(Change)) |change| {
+                errdefer std.debug.print("settings after a {s} change\n", .{@tagName(change)});
+                var states: [2][sections.len]State = undefined;
+                var pixels: [2][sections.len]u64 = undefined;
+                for ([_]bool{ true, false }, 0..) |whole, index| {
+                    const fixture = try dialog_test.Fixture.start();
+                    defer fixture.finish();
+                    const settings = &fixture.settings;
+                    // Every section made and shown its values at open, so the
+                    // change reaches it the way it reaches a window's controls.
+                    if (whole) {
+                        dialog_test.makeAllSections(settings);
+                        settings.refreshAllControls();
+                    }
+                    switch (change) {
+                        .dpi => dialog_test.simulateDpi(fixture.hwnd(), 144),
+                        .high_contrast => {
+                            fixture.high_contrast = true;
+                            settings.themeChanged();
+                        },
+                    }
+                    for (sections, 0..) |section, at| {
+                        settings.setActiveSection(section);
+                        dialog_test.flushPaint(fixture.hwnd());
+                        // What is shown: hidden rows of other sections are
+                        // the difference between the two windows.
+                        const all = State.of(settings);
+                        states[index][at] = all.shown();
+                        const capture = try dialog_test.Capture.take(fixture.hwnd());
+                        defer capture.deinit();
+                        pixels[index][at] = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(capture.pixels));
+                    }
+                }
+                for (sections, 0..) |section, at| {
+                    errdefer std.debug.print("settings on {s}\n", .{@tagName(section)});
+                    try State.expectSame(&states[0][at], &states[1][at]);
+                    try std.testing.expectEqual(pixels[0][at], pixels[1][at]);
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings a field in a section not shown yet is reached by openField, UIA and a config change" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.startWith(true);
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            try std.testing.expect(settings.fields.combo_clipboard_read == null);
+            try std.testing.expect(settings.fields.edit_scrollback == null);
+
+            // A file edit before Privacy is first shown: its dropdown shows
+            // the new value when it is made.
+            var disk = try Config.default(std.testing.allocator);
+            defer disk.deinit();
+            disk.@"clipboard-read" = .allow;
+            settings.externalConfigChanged(&disk, 100);
+            try std.testing.expectEqual(@as(usize, 0), settings.conflictCount());
+            // The palette's setting rows open on the field itself.
+            try settings.openField(.clipboard_write);
+            const write = settings.fields.combo_clipboard_write.?;
+            try std.testing.expectEqual(write, sys.GetFocus().?);
+            try std.testing.expect(sys.IsWindowVisible(write) != 0);
+            try std.testing.expectEqual(
+                @as(LRESULT, @intCast(field_model.Combo(.clipboard_read).toIndex(.allow))),
+                sys.SendMessageW(settings.fields.combo_clipboard_read.?, CB_GETCURSEL, 0, 0),
+            );
+            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(write).?] != null);
+
+            // UIA selects a section the way a click does, inside the window
+            // procedure, and its rows are there and shown when Select returns.
+            const updates = settings.sectionProvider(.updates).?;
+            try std.testing.expectEqual(win32_uia.S_OK, updates.selection_iface.vtbl.Select(&updates.selection_iface));
+            try std.testing.expectEqual(Section.updates, settings.active_section);
+            try std.testing.expect(sys.IsWindowVisible(settings.fields.combo_auto_update.?) != 0);
+
+            // Opened again on a section of its own, a field elsewhere makes
+            // that section and the field's, and no other.
+            settings.closeNow(fixture.hwnd());
+            settings.active_section = .advanced;
+            try settings.openField(.scrollback_limit);
+            try std.testing.expectEqual(settings.fields.edit_scrollback.?, sys.GetFocus().?);
+            try std.testing.expect(settings.fields.btn_open_editor != null);
+            try std.testing.expect(settings.fields.edit_command == null);
+            try std.testing.expect(settings.fields.edit_font_size == null);
+        }
+    }.body);
+}
+
 test "settings Ctrl+S is the only save shortcut" {
     try std.testing.expect(isSaveShortcut('S', true, false, false));
     try std.testing.expect(!isSaveShortcut('S', false, false, false));
@@ -6208,7 +6118,7 @@ test "settings status priority survives validation and conflict mutations" {
     var settings: SettingsWindow = .{ .handle = undefined };
     const raw_control: HWND = @ptrFromInt(0x101);
     const owned_control: HWND = @ptrFromInt(0x102);
-    settings.edit_font_size = raw_control;
+    settings.fields.edit_font_size = raw_control;
 
     settings.setRawScalarValidationError(.font_size, raw_control, "Font size is required.");
     // Inside its quiet period the raw error is not a status yet.
@@ -6292,8 +6202,8 @@ test "settings fixing one of two invalid scalars surfaces the other" {
     var settings: SettingsWindow = .{ .handle = undefined };
     const font_size_control: HWND = @ptrFromInt(0x101);
     const opacity_control: HWND = @ptrFromInt(0x102);
-    settings.edit_font_size = font_size_control;
-    settings.edit_bg_opacity = opacity_control;
+    settings.fields.edit_font_size = font_size_control;
+    settings.fields.edit_bg_opacity = opacity_control;
 
     settings.markRawScalarEdit(.font_size);
     settings.setRawScalarValidationError(.font_size, font_size_control, "Font size is required.");
@@ -6328,7 +6238,7 @@ test "settings a half-typed number raises no error until the field has been quie
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
-            const edit = settings.edit_font_size.?;
+            const edit = settings.fields.edit_font_size.?;
             var buf: [256]u8 = undefined;
 
             // "1" is the first key of "16": no message after it ...
@@ -6384,7 +6294,7 @@ test "settings the quiet period is a real timer and leaving the field ends it" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
-            const edit = settings.edit_font_size.?;
+            const edit = settings.fields.edit_font_size.?;
             var buf: [256]u8 = undefined;
 
             typeInto(edit, "1");
@@ -6439,12 +6349,12 @@ test "settings Save shows an error still inside its quiet period instead of savi
             const settings = &fixture.settings;
             var buf: [256]u8 = undefined;
 
-            typeInto(settings.edit_font_size.?, "1");
+            typeInto(settings.fields.edit_font_size.?, "1");
             try std.testing.expectEqual(SettingsStatus.none, settings.nextStatus());
             // The close prompt's "Save and close" calls save() directly.
             settings.save();
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
-            try std.testing.expectEqual(settings.edit_font_size.?, settings.validation_control.?);
+            try std.testing.expectEqual(settings.fields.edit_font_size.?, settings.validation_control.?);
             try std.testing.expect(std.mem.startsWith(u8, try statusTextOf(settings, &buf), "Error: "));
         }
     }.body);
@@ -6456,6 +6366,7 @@ test "settings an invalid field marks its rail section, the title and UIA" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
             const Marker = win32_uia.SettingsSectionMarker;
 
@@ -6465,17 +6376,17 @@ test "settings an invalid field marks its rail section, the title and UIA" {
             try std.testing.expectEqualStrings("noctty settings", try titleOf(hwnd));
 
             // An unsaved edit marks its own section and the title, not the others.
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.terminal).?.markerState());
             try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
             try std.testing.expectEqualStrings("noctty settings (unsaved changes)", try titleOf(hwnd));
 
             // A half-typed number marks Appearance as unsaved, and as invalid
             // once its error is shown. The field says so too.
-            typeInto(settings.edit_font_size.?, "1");
+            typeInto(settings.fields.edit_font_size.?, "1");
             try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
-            const field = settings.control_uia_providers[settings.controlIndex(settings.edit_font_size.?).?].?;
+            const field = settings.control_uia_providers[settings.controlIndex(settings.fields.edit_font_size.?).?].?;
             try std.testing.expect(!field.data_invalid.load(.acquire));
             settings.validationQuietElapsed();
             try std.testing.expectEqual(Marker.invalid, settings.sectionProvider(.appearance).?.markerState());
@@ -6484,10 +6395,10 @@ test "settings an invalid field marks its rail section, the title and UIA" {
 
             // Correcting it clears the error but leaves nothing unsaved only
             // when the value is back to what is saved.
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
             try std.testing.expect(!field.data_invalid.load(.acquire));
-            typeInto(settings.edit_font_size.?, "12");
+            typeInto(settings.fields.edit_font_size.?, "12");
             try std.testing.expectEqual(Marker.none, settings.sectionProvider(.appearance).?.markerState());
 
             // The mark follows the section's own state through a discard.
@@ -6508,7 +6419,7 @@ test "settings an invalid value in a field that is not a number marks its sectio
 
             // The theme is parsed when the field is left; half a light/dark
             // pair is not a theme.
-            typeInto(settings.edit_theme.?, "light:solo");
+            typeInto(settings.fields.edit_theme.?, "light:solo");
             try std.testing.expectEqual(Marker.unsaved, settings.sectionProvider(.appearance).?.markerState());
             settings.syncThemeFromEdit();
             try std.testing.expectEqual(Marker.invalid, settings.sectionProvider(.appearance).?.markerState());
@@ -6517,7 +6428,7 @@ test "settings an invalid value in a field that is not a number marks its sectio
                 "Error: Terminal theme must be a valid name, path, or light/dark pair.",
                 try statusTextOf(settings, &buf),
             );
-            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(settings.edit_theme.?).?].?.data_invalid.load(.acquire));
+            try std.testing.expect(settings.control_uia_providers[settings.controlIndex(settings.fields.edit_theme.?).?].?.data_invalid.load(.acquire));
         }
     }.body);
 }
@@ -6538,6 +6449,7 @@ test "settings status and close prompt are live regions" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const Role = win32_uia.SettingsControlProvider.Role;
 
             try std.testing.expectEqual(Role.live_text, settings.text_uia_providers[text_status_index].?.role);
@@ -6567,9 +6479,9 @@ test "settings status and close prompt are live regions" {
             const events = win32_uia.events;
             events.testing_live_regions = 0;
             // A half-typed number and the hint that follows an edit: silent.
-            typeInto(settings.edit_font_size.?, "1");
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            typeInto(settings.fields.edit_font_size.?, "1");
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqual(@as(usize, 0), events.testing_live_regions);
             // The error, once it is shown: spoken, once, and not again for the
             // same words.
@@ -6596,10 +6508,11 @@ test "settings a failed Save and close is spoken when the prompt goes away" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const events = win32_uia.events;
 
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.confirm_close);
             settings.showClosePrompt();
             // The status line is hidden behind the prompt: nothing to speak yet.
             events.testing_live_regions = 0;
@@ -6620,7 +6533,7 @@ test "settings a Discard that cannot copy the saved config leaves the draft and 
             const settings = &fixture.settings;
             var buf: [256]u8 = undefined;
             fixture.live_previews = true;
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
 
             const real = settings.handle.alloc;
@@ -6682,19 +6595,19 @@ test "settings offers accent-follow-system as a checkbox that previews the theme
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
-            const chk = settings.chk_accent_follow.?;
+            const chk = settings.fields.chk_accent_follow.?;
             var buf: [256]u8 = undefined;
 
             // It sits in Appearance, shows the config value, and is not the
             // disabled blur box.
-            try std.testing.expectEqual(Section.appearance, settings.controlSection(27).?);
+            try std.testing.expectEqual(Section.appearance, settings.controlSection(settings.controlIndex(chk).?).?);
             try std.testing.expect(sys.SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
             try std.testing.expect(sys.IsWindowEnabled(chk) != 0);
             try std.testing.expectEqual(PreviewEffect.theme, previewEffect(.accent_follow_system));
 
             fixture.live_previews = true;
             _ = sys.SendMessageW(chk, BM_SETCHECK, BST_UNCHECKED, 0);
-            settings.syncAccentFollowFromCheckbox();
+            settings.syncCheckbox(.accent_follow_system);
             try std.testing.expect(!settings.pending.?.@"accent-follow-system");
             try std.testing.expect(!fixture.config.@"accent-follow-system");
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
@@ -6725,7 +6638,7 @@ test "SET Discard asks before losing edits and supports keyboard cancellation" {
             defer fixture.finish();
             const settings = &fixture.settings;
             fixture.live_previews = true;
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             _ = sys.SetFocus(settings.btn_discard_changes.?);
             _ = sys.SendMessageW(settings.btn_discard_changes.?, BM_CLICK, 0, 0);
             try std.testing.expect(settings.hasPendingChanges());
@@ -6750,8 +6663,8 @@ test "SET UI Automation can request and accept Discard without closing Settings"
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
-            typeInto(settings.edit_font_size.?, "16");
-            const request = &settings.control_uia_providers[34].?.invoke_iface;
+            typeInto(settings.fields.edit_font_size.?, "16");
+            const request = &settings.control_uia_providers[settings.controlIndex(settings.btn_discard_changes.?).?].?.invoke_iface;
             try std.testing.expectEqual(@as(HRESULT, 0), request.vtbl.Invoke(request));
             dialog_test.pump();
             try std.testing.expect(settings.close_prompt_visible);
@@ -6760,7 +6673,7 @@ test "SET UI Automation can request and accept Discard without closing Settings"
             // The hidden Save and close action cannot turn Discard into a save.
             settings.saveAndClose();
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
-            const accept = &settings.control_uia_providers[32].?.invoke_iface;
+            const accept = &settings.control_uia_providers[settings.controlIndex(settings.btn_close_discard.?).?].?.invoke_iface;
             try std.testing.expectEqual(@as(HRESULT, 0), accept.vtbl.Invoke(accept));
             dialog_test.pump();
             try std.testing.expect(!settings.hasPendingChanges());
@@ -6777,7 +6690,7 @@ test "SET confirmed Discard adopts an external conflict and a reverted draft dis
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             settings.discardChanges();
             fixture.config.@"font-size" = 18;
             settings.externalConfigChanged(&fixture.config, 2);
@@ -6789,16 +6702,16 @@ test "SET confirmed Discard adopts an external conflict and a reverted draft dis
             try std.testing.expectEqual(@as(u32, 0), fixture.closed);
 
             // Reverting the only edit while the prompt is open needs no answer.
-            typeInto(settings.edit_font_size.?, "20");
+            typeInto(settings.fields.edit_font_size.?, "20");
             _ = sys.SetFocus(settings.btn_discard_changes.?);
             settings.discardChanges();
             try std.testing.expect(settings.discard_prompt);
             try std.testing.expectEqual(settings.btn_discard_changes.?, settings.close_prior_focus.?);
-            _ = sys.SetFocus(settings.edit_font_size.?);
-            typeInto(settings.edit_font_size.?, "18");
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
+            typeInto(settings.fields.edit_font_size.?, "18");
             try std.testing.expect(!settings.hasPendingChanges());
             try std.testing.expect(!settings.close_prompt_visible);
-            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+            try std.testing.expectEqual(settings.fields.edit_font_size.?, sys.GetFocus().?);
         }
     }.body);
 }
@@ -6809,16 +6722,16 @@ test "SET reverting the last edit dismisses Discard without moving field focus" 
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             _ = sys.SetFocus(settings.btn_discard_changes.?);
             settings.discardChanges();
             try std.testing.expect(settings.discard_prompt);
             try std.testing.expectEqual(settings.btn_discard_changes.?, settings.close_prior_focus.?);
-            _ = sys.SetFocus(settings.edit_font_size.?);
-            typeInto(settings.edit_font_size.?, "12");
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
+            typeInto(settings.fields.edit_font_size.?, "12");
             try std.testing.expect(!settings.hasPendingChanges());
             try std.testing.expect(!settings.close_prompt_visible);
-            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+            try std.testing.expectEqual(settings.fields.edit_font_size.?, sys.GetFocus().?);
         }
     }.body);
 }
@@ -6829,18 +6742,19 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
-            const cases = [_]struct { field: RawScalarField, edit: HWND, value: []const u8 }{
-                .{ .field = .font_size, .edit = settings.edit_font_size.?, .value = "16" },
-                .{ .field = .background_opacity, .edit = settings.edit_bg_opacity.?, .value = "0.5" },
-                .{ .field = .scrollback_limit, .edit = settings.edit_scrollback.?, .value = "12345" },
-                .{ .field = .window_padding_x, .edit = settings.edit_pad_x.?, .value = "9" },
-                .{ .field = .window_padding_y, .edit = settings.edit_pad_y.?, .value = "11" },
+            const cases = [_]struct { field: RawScalarField, value: []const u8 }{
+                .{ .field = .font_size, .value = "16" },
+                .{ .field = .background_opacity, .value = "0.5" },
+                .{ .field = .scrollback_limit, .value = "12345" },
+                .{ .field = .window_padding_x, .value = "9" },
+                .{ .field = .window_padding_y, .value = "11" },
             };
             for (cases) |case| {
                 settings.setActiveSection(settings.rawScalarDestination(case.field).section);
+                const edit = settings.rawScalarEdit(case.field).?;
                 var saved_buffer: [128]u8 = undefined;
-                const saved = readEditUtf8(case.edit, &saved_buffer).?;
-                typeInto(case.edit, "");
+                const saved = readEditUtf8(edit, &saved_buffer).?;
+                typeInto(edit, "");
                 settings.showRawScalarErrors(null);
                 try std.testing.expectEqual(case.field, settings.active_raw_validation.?);
                 settings.discardChanges();
@@ -6848,7 +6762,7 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
 
                 // Clearing raw validation must not briefly hide this question
                 // before the valid value reaches the typed transaction.
-                typeInto(case.edit, case.value);
+                typeInto(edit, case.value);
                 try std.testing.expect(settings.hasPendingChanges());
                 try std.testing.expect(!settings.hasRawScalarEdits());
                 try std.testing.expect(settings.validation_control == null);
@@ -6862,15 +6776,15 @@ test "SET correcting shown invalid scalars preserves Discard for unsaved values"
 
                 // A correction back to the saved value really is clean, and
                 // may dismiss the question without taking focus from typing.
-                typeInto(case.edit, "");
+                typeInto(edit, "");
                 settings.showRawScalarErrors(null);
                 settings.discardChanges();
                 try std.testing.expect(settings.discard_prompt);
-                _ = sys.SetFocus(case.edit);
-                typeInto(case.edit, saved);
+                _ = sys.SetFocus(edit);
+                typeInto(edit, saved);
                 try std.testing.expect(!settings.hasPendingChanges());
                 try std.testing.expect(!settings.close_prompt_visible);
-                try std.testing.expectEqual(case.edit, sys.GetFocus().?);
+                try std.testing.expectEqual(edit, sys.GetFocus().?);
             }
         }
     }.body);
@@ -6884,7 +6798,7 @@ test "SET close and quit switch the Discard prompt in place and preserve cancell
             const settings = &fixture.settings;
             const events = win32_uia.events;
             var buffer: [128]u8 = undefined;
-            typeInto(settings.edit_font_size.?, "16");
+            typeInto(settings.fields.edit_font_size.?, "16");
             _ = sys.SetFocus(settings.btn_discard_changes.?);
             settings.discardChanges();
             events.testing_live_regions = 0;
@@ -6950,12 +6864,12 @@ test "settings Discard changes throws the draft away and keeps the window" {
             // hands out, so Discard has to take it back before it reads it.
             fixture.live_previews = true;
             const original_cursor = settings.original.?.@"cursor-style";
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
-            typeInto(settings.edit_font_size.?, "16");
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
+            typeInto(settings.fields.edit_font_size.?, "16");
             try std.testing.expectEqual(@as(f32, 16), fixture.config.@"font-size");
             try std.testing.expect(fixture.config.@"cursor-style" != original_cursor);
-            typeInto(settings.edit_font_size.?, "1");
+            typeInto(settings.fields.edit_font_size.?, "1");
             try std.testing.expect(sys.IsWindowEnabled(discard) != 0);
 
             _ = sys.SetFocus(discard);
@@ -6975,10 +6889,10 @@ test "settings Discard changes throws the draft away and keeps the window" {
             try std.testing.expectEqual(original_cursor, settings.pending.?.@"cursor-style");
             try std.testing.expectEqual(
                 @as(LRESULT, @intCast(comboIndexFromCursorStyle(original_cursor))),
-                sys.SendMessageW(settings.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
+                sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
             );
             var edit_text: [16]u8 = undefined;
-            try std.testing.expectEqualStrings("12", readEditUtf8(settings.edit_font_size.?, &edit_text).?);
+            try std.testing.expectEqualStrings("12", readEditUtf8(settings.fields.edit_font_size.?, &edit_text).?);
             try std.testing.expect(sys.IsWindowEnabled(discard) == 0);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) == 0);
             try std.testing.expect(sys.GetFocus().? != discard);
@@ -6989,8 +6903,8 @@ test "settings Discard changes throws the draft away and keeps the window" {
             try std.testing.expectEqualStrings("noctty settings", try titleOf(fixture.hwnd()));
 
             // The next edit replaces the note, as any outcome is replaced.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
         }
     }.body);
@@ -7004,8 +6918,8 @@ test "settings Discard changes gives way to the conflict choices and to the clos
             const settings = &fixture.settings;
             const discard = settings.btn_discard_changes.?;
 
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowVisible(discard) != 0);
 
             // The close prompt hides it with Save and brings it back with Save.
@@ -7320,7 +7234,11 @@ fn settingsFormItemRects(items: []const FormItem, pane_width: i32, dpi: u32, out
     var start: usize = 0;
     while (start < items.len) {
         var end = start + 1;
-        while (end < items.len and items[end].checkbox == items[start].checkbox) : (end += 1) {}
+        // A later labeled checkbox starts a new run so its label has its own
+        // space above the control, rather than sharing the first row's label.
+        while (end < items.len and items[end].checkbox == items[start].checkbox and
+            !(items[end].checkbox and items[end].label_index != null)) : (end += 1)
+        {}
         if (items[start].checkbox) {
             const lane = settingsFieldRects(0, pane_width, dpi);
             const control_top = top + if (items[start].label_index != null) scaleForDpi(settings_field_label_offset, dpi) else 0;
@@ -7684,7 +7602,7 @@ test "settings action bar follows the form's column once it has two lanes" {
         try std.testing.expect(settingsActionColumnWidth(tight, tight, dpi) >= tight - 1);
         // The right lane's controls end where the column ends.
         var rects: [2]SettingsFieldRects = undefined;
-        settingsFormItemRects(&.{ .{ .control_index = 4, .label_index = 3 }, .{ .control_index = 5, .label_index = 4 } }, wide, dpi, &rects);
+        settingsFormItemRects(formItemsForSection(.appearance)[0..2], wide, dpi, &rects);
         try std.testing.expectEqual(column, rects[1].control.right);
     }
 }
@@ -8078,6 +7996,12 @@ const dialog_test = struct {
         _ = SendMessageW(hwnd, WM_DPICHANGED, (@as(usize, dpi) << 16) | dpi, @bitCast(@intFromPtr(&rect)));
     }
 
+    /// Make every section's rows, as if each had been shown once, for a test
+    /// that reaches into sections it does not show.
+    fn makeAllSections(settings: *SettingsWindow) void {
+        for (std.enums.values(Section)) |section| settings.materializeSection(section);
+    }
+
     /// Dispatch the messages that are queued for this thread: posted ones and
     /// a timer that has come due.
     fn pump() void {
@@ -8217,12 +8141,22 @@ const dialog_test = struct {
         /// Whether a live preview writes into `config`, as the App's does into
         /// `app.config`, which is what `currentConfig` hands back.
         live_previews: bool = false,
+        /// What the window's High Contrast probe answers.
+        high_contrast: bool = false,
 
         fn start() !*Fixture {
             return startWith(false);
         }
 
         fn startWith(custom_uia: bool) !*Fixture {
+            const self = try prepare(custom_uia);
+            errdefer self.finish();
+            try self.settings.open();
+            return self;
+        }
+
+        /// The fixture with its window not opened yet.
+        fn prepare(custom_uia: bool) !*Fixture {
             const self = try std.testing.allocator.create(Fixture);
             errdefer std.testing.allocator.destroy(self);
             self.* = .{
@@ -8245,10 +8179,10 @@ const dialog_test = struct {
                 .notifySuccess = &notifySuccess,
                 .customUiaProvidersEnabled = &customUia,
                 .previewField = &previewField,
+                .highContrast = &highContrast,
                 .onClosed = &onClosed,
             });
             self.settings.wheel_lines_override = 3;
-            try self.settings.open();
             return self;
         }
 
@@ -8292,6 +8226,11 @@ const dialog_test = struct {
         fn customUia(ctx: *anyopaque) bool {
             const self: *Fixture = @ptrCast(@alignCast(ctx));
             return self.custom_uia;
+        }
+
+        fn highContrast(ctx: *anyopaque) bool {
+            const self: *Fixture = @ptrCast(@alignCast(ctx));
+            return self.high_contrast;
         }
 
         fn notifySuccess(_: *anyopaque, _: []const u8, _: []const u8) void {}
@@ -8342,6 +8281,278 @@ const dialog_test = struct {
             try std.testing.expect(self.settings.content_scroll_max > 0);
         }
     };
+    /// What one `open` does to each window, counted from the messages user32
+    /// delivers on this thread (thread-local `WH_CBT` and `WH_CALLWNDPROC`
+    /// hooks): what each window was actually sent, not what the code meant to
+    /// send. `SetWindowTheme` shows as the `WM_THEMECHANGED` it sends.
+    const OpenWork = struct {
+        const WH_CALLWNDPROC: c_int = 4;
+        const WH_CBT: c_int = 5;
+        const HCBT_CREATEWND: c_int = 3;
+        const WM_SHOWWINDOW: UINT = 0x0018;
+        const WM_STYLECHANGING: UINT = 0x007C;
+        const WM_WINDOWPOSCHANGING: UINT = 0x0046;
+        const HookProc = *const fn (c_int, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+        const CWPSTRUCT = extern struct { lParam: LPARAM, wParam: WPARAM, message: UINT, hwnd: HWND };
+        extern "user32" fn SetWindowsHookExW(id: c_int, proc: HookProc, module: ?HINSTANCE, thread: u32) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn UnhookWindowsHookEx(hook: *anyopaque) callconv(.winapi) BOOL;
+        extern "user32" fn CallNextHookEx(hook: ?*anyopaque, code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
+
+        const Counts = struct {
+            hwnd: HWND,
+            created: u16 = 0,
+            fonts: u16 = 0,
+            themes: u16 = 0,
+            shown: u16 = 0,
+            hidden: u16 = 0,
+            z_moves: u16 = 0,
+            style_rewrites: u16 = 0,
+            frame_changes: u16 = 0,
+            messages: u32 = 0,
+        };
+
+        // The hooks run on the test's own thread, one at a time.
+        var seen: [256]Counts = undefined;
+        var seen_len: usize = 0;
+        var overflowed = false;
+
+        fn at(hwnd: HWND) ?*Counts {
+            for (seen[0..seen_len]) |*counts| if (counts.hwnd == hwnd) return counts;
+            if (seen_len == seen.len) {
+                overflowed = true;
+                return null;
+            }
+            seen[seen_len] = .{ .hwnd = hwnd };
+            seen_len += 1;
+            return &seen[seen_len - 1];
+        }
+
+        fn of(hwnd: HWND) Counts {
+            for (seen[0..seen_len]) |counts| if (counts.hwnd == hwnd) return counts;
+            return .{ .hwnd = hwnd };
+        }
+
+        fn cbt(code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (code == HCBT_CREATEWND) if (at(@ptrFromInt(wParam))) |counts| {
+                counts.created += 1;
+            };
+            return CallNextHookEx(null, code, wParam, lParam);
+        }
+
+        fn sent(code: c_int, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
+            if (code >= 0) {
+                const message: *const CWPSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (at(message.hwnd)) |counts| {
+                    counts.messages += 1;
+                    switch (message.message) {
+                        WM_SETFONT => counts.fonts += 1,
+                        WM_THEMECHANGED => counts.themes += 1,
+                        WM_SHOWWINDOW => if (message.wParam != 0) {
+                            counts.shown += 1;
+                        } else {
+                            counts.hidden += 1;
+                        },
+                        WM_STYLECHANGING => if (message.wParam == @as(WPARAM, @bitCast(@as(isize, GWL_STYLE)))) {
+                            counts.style_rewrites += 1;
+                        },
+                        WM_WINDOWPOSCHANGING => {
+                            const pos: *const sys.WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(message.lParam)));
+                            if (pos.flags & SWP_NOZORDER == 0) counts.z_moves += 1;
+                            if (pos.flags & SWP_FRAMECHANGED != 0) counts.frame_changes += 1;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return CallNextHookEx(null, code, wParam, lParam);
+        }
+
+        /// Open `settings` with the hooks installed.
+        fn measure(settings: *SettingsWindow) !void {
+            try measureStep(settings, .open);
+        }
+
+        const Step = union(enum) { open, show: Section };
+
+        /// Run `step` with the hooks installed, counting from zero.
+        fn measureStep(settings: *SettingsWindow, step: Step) !void {
+            seen_len = 0;
+            overflowed = false;
+            const thread = sys.GetCurrentThreadId();
+            const creation_hook = SetWindowsHookExW(WH_CBT, &cbt, null, thread) orelse return error.HookUnavailable;
+            defer _ = UnhookWindowsHookEx(creation_hook);
+            const message_hook = SetWindowsHookExW(WH_CALLWNDPROC, &sent, null, thread) orelse return error.HookUnavailable;
+            defer _ = UnhookWindowsHookEx(message_hook);
+            switch (step) {
+                .open => try settings.open(),
+                .show => |section| settings.setActiveSection(section),
+            }
+        }
+
+        /// The windows the last measured step created.
+        fn created() []const Counts {
+            const Storage = struct {
+                var windows: [256]Counts = undefined;
+            };
+            var len: usize = 0;
+            for (seen[0..seen_len]) |counts| if (counts.created != 0) {
+                Storage.windows[len] = counts;
+                len += 1;
+            };
+            return Storage.windows[0..len];
+        }
+
+        /// The window's tree: the window itself first, then its descendants.
+        const Tree = struct {
+            windows: [128]HWND = undefined,
+            len: usize = 0,
+
+            fn of(root: HWND) Tree {
+                var tree: Tree = .{};
+                tree.windows[0] = root;
+                tree.len = 1;
+                _ = sys.EnumChildWindows(root, collect, @bitCast(@intFromPtr(&tree)));
+                return tree;
+            }
+
+            fn collect(child: HWND, data: LPARAM) callconv(.winapi) BOOL {
+                const tree: *Tree = @ptrFromInt(@as(usize, @bitCast(data)));
+                if (tree.len == tree.windows.len) return 0;
+                tree.windows[tree.len] = child;
+                tree.len += 1;
+                return 1;
+            }
+
+            fn slice(self: *const Tree) []const HWND {
+                return self.windows[0..self.len];
+            }
+        };
+
+        fn print(tree: *const Tree) void {
+            for (tree.slice()) |hwnd| {
+                const counts = of(hwnd);
+                var class_w: [64]u16 = undefined;
+                const length = GetClassNameW(hwnd, &class_w, class_w.len);
+                std.debug.print("  {f} id={d} created={d} fonts={d} themes={d} shown={d} hidden={d} z={d} style={d} frame={d} messages={d}\n", .{
+                    std.unicode.fmtUtf16Le(class_w[0..@intCast(@max(0, length))]),
+                    sys.GetDlgCtrlID(hwnd),
+                    counts.created,
+                    counts.fonts,
+                    counts.themes,
+                    counts.shown,
+                    counts.hidden,
+                    counts.z_moves,
+                    counts.style_rewrites,
+                    counts.frame_changes,
+                    counts.messages,
+                });
+            }
+        }
+    };
+
+    /// What each window of an open Settings window shows and how the keyboard
+    /// reaches it: the state `open` decides at creation and a section switch
+    /// or a DPI change decides again (`setActiveSection`, `recreateUiFont`).
+    /// A font is recorded by its role, since a rebuild makes new handles.
+    /// Neither path writes `WS_GROUP` or `WS_DISABLED`, so for those bits
+    /// the comparison shows only that nothing changed them; "settings
+    /// arrow-key groups stop at the rail and the action bar" pins the groups.
+    const OpenState = struct {
+        const WS_DISABLED: u32 = 0x08000000;
+        const kept_styles = WS_VISIBLE | WS_TABSTOP | WS_GROUP | WS_DISABLED | WS_VSCROLL;
+        const Font = enum { none, ui, secondary, emphasis, header, other };
+
+        const Window = struct {
+            hwnd: HWND,
+            id: c_int,
+            style: u32,
+            /// Relative to the Settings window's rectangle.
+            rect: RECT,
+            /// The client area's size: a text field's frame insets show here.
+            client: [2]i32,
+            check: usize,
+            /// A dropdown's selection-field and list item heights.
+            items: [2]isize,
+            text: u64,
+            font: Font,
+        };
+
+        windows: [128]Window = undefined,
+        len: usize = 0,
+
+        fn styleOf(hwnd: HWND) u32 {
+            return @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, GWL_STYLE))));
+        }
+
+        fn of(settings: *const SettingsWindow) OpenState {
+            const tree = OpenWork.Tree.of(settings.hwnd.?);
+            var origin: RECT = undefined;
+            _ = GetWindowRect(settings.hwnd.?, &origin);
+            var state: OpenState = .{};
+            for (tree.slice()) |hwnd| {
+                var rect: RECT = undefined;
+                _ = GetWindowRect(hwnd, &rect);
+                var client: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                _ = GetClientRect(hwnd, &client);
+                var class_w: [16]u16 = undefined;
+                const class_len = GetClassNameW(hwnd, &class_w, class_w.len);
+                const class = class_w[0..@intCast(@max(0, class_len))];
+                const button = std.mem.eql(u16, class, std.unicode.utf8ToUtf16LeStringLiteral("Button"));
+                const combo = std.mem.eql(u16, class, std.unicode.utf8ToUtf16LeStringLiteral("ComboBox"));
+                var text_w: [2048]u16 = undefined;
+                const text_len = sys.GetWindowTextW(hwnd, &text_w, text_w.len);
+                const font: HGDIOBJ = @ptrFromInt(@as(usize, @bitCast(sys.SendMessageW(hwnd, WM_GETFONT, 0, 0))));
+                state.windows[state.len] = .{
+                    .hwnd = hwnd,
+                    .id = sys.GetDlgCtrlID(hwnd),
+                    .style = styleOf(hwnd) & kept_styles,
+                    .rect = .{ .left = rect.left - origin.left, .top = rect.top - origin.top, .right = rect.right - origin.left, .bottom = rect.bottom - origin.top },
+                    .client = .{ client.right, client.bottom },
+                    .check = if (button) @bitCast(sys.SendMessageW(hwnd, BM_GETCHECK, 0, 0)) else 0,
+                    .items = if (combo) .{
+                        sys.SendMessageW(hwnd, CB_GETITEMHEIGHT, std.math.maxInt(WPARAM), 0),
+                        sys.SendMessageW(hwnd, CB_GETITEMHEIGHT, 0, 0),
+                    } else .{ 0, 0 },
+                    .text = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(text_w[0..@intCast(@max(0, text_len))])),
+                    .font = if (font == null) .none else if (font == settings.ui_font) .ui else if (font == settings.secondary_font) .secondary else if (font == settings.emphasis_font) .emphasis else if (font == settings.header_font) .header else .other,
+                };
+                state.len += 1;
+            }
+            return state;
+        }
+
+        fn slice(self: *const OpenState) []const Window {
+            return self.windows[0..self.len];
+        }
+
+        /// The windows shown now, which the user sees and reaches: what a
+        /// section looks like does not depend on the hidden rows of others.
+        fn shown(self: *const OpenState) OpenState {
+            var result: OpenState = .{};
+            for (self.slice()) |window| if (window.style & WS_VISIBLE != 0) {
+                result.windows[result.len] = window;
+                result.len += 1;
+            };
+            return result;
+        }
+
+        /// Two windows' states, `a` and `b`, the same in everything but the
+        /// handle: two Settings windows built two ways.
+        fn expectSame(a: *const OpenState, b: *const OpenState) !void {
+            try std.testing.expectEqual(a.len, b.len);
+            for (a.slice(), b.slice()) |first, second| {
+                var other = second;
+                other.hwnd = first.hwnd;
+                errdefer print(first, second);
+                try std.testing.expectEqualDeep(first, other);
+            }
+        }
+
+        fn print(at_open: Window, after_switch: Window) void {
+            std.debug.print("  id={d} at open: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) client={d}x{d} items={d},{d} text={x}\n", .{ at_open.id, at_open.style, at_open.check, @tagName(at_open.font), at_open.rect.left, at_open.rect.top, at_open.rect.right, at_open.rect.bottom, at_open.client[0], at_open.client[1], at_open.items[0], at_open.items[1], at_open.text });
+            std.debug.print("  id={d} switched: style=0x{x} check={d} font={s} rect=({d},{d},{d},{d}) client={d}x{d} items={d},{d} text={x}\n", .{ after_switch.id, after_switch.style, after_switch.check, @tagName(after_switch.font), after_switch.rect.left, after_switch.rect.top, after_switch.rect.right, after_switch.rect.bottom, after_switch.client[0], after_switch.client[1], after_switch.items[0], after_switch.items[1], after_switch.text });
+        }
+    };
 };
 
 test "settings Escape without the close prompt closes a clean window and prompts a dirty one" {
@@ -8354,7 +8565,7 @@ test "settings Escape without the close prompt closes a clean window and prompts
 
             // A dirty window asks first; Escape is the same request as the X.
             settings.markRawScalarEdit(.font_size);
-            _ = sys.SetFocus(settings.edit_font_size.?);
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
             try std.testing.expect(fixture.pumpKey(0x1B));
             try std.testing.expect(settings.close_prompt_visible);
             try std.testing.expectEqual(@as(u32, 0), fixture.closed);
@@ -8364,7 +8575,7 @@ test "settings Escape without the close prompt closes a clean window and prompts
             try std.testing.expect(!settings.close_prompt_visible);
             try std.testing.expectEqual(@as(u32, 0), fixture.closed);
             // ... and focus goes back to the field it was taken from.
-            try std.testing.expectEqual(settings.edit_font_size.?, sys.GetFocus().?);
+            try std.testing.expectEqual(settings.fields.edit_font_size.?, sys.GetFocus().?);
 
             // A clean window closes.
             settings.raw_scalar_dirty[@intFromEnum(RawScalarField.font_size)] = false;
@@ -8416,8 +8627,8 @@ test "settings Enter presses the focused push button and does nothing in a field
             const settings = &fixture.settings;
 
             settings.setActiveSection(.advanced);
-            _ = sys.SetFocus(settings.btn_open_editor.?);
-            try std.testing.expectEqual(settings.btn_open_editor.?, sys.GetFocus().?);
+            _ = sys.SetFocus(settings.fields.btn_open_editor.?);
+            try std.testing.expectEqual(settings.fields.btn_open_editor.?, sys.GetFocus().?);
             try std.testing.expect(fixture.pumpKey(0x0D));
             try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
 
@@ -8428,10 +8639,10 @@ test "settings Enter presses the focused push button and does nothing in a field
             // With a change pending (Save enabled), Enter in a field neither
             // saves nor closes the window.
             settings.setActiveSection(.appearance);
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
-            _ = sys.SetFocus(settings.edit_font_size.?);
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
             _ = fixture.pumpKey(0x0D);
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
             try std.testing.expectEqual(@as(u32, 1), fixture.editor_opened);
@@ -8452,9 +8663,9 @@ test "settings Ctrl+S reaches Save through the accelerator hook" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
-            _ = sys.SetFocus(settings.edit_font_size.?);
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
 
             // The thread's key table starts as a copy of what the real keyboard
             // holds, so a test that sets only Ctrl in it inherits any Shift,
@@ -8495,16 +8706,16 @@ test "settings Ctrl+S gate follows the Save button and a held Escape does not fl
             // Clean: Save is disabled, so the shortcut's path saves nothing.
             settings.saveIfAllowed();
             try std.testing.expectEqual(@as(u32, 0), fixture.saved);
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             settings.saveIfAllowed();
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
 
             // Dirty again: Escape opens the prompt, its auto-repeats do not
             // toggle it, and nothing closes while a close is already posted.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 3, 0);
-            settings.syncCursorStyleFromCombo();
-            _ = sys.SetFocus(settings.edit_font_size.?);
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 3, 0);
+            settings.syncCombo(.cursor_style);
+            _ = sys.SetFocus(settings.fields.edit_font_size.?);
             try std.testing.expect(fixture.pumpKey(0x1B));
             try std.testing.expect(settings.close_prompt_visible);
             for (0..3) |_| try std.testing.expect(fixture.pumpKeyRepeat(0x1B, true));
@@ -8547,7 +8758,7 @@ test "settings wheel over a closed dropdown scrolls the form instead of changing
             const settings = &fixture.settings;
             try fixture.makeFormScrollable();
 
-            const combo = settings.combo_cursor_style.?;
+            const combo = settings.fields.combo_cursor_style.?;
             _ = sys.SendMessageW(combo, CB_SETCURSEL, 1, 0);
             _ = sys.SetFocus(combo);
             // Focusing the combo may scroll it into view; measure from there.
@@ -8568,7 +8779,7 @@ test "settings reactivation restores the focused field" {
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
 
-            const field = settings.edit_font_size.?;
+            const field = settings.fields.edit_font_size.?;
             _ = sys.SetFocus(field);
             try std.testing.expectEqual(field, sys.GetFocus().?);
 
@@ -8588,6 +8799,38 @@ test "settings reactivation restores the focused field" {
     }.body);
 }
 
+test "settings generated form labels immediately precede their controls" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            // Sections are made when first shown. Later ones first, so the
+            // rows of most sections are made after rows that follow them.
+            for ([_]Section{ .advanced, .shell, .privacy, .terminal, .keybindings, .updates }) |section| {
+                settings.setActiveSection(section);
+            }
+            // Tab and the arrow keys follow z-order: the help text, then each
+            // section's rows in order, a label right before its control, as if
+            // every section had been made at once.
+            const GW_HWNDNEXT: UINT = 2;
+            const GW_CHILD: UINT = 5;
+            var window = sys.GetWindow(settings.viewport.?, GW_CHILD);
+            try std.testing.expectEqual(settings.text_help.?, window.?);
+            for (std.enums.values(Section)) |section| for (formItemsForSection(section)) |item| {
+                errdefer std.debug.print("settings form order breaks in {s} at control {d}\n", .{ @tagName(section), item.control_index });
+                if (item.label_index) |index| {
+                    window = sys.GetWindow(window.?, GW_HWNDNEXT);
+                    try std.testing.expectEqual(settings.field_labels[index].?, window.?);
+                }
+                window = sys.GetWindow(window.?, GW_HWNDNEXT);
+                try std.testing.expectEqual(settings.controlHwnd(item.control_index).?, window.?);
+            };
+            try std.testing.expectEqual(@as(?HWND, null), sys.GetWindow(window.?, GW_HWNDNEXT));
+        }
+    }.body);
+}
+
 test "settings Tab visits the fields in form order and Save last" {
     try dialog_test.onHiddenDesktop(struct {
         fn body() !void {
@@ -8596,9 +8839,9 @@ test "settings Tab visits the fields in form order and Save last" {
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
 
-            // A pending change enables Save, which is created before every field.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            // A pending change makes Save eligible for dialog traversal.
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
 
             for (std.enums.values(Section)) |section| {
@@ -8654,13 +8897,153 @@ test "settings arrow-key groups stop at the rail and the action bar" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
+            const viewport = settings.viewport.?;
+            const VK_UP: u32 = 0x26;
+            const VK_DOWN: u32 = 0x28;
+            const DLGC_WANTARROWS: LRESULT = 0x0001;
+            const rail = struct {
+                fn has(window: *const SettingsWindow, control: HWND) bool {
+                    for (std.enums.values(Section)) |section| {
+                        if (window.sectionButton(section).? == control) return true;
+                    }
+                    return false;
+                }
+            }.has;
 
             // Down from the last rail button wraps to the first, rather than
-            // running on into the fields.
+            // running on into the fields, and no rail button's group reaches
+            // past the rail. (The dialog manager clicks the rail's radio
+            // buttons as it moves, so the rail is read rather than walked.)
             try std.testing.expectEqual(
                 settings.btn_section_appearance.?,
                 dialog_test.GetNextDlgGroupItem(hwnd, settings.btn_section_advanced.?, 0).?,
             );
+            for (std.enums.values(Section)) |section| for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                try std.testing.expect(rail(settings, dialog_test.GetNextDlgGroupItem(hwnd, settings.sectionButton(section).?, previous).?));
+            };
+
+            // A pending change shows and enables Discard changes and Save.
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
+            const actions = [_]HWND{ settings.btn_discard_changes.?, settings.btn_save.? };
+            for (actions) |button| try std.testing.expect(sys.IsWindowVisible(button) != 0 and sys.IsWindowEnabled(button) != 0);
+
+            // Down and Up as the App pump hands them to the dialog manager:
+            // from a form control that leaves the arrows to it (a check box,
+            // a push button) focus stays in the form, and from the action bar
+            // it never reaches the form or the rail. Both sides rest on the
+            // group the bar's first button starts at creation; the last
+            // control on Advanced is a push button that is a group of its own.
+            for (std.enums.values(Section)) |section| {
+                settings.setActiveSection(section);
+                errdefer std.debug.print("settings arrows on {s}\n", .{@tagName(section)});
+                // The pump moves focus at all: Down goes from Discard to Save.
+                _ = sys.SetFocus(actions[0]);
+                try std.testing.expect(fixture.pumpKey(VK_DOWN));
+                try std.testing.expectEqual(actions[1], sys.GetFocus().?);
+                for (settings.formItems()) |item| {
+                    const control = settings.controlHwnd(item.control_index).?;
+                    if (sys.IsWindowVisible(control) == 0 or sys.IsWindowEnabled(control) == 0) continue;
+                    if (SendMessageW(control, WM_GETDLGCODE, 0, 0) & DLGC_WANTARROWS != 0) continue;
+                    for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                        _ = sys.SetFocus(control);
+                        try std.testing.expect(fixture.pumpKey(key));
+                        try std.testing.expect(IsChild(viewport, sys.GetFocus().?) != 0);
+                    }
+                }
+                for (actions) |button| for ([_]u32{ VK_DOWN, VK_UP }) |key| {
+                    _ = sys.SetFocus(button);
+                    try std.testing.expect(fixture.pumpKey(key));
+                    const focus = sys.GetFocus().?;
+                    try std.testing.expect(IsChild(viewport, focus) == 0 and !rail(settings, focus));
+                };
+            }
+        }
+    }.body);
+}
+
+test "settings later labeled checkbox starts a layout run" {
+    const items = [_]FormItem{
+        .{ .control_index = 0, .checkbox = true },
+        .{ .control_index = 1, .checkbox = true, .label_index = 0 },
+        .{ .control_index = 2, .checkbox = true },
+    };
+    var rects: [items.len]SettingsFieldRects = undefined;
+    settingsFormItemRects(&items, 700, 96, &rects);
+    try std.testing.expect(rects[1].label.top >= rects[0].control.bottom);
+    try std.testing.expect(rects[1].control.top > rects[1].label.bottom);
+    try std.testing.expect(rects[2].control.top > rects[1].control.bottom);
+}
+
+test "settings forgetting form clears every generated HWND" {
+    var settings: SettingsWindow = undefined;
+    inline for (std.meta.fields(FieldWindows)) |field| @field(settings.fields, field.name) = @ptrFromInt(1);
+    settings.forgetFormWindows();
+    inline for (std.meta.fields(FieldWindows)) |field| try std.testing.expect(@field(settings.fields, field.name) == null);
+}
+
+test "settings labeled checkbox arrow group never visits its static label" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const settings = &fixture.settings;
+            settings.setActiveSection(.privacy);
+            for (settings.controlsForRole(.check_box)) |optional| {
+                const control = optional orelse continue;
+                if (sys.IsWindowVisible(control) == 0 or sys.IsWindowEnabled(control) == 0) continue;
+                for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                    const next = dialog_test.GetNextDlgGroupItem(fixture.hwnd(), control, previous).?;
+                    try std.testing.expect(settings.controlIndex(next) != null);
+                }
+            }
+        }
+    }.body);
+}
+
+test "settings display-only text row needs no persistence adapter" {
+    try dialog_test.onHiddenDesktop(struct {
+        fn body() !void {
+            const fixture = try dialog_test.Fixture.start();
+            defer fixture.finish();
+            const spec = comptime displayRowSpec(.{ .kind = .text, .section = .advanced, .native = .{
+                .binding = "example_read_only_row",
+                .id = 499,
+                .order = 1,
+                .accessible_name = "Read-only information",
+            } });
+            comptime std.debug.assert(!@hasField(@TypeOf(field_adapters), spec.binding));
+            // Insert the descriptor-only row in a real checkbox run, grouped
+            // by the same rule as generated rows on either side: created with
+            // the group its position gives it, and the row after it starting
+            // one because it follows text.
+            fixture.settings.setActiveSection(.privacy);
+            const before = fixture.settings.fields.chk_app_notify_clipboard.?;
+            const after = fixture.settings.fields.chk_app_notify_config.?;
+            const group = struct {
+                fn style(starts: bool) u32 {
+                    return if (starts) WS_GROUP else 0;
+                }
+            }.style;
+            try std.testing.expectEqual(@as(u32, 0), group(formGroupStarts(5, false, false)));
+            const control = makeDisplayControl(fixture.settings.viewport.?, fixture.settings.handle.hinstance, spec, WS_VISIBLE | group(formGroupStarts(6, false, true))).?;
+            defer _ = sys.DestroyWindow(control);
+            const keep_size = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            _ = SetWindowPos(control, before, 0, 0, 0, 0, keep_size);
+            _ = SetWindowPos(after, control, 0, 0, 0, 0, keep_size);
+            const after_style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(after, GWL_STYLE))));
+            _ = sys.SetWindowLongPtrW(after, GWL_STYLE, @intCast(after_style | group(formGroupStarts(7, true, false))));
+            for ([_]HWND{ before, after }) |checkbox| {
+                for ([_]windows.BOOL{ 0, 1 }) |previous| {
+                    try std.testing.expect(dialog_test.GetNextDlgGroupItem(fixture.hwnd(), checkbox, previous).? != control);
+                }
+            }
+            var text: [64]u8 = undefined;
+            try std.testing.expectEqualStrings(spec.name, readEditUtf8(control, &text).?);
+            try std.testing.expectEqual(@as(LONG_PTR, 499), sys.GetWindowLongPtrW(control, -12));
+            try std.testing.expect(sys.GetWindowLongPtrW(control, GWL_STYLE) & WS_TABSTOP == 0);
+            try std.testing.expect(sys.IsWindowEnabled(fixture.settings.btn_save.?) == 0);
+            try std.testing.expectEqual(@as(usize, 25), editable_keys.len);
         }
     }.body);
 }
@@ -8674,7 +9057,7 @@ test "settings focus forwarded to a saved field does not scroll the form" {
             const hwnd = fixture.hwnd();
             try fixture.makeFormScrollable();
 
-            const field = settings.edit_pad_y.?;
+            const field = settings.fields.edit_pad_y.?;
             _ = sys.SetFocus(field);
             _ = sys.SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE, 0);
             // The click that reactivates the window was aimed at the form as
@@ -8695,7 +9078,7 @@ test "settings dropdown wheel forwarding survives the UIA control subclass" {
             const settings = &fixture.settings;
             try fixture.makeFormScrollable();
 
-            const combo = settings.combo_cursor_style.?;
+            const combo = settings.fields.combo_cursor_style.?;
             // The UIA subclass sits on top of the combo subclass.
             try std.testing.expect(settings.controlIndex(combo) != null);
             try std.testing.expect(settings.control_uia_providers[settings.controlIndex(combo).?] != null);
@@ -8710,14 +9093,14 @@ test "settings dropdown wheel forwarding survives the UIA control subclass" {
 
 test "settings correcting one invalid field does not move to another section" {
     var settings: SettingsWindow = .{ .handle = undefined };
-    settings.edit_scrollback = @ptrFromInt(0x201);
-    settings.edit_font_size = @ptrFromInt(0x202);
+    settings.fields.edit_scrollback = @ptrFromInt(0x201);
+    settings.fields.edit_font_size = @ptrFromInt(0x202);
 
     settings.markRawScalarEdit(.scrollback_limit);
-    settings.setRawScalarValidationError(.scrollback_limit, settings.edit_scrollback.?, "Scrollback limit is required.");
+    settings.setRawScalarValidationError(.scrollback_limit, settings.fields.edit_scrollback.?, "Scrollback limit is required.");
     settings.active_section = .appearance;
     settings.markRawScalarEdit(.font_size);
-    settings.setRawScalarValidationError(.font_size, settings.edit_font_size.?, "Font size is required.");
+    settings.setRawScalarValidationError(.font_size, settings.fields.edit_font_size.?, "Font size is required.");
     settings.showRawScalarErrors(null);
 
     // Typing a valid size leaves the user in Appearance; the other error stays
@@ -8725,7 +9108,7 @@ test "settings correcting one invalid field does not move to another section" {
     settings.finishRawScalarEdit(.font_size);
     try std.testing.expectEqual(Section.appearance, settings.active_section);
     try std.testing.expectEqual(RawScalarField.scrollback_limit, settings.active_raw_validation.?);
-    try std.testing.expectEqual(settings.edit_scrollback.?, settings.validation_control.?);
+    try std.testing.expectEqual(settings.fields.edit_scrollback.?, settings.validation_control.?);
 }
 
 test "settings window carries the application icon" {
@@ -8756,9 +9139,10 @@ test "settings fields, labels and help live in a viewport that clips them" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
 
-            const viewport = sys.GetParent(settings.edit_font_size.?).?;
+            const viewport = sys.GetParent(settings.fields.edit_font_size.?).?;
             try std.testing.expect(viewport != hwnd);
             try std.testing.expectEqual(hwnd, sys.GetParent(viewport).?);
             try std.testing.expect(windowStyle(viewport) & WS_CLIPCHILDREN != 0);
@@ -8859,11 +9243,12 @@ test "settings dropdowns are as tall as text fields and the text sits in the mid
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             const hwnd = fixture.hwnd();
 
             for ([_]u32{ 144, 96, 192, 288 }) |dpi| {
                 dialog_test.simulateDpi(hwnd, dpi);
-                const field = settings.edit_font_size.?;
+                const field = settings.fields.edit_font_size.?;
                 const edit = dialog_test.rectIn(hwnd, field);
                 for (settings.comboControls()) |combo| {
                     const rect = dialog_test.rectIn(hwnd, combo.?);
@@ -8991,7 +9376,7 @@ test "settings field frames take the new colours when the theme changes" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
-            const field = dialog_test.rectIn(hwnd, settings.edit_font_family.?);
+            const field = dialog_test.rectIn(hwnd, settings.fields.edit_font_family.?);
             const middle = @divTrunc(field.top + field.bottom, 2);
 
             dialog_test.flushPaint(hwnd);
@@ -9065,8 +9450,8 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
                 defer clean.deinit();
 
                 // Unsaved: the dot, in the accent (a text colour in High Contrast).
-                _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-                settings.syncCursorStyleFromCombo();
+                _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+                settings.syncCombo(.cursor_style);
                 dialog_test.flushPaint(hwnd);
                 const unsaved = try dialog_test.Capture.take(hwnd);
                 defer unsaved.deinit();
@@ -9078,7 +9463,7 @@ test "settings rail marks draw for unsaved and invalid sections at 100% and 150%
                 try std.testing.expect(colorAt(clean, dot_x, dot_y) != dot_fill);
 
                 // Invalid: the larger disc with its mark, in the error colour.
-                typeInto(settings.edit_font_size.?, "1");
+                typeInto(settings.fields.edit_font_size.?, "1");
                 settings.validationQuietElapsed();
                 dialog_test.flushPaint(hwnd);
                 const invalid = try dialog_test.Capture.take(hwnd);
@@ -9119,7 +9504,7 @@ test "settings an empty focused text field shows that it has focus" {
             defer fixture.finish();
             const settings = &fixture.settings;
             const hwnd = fixture.hwnd();
-            const field = settings.edit_font_family.?;
+            const field = settings.fields.edit_font_family.?;
             var text: [8]u16 = undefined;
             try std.testing.expectEqual(@as(c_int, 0), GetWindowTextW(field, &text, @intCast(text.len)));
 
@@ -9170,6 +9555,12 @@ test "settings viewport stays out of the UIA control view" {
             const provider = settings.viewport_uia_provider.?;
             try std.testing.expectEqual(settings.viewport.?, provider.hwnd);
             try std.testing.expectEqual(win32_uia.SettingsControlProvider.Role.layout_pane, provider.role);
+            // Each control that exists has its provider: the action bar and
+            // the shown section's at open, the rest once their section is.
+            for (0..settings_control_count) |index| {
+                try std.testing.expectEqual(settings.controlHwnd(index) != null, settings.control_uia_providers[index] != null);
+            }
+            dialog_test.makeAllSections(settings);
             for (0..settings_control_count) |index| try std.testing.expect(settings.control_uia_providers[index] != null);
         }
     }.body);
@@ -9417,6 +9808,7 @@ test "settings labels fit on one line in the narrowest two-column lane" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             for ([_]u32{ 96, 144, 192 }) |dpi| {
                 dialog_test.simulateDpi(fixture.hwnd(), dpi);
                 const lane = @divTrunc(scaleForDpi(settings_two_column_min_width, dpi) - scaleForDpi(settings_column_gap, dpi), 2);
@@ -9543,21 +9935,22 @@ test "settings dropdowns list the text of their labels in order" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
 
             const Case = struct { combo: ?HWND, labels: []const []const u8 };
             const cases = [_]Case{
-                .{ .combo = settings.combo_confirm_close, .labels = &confirm_close_labels },
-                .{ .combo = settings.combo_copy_on_select, .labels = &copy_on_select_labels },
-                .{ .combo = settings.combo_clipboard_read, .labels = &clipboard_access_labels },
-                .{ .combo = settings.combo_clipboard_write, .labels = &clipboard_access_labels },
-                .{ .combo = settings.combo_link_url, .labels = &link_url_labels },
-                .{ .combo = settings.combo_link_previews, .labels = &link_previews_labels },
-                .{ .combo = settings.combo_window_theme, .labels = &window_theme_labels },
-                .{ .combo = settings.combo_shell_integ, .labels = &shell_integration_labels },
-                .{ .combo = settings.combo_cursor_style, .labels = &cursor_style_labels },
-                .{ .combo = settings.combo_pad_balance, .labels = &padding_balance_labels },
-                .{ .combo = settings.combo_auto_update, .labels = &auto_update_labels },
-                .{ .combo = settings.combo_auto_update_channel, .labels = &auto_update_channel_labels },
+                .{ .combo = settings.fields.combo_confirm_close, .labels = &confirm_close_labels },
+                .{ .combo = settings.fields.combo_copy_on_select, .labels = &copy_on_select_labels },
+                .{ .combo = settings.fields.combo_clipboard_read, .labels = &clipboard_access_labels },
+                .{ .combo = settings.fields.combo_clipboard_write, .labels = &clipboard_access_labels },
+                .{ .combo = settings.fields.combo_link_url, .labels = &link_url_labels },
+                .{ .combo = settings.fields.combo_link_previews, .labels = &link_previews_labels },
+                .{ .combo = settings.fields.combo_window_theme, .labels = &window_theme_labels },
+                .{ .combo = settings.fields.combo_shell_integ, .labels = &shell_integration_labels },
+                .{ .combo = settings.fields.combo_cursor_style, .labels = &cursor_style_labels },
+                .{ .combo = settings.fields.combo_pad_balance, .labels = &padding_balance_labels },
+                .{ .combo = settings.fields.combo_auto_update, .labels = &auto_update_labels },
+                .{ .combo = settings.fields.combo_auto_update_channel, .labels = &auto_update_channel_labels },
             };
             const CB_GETCOUNT: UINT = 0x0146;
             const CB_GETLBTEXT: UINT = 0x0148;
@@ -9576,7 +9969,7 @@ test "settings dropdowns list the text of their labels in order" {
             // The shipped selection still follows the config value.
             try std.testing.expectEqual(
                 @as(LRESULT, @intCast(comboIndexFromCursorStyle(settings.pending.?.@"cursor-style"))),
-                sys.SendMessageW(settings.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
+                sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_GETCURSEL, 0, 0),
             );
         }
     }.body);
@@ -9588,7 +9981,7 @@ test "settings background blur is shown but cannot be changed" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
-            const blur = settings.chk_bg_blur.?;
+            const blur = settings.fields.chk_bg_blur.?;
 
             try std.testing.expect(sys.IsWindowEnabled(blur) == 0);
             var wide: [128]u16 = undefined;
@@ -9609,6 +10002,7 @@ test "settings descriptor support matches every native editor enabled state" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             inline for (field_model.descriptors) |spec| {
                 const expected_enabled = spec.support == .available;
                 if (spec.field) |field| {
@@ -9618,7 +10012,7 @@ test "settings descriptor support matches every native editor enabled state" {
                     try std.testing.expectEqual(expected_enabled, sys.IsWindowEnabled(settings.settingDestination(part.field).hwnd.?) != 0);
                 }
             }
-            for ([_]?HWND{ settings.edit_font_family, settings.edit_theme, settings.edit_command }) |control| {
+            for ([_]?HWND{ settings.fields.edit_font_family, settings.fields.edit_theme, settings.fields.edit_command }) |control| {
                 try std.testing.expect(sys.IsWindowEnabled(control.?) != 0);
             }
         }
@@ -9637,9 +10031,10 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
             var combos: usize = 0;
             for (settings_control_specs, 0..) |spec, index| {
                 if (spec.role != .check_box and spec.role != .combo_box) continue;
+                // A section's controls and their providers exist once it is shown.
+                settings.setActiveSection(settings.controlSection(index).?);
                 const provider = settings.control_uia_providers[index].?;
                 const control = settings.controlHwnd(index).?;
-                settings.setActiveSection(settings.controlSection(index).?);
                 settings.ensureControlVisible(control);
                 const events = @import("win32_uia/events.zig");
                 const changes_before = events.testing_property_changes;
@@ -9657,7 +10052,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                         continue;
                     }
                     try std.testing.expectEqual(com.S_OK, toggle.vtbl.Toggle(toggle));
-                    if (control == settings.chk_trim_trail.?) try std.testing.expectEqual(!before, settings.pending.?.@"clipboard-trim-trailing-spaces");
+                    if (control == settings.fields.chk_trim_trail.?) try std.testing.expectEqual(!before, settings.pending.?.@"clipboard-trim-trailing-spaces");
                 } else {
                     combos += 1;
                     const expand = &provider.expand_iface;
@@ -9671,7 +10066,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
                     var expanded: i32 = 0;
                     try std.testing.expectEqual(com.S_OK, expand.vtbl.get_ExpandCollapseState(expand, &expanded));
                     try std.testing.expectEqual(@as(i32, 1), expanded);
-                    if (control == settings.combo_window_theme.?) {
+                    if (control == settings.fields.combo_window_theme.?) {
                         var popup: SettingsComboPopup.Info = .{};
                         try std.testing.expect(SettingsComboPopup.GetComboBoxInfo(control, &popup) != 0);
                         const before_hover = sys.SendMessageW(control, CB_GETCURSEL, 0, 0);
@@ -9736,7 +10131,7 @@ test "settings UIA checkbox and combo actions update the draft and discard resto
             }
             try std.testing.expectEqual(@as(usize, 6), checks);
             try std.testing.expectEqual(@as(usize, 12), combos);
-            const retired = settings.control_uia_providers[3].?;
+            const retired = settings.control_uia_providers[settings.controlIndex(settings.fields.chk_trim_trail.?).?].?;
             retired.detach();
             try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, retired.toggle_iface.vtbl.Toggle(&retired.toggle_iface));
         }
@@ -9751,8 +10146,9 @@ test "CHROME unsupported settings are disabled and UIA names explain why" {
             const fixture = try dialog_test.Fixture.startWith(true);
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
 
-            for ([_]HWND{ settings.chk_bg_blur.?, settings.combo_link_previews.? }) |control| {
+            for ([_]HWND{ settings.fields.chk_bg_blur.?, settings.fields.combo_link_previews.? }) |control| {
                 try std.testing.expect(sys.IsWindowEnabled(control) == 0);
                 const provider = settings.control_uia_providers[settings.controlIndex(control).?].?;
                 var name = com.VARIANT.empty();
@@ -9775,10 +10171,12 @@ test "CHROME unsupported link previews retain their config value and palette foc
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            // Privacy has not been shown yet: its dropdown shows the draft's
+            // value when it is made.
+            try std.testing.expect(settings.fields.combo_link_previews == null);
             settings.pending.?.@"link-previews" = .osc8;
-            settings.displayLinkPreviewsInCombo();
-            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.combo_link_previews.?, CB_GETCURSEL, 0, 0));
             try settings.openField(.link_previews);
+            try std.testing.expectEqual(@as(LRESULT, 1), sys.SendMessageW(settings.fields.combo_link_previews.?, CB_GETCURSEL, 0, 0));
             try std.testing.expectEqual(Section.privacy, settings.active_section);
             try std.testing.expectEqual(settings.sectionButton(.privacy).?, sys.GetFocus().?);
             try std.testing.expectEqual(@as(@FieldType(Config, "link-previews"), .osc8), settings.pending.?.@"link-previews");
@@ -9799,6 +10197,7 @@ test "settings status line says whether an edit previews or waits for a save" {
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             var buf: [256]u8 = undefined;
 
             // Nothing edited: the disabled Save says why in words.
@@ -9806,38 +10205,38 @@ test "settings status line says whether an edit previews or waits for a save" {
             try std.testing.expectEqualStrings(nothing_to_save_text, try statusTextOf(settings, &buf));
 
             // An edit that shows in the open terminals now.
-            _ = sys.SendMessageW(settings.combo_window_theme.?, CB_SETCURSEL, 3, 0);
-            settings.syncWindowThemeFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_window_theme.?, CB_SETCURSEL, 3, 0);
+            settings.syncCombo(.window_theme);
             try std.testing.expectEqualStrings("Previewing now. Save to keep it.", try statusTextOf(settings, &buf));
 
             // Cursor style is previewed into the config, but no open terminal
             // reads it until the save, so it must not claim a preview.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
 
             // A setting that is only read at save says so too.
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
 
             // Putting everything back leaves nothing to save.
-            _ = sys.SendMessageW(settings.combo_window_theme.?, CB_SETCURSEL, 0, 0);
-            settings.syncWindowThemeFromCombo();
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, @as(usize, comboIndexFromCursorStyle(settings.original.?.@"cursor-style")), 0);
-            settings.syncCursorStyleFromCombo();
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, @as(usize, comboIndexFromConfirmClose(settings.original.?.@"confirm-close-surface")), 0);
-            settings.syncConfirmCloseFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_window_theme.?, CB_SETCURSEL, 0, 0);
+            settings.syncCombo(.window_theme);
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, @as(usize, comboIndexFromCursorStyle(settings.original.?.@"cursor-style")), 0);
+            settings.syncCombo(.cursor_style);
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, @as(usize, comboIndexFromConfirmClose(settings.original.?.@"confirm-close-surface")), 0);
+            settings.syncCombo(.confirm_close);
             try std.testing.expectEqualStrings(nothing_to_save_text, try statusTextOf(settings, &buf));
 
             // A saved edit is reported, and the next edit replaces that.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             settings.save();
             try std.testing.expectEqual(@as(u32, 1), fixture.saved);
             try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
         }
     }.body);
@@ -9859,10 +10258,11 @@ test "settings outcome messages show over a conflict and do not outlive their ed
             const fixture = try dialog_test.Fixture.start();
             defer fixture.finish();
             const settings = &fixture.settings;
+            dialog_test.makeAllSections(settings);
             var buf: [256]u8 = undefined;
 
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -9881,8 +10281,8 @@ test "settings outcome messages show over a conflict and do not outlive their ed
             // A failure is about edits that are still there to save.
             settings.status_note = .save_failed;
             try std.testing.expectEqualStrings(nothing_to_save_text, settings.idleStatusText());
-            _ = sys.SendMessageW(settings.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
-            settings.syncConfirmCloseFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_confirm_close.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.confirm_close);
             // The edit replaced the note.
             try std.testing.expectEqualStrings("Applies when you save.", settings.idleStatusText());
         }
@@ -9897,16 +10297,16 @@ test "settings typing in a text field replaces the saved message" {
             const settings = &fixture.settings;
             var buf: [256]u8 = undefined;
 
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             settings.save();
             try std.testing.expectEqualStrings("Settings saved.", try statusTextOf(settings, &buf));
 
             // Font family, theme and default command only commit when they lose
             // focus; Save is already enabled by the first keystroke, and the
             // line must not keep saying the last save went through.
-            _ = sys.SetWindowTextW(settings.edit_font_family.?, std.unicode.utf8ToUtf16LeStringLiteral("Cascadia Mono"));
-            settings.markOwnedTextChanged(.font_family, settings.edit_font_family.?);
+            _ = sys.SetWindowTextW(settings.fields.edit_font_family.?, std.unicode.utf8ToUtf16LeStringLiteral("Cascadia Mono"));
+            settings.markOwnedTextChanged(.font_family, settings.fields.edit_font_family.?);
             try std.testing.expect(sys.IsWindowEnabled(settings.btn_save.?) != 0);
             try std.testing.expectEqualStrings("Applies when you save.", try statusTextOf(settings, &buf));
         }
@@ -9964,8 +10364,8 @@ test "settings conflict message uses the field's name and fits its own row" {
             var buf: [256]u8 = undefined;
 
             // The same field edited here and, differently, on disk.
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -10020,8 +10420,8 @@ test "settings stacked action bar keeps a wide status row above the buttons" {
             defer fixture.finish();
             const settings = &fixture.settings;
 
-            _ = sys.SendMessageW(settings.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
-            settings.syncCursorStyleFromCombo();
+            _ = sys.SendMessageW(settings.fields.combo_cursor_style.?, CB_SETCURSEL, 2, 0);
+            settings.syncCombo(.cursor_style);
             var disk = try Config.default(std.testing.allocator);
             defer disk.deinit();
             disk.@"cursor-style" = .bar;
@@ -10103,9 +10503,16 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
             const previous = settings.control_uia_prev_procs[index];
             if (msg == win32_uia.SettingsControlProvider.action_message) {
                 if (settings.control_uia_providers[index]) |provider| {
+                    const trace_action = settings.combo_trace.enabled() and
+                        (wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.expand) or
+                            wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.collapse));
+                    if (trace_action)
+                        settings.combo_trace.noteEvent(.action_received, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
                     if (wParam == @intFromEnum(win32_uia.SettingsControlProvider.Action.expand) and sys.IsWindowEnabled(hwnd) != 0)
                         settings.ensureControlVisible(hwnd);
                     const hr = provider.handleAction(wParam, lParam);
+                    if (trace_action)
+                        settings.combo_trace.noteEvent(.action_returned, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
                     return if (hr == @import("win32_uia/com.zig").S_OK) win32_uia.SettingsControlProvider.action_success else hr;
                 }
                 return @import("win32_uia/com.zig").UIA_E_ELEMENTNOTAVAILABLE;
@@ -10123,7 +10530,20 @@ fn settingsControlProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) ca
                 }
             }
             if (previous) |proc| {
+                if (settings.combo_trace.enabled() and settings_control_specs[index].role == .combo_box) {
+                    const event: ?bench_trace.SettingsComboTrace.Event = switch (msg) {
+                        WM_KILLFOCUS => .focus_lost,
+                        0x0215 => .capture_changed, // WM_CAPTURECHANGED
+                        else => null,
+                    };
+                    if (event) |tag|
+                        settings.combo_trace.noteEvent(tag, sys.GetDlgCtrlID(hwnd), sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+                }
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, null);
                 const result = sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
+                if (msg == 0x014F and settings.combo_trace.enabled())
+                    settings.combo_trace.note(sys.GetDlgCtrlID(hwnd), wParam != 0, sys.SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0, result);
                 if (msg == WM_SETFOCUS) {
                     if (settings.control_uia_providers[index]) |provider| provider.raiseFocusChanged();
                 }
@@ -10205,16 +10625,18 @@ fn settingsComboProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) call
     return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
 }
 
-fn subclassCombo(combo: HWND) void {
+/// Install `proc` on a stock control and keep the procedure it replaces in
+/// the control's `GWLP_USERDATA`, which the stock classes leave unused.
+fn subclassKeepingPrevious(control: HWND, proc: win32_types.WNDPROC) void {
     // Already ours (the prior procedure is recorded): nothing to do.
-    if (sys.GetWindowLongPtrW(combo, GWLP_USERDATA) != 0) return;
+    if (sys.GetWindowLongPtrW(control, GWLP_USERDATA) != 0) return;
     const previous = sys.SetWindowLongPtrW(
-        combo,
+        control,
         GWLP_WNDPROC,
-        @as(LONG_PTR, @intCast(@intFromPtr(&settingsComboProc))),
+        @as(LONG_PTR, @intCast(@intFromPtr(proc))),
     );
     if (previous == 0) return;
-    _ = sys.SetWindowLongPtrW(combo, GWLP_USERDATA, previous);
+    _ = sys.SetWindowLongPtrW(control, GWLP_USERDATA, previous);
 }
 
 /// Subclass for the text fields, which draw their own frame (`fieldFrameInsets`,
@@ -10267,17 +10689,6 @@ fn settingsEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callc
         else => {},
     }
     return sys.CallWindowProcW(proc, hwnd, msg, wParam, lParam);
-}
-
-fn subclassEdit(edit: HWND) void {
-    if (sys.GetWindowLongPtrW(edit, GWLP_USERDATA) != 0) return;
-    const previous = sys.SetWindowLongPtrW(
-        edit,
-        GWLP_WNDPROC,
-        @as(LONG_PTR, @intCast(@intFromPtr(&settingsEditProc))),
-    );
-    if (previous == 0) return;
-    _ = sys.SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
 }
 
 const FieldFrameInsets = struct { x: i32, y: i32 };
@@ -10334,9 +10745,9 @@ fn wheelScrollPixels(remainder: *i32, delta: i32, notch_px: i32) i32 {
     return @intCast(std.math.clamp(pixels, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
-fn startGroup(control: HWND) void {
-    const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
-    if (style & WS_GROUP == 0) _ = sys.SetWindowLongPtrW(control, GWL_STYLE, @intCast(style | WS_GROUP));
+/// Keep labels adjacent while excluding STATIC rows from neighboring arrow groups.
+fn formGroupStarts(index: usize, previous_text: bool, text: bool) bool {
+    return index == 0 or previous_text or text;
 }
 
 /// Show or hide a child window, leaving one already in that state alone. The
@@ -10346,12 +10757,6 @@ fn setChildShown(control: HWND, shown: bool) void {
     const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(control, GWL_STYLE))));
     if ((style & WS_VISIBLE != 0) == shown) return;
     _ = ShowWindow(control, if (shown) SW_SHOWNORMAL else SW_HIDE);
-}
-
-fn sendToBottom(control: HWND) void {
-    const hwnd_bottom: ?*anyopaque = @ptrFromInt(1);
-    const flags: UINT = 0x0002 | 0x0001 | SWP_NOACTIVATE | SWP_NOREDRAW; // SWP_NOMOVE | SWP_NOSIZE
-    _ = sys.SetWindowPos(control, hwnd_bottom, 0, 0, 0, 0, flags);
 }
 
 test "settings wheel carries sub-pixel movement between messages" {
@@ -10735,7 +11140,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                             if (controlIndexIsCheckbox(index)) colors.secondary_text else colors.button_text
                         else
                             colors.button_text
-                    else if (control == o.text_summary or (o.textIndex(control) orelse 0) >= 5)
+                    else if (control == o.text_summary or (o.textIndex(control) orelse 0) >= text_first_label_index)
                         colors.secondary_text
                     else
                         colors.text
@@ -10839,6 +11244,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         WM_COMMAND => {
             const id: usize = wParam & 0xFFFF;
             const notify: u16 = @intCast((wParam >> 16) & 0xFFFF);
+            if (notify == 8 and lParam != 0) { // CBN_CLOSEUP
+                if (owner) |o| if (o.combo_trace.enabled()) {
+                    const control: HWND = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                    if (o.controlIndex(control)) |index| {
+                        if (settings_control_specs[index].role == .combo_box)
+                            o.combo_trace.noteEvent(.closeup, sys.GetDlgCtrlID(control), sys.SendMessageW(control, CB_GETDROPPEDSTATE, 0, 0) != 0);
+                    }
+                };
+            }
             // Popup mouse input is delivered to its list HWND. Native combo
             // notifications are the reliable point to announce the resulting
             // expansion / selection state, after draft handlers have run.
@@ -10862,11 +11276,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             if (lParam != 0 and (notify == EN_SETFOCUS or notify == CBN_SETFOCUS or notify == BN_SETFOCUS)) {
                 if (owner) |o| if (!o.restoring_focus) o.ensureControlVisible(@ptrFromInt(@as(usize, @bitCast(lParam))));
             }
-            if (clickedButton(id, notify, BTN_OPEN_EDITOR)) {
-                if (owner) |o| o.handle.openInEditor(o.handle.ctx);
-                return 0;
-            }
-            if (clickedButton(id, notify, BTN_KEYBINDINGS_EDITOR)) {
+            if (clickedButton(id, notify, BTN_OPEN_EDITOR) or clickedButton(id, notify, BTN_KEYBINDINGS_EDITOR)) {
                 if (owner) |o| o.handle.openInEditor(o.handle.ctx);
                 return 0;
             }
@@ -10906,132 +11316,28 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                 }
                 return 0;
             }
-            if (id == EDIT_SCROLLBACK and notify == EN_CHANGE) {
-                if (owner) |o| o.syncScrollbackFromEdit();
-                return 0;
-            }
-            // A field the user leaves says what is wrong with it without
-            // waiting out the quiet period.
+            // A scalar departure is posted because EN_KILLFOCUS does not say
+            // where focus went. Owned fields keep their existing deferred parse.
             if (notify == EN_KILLFOCUS) if (rawScalarForEditId(id)) |field| {
-                // Posted: the notification does not say where focus went.
                 if (owner != null) _ = sys.PostMessageW(hwnd, WM_SETTINGS_FIELD_LEFT, @intFromEnum(field), 0);
                 return 0;
             };
-            // These parse into pending._arena; record raw dirtiness immediately
-            // so closing a focused edit cannot silently discard text, then
-            // defer allocation to EN_KILLFOCUS/Save.
-            if (id == EDIT_FONT_FAMILY and notify == EN_CHANGE) {
-                if (owner) |o| if (o.edit_font_family) |edit| o.markOwnedTextChanged(.font_family, edit);
-                return 0;
-            }
-            if (id == EDIT_FONT_FAMILY and notify == EN_KILLFOCUS) {
-                if (owner) |o| o.syncFontFamilyFromEdit();
-                return 0;
-            }
-            if (id == EDIT_FONT_SIZE and notify == EN_CHANGE) {
-                if (owner) |o| o.syncFontSizeFromEdit();
-                return 0;
-            }
-            if (id == EDIT_THEME and notify == EN_CHANGE) {
-                if (owner) |o| if (o.edit_theme) |edit| o.markOwnedTextChanged(.theme, edit);
-                return 0;
-            }
-            if (id == EDIT_THEME and notify == EN_KILLFOCUS) {
-                if (owner) |o| o.syncThemeFromEdit();
-                return 0;
-            }
-            if (id == EDIT_BG_OPACITY and notify == EN_CHANGE) {
-                if (owner) |o| o.syncBgOpacityFromEdit();
-                return 0;
-            }
-            if (id == EDIT_COMMAND and notify == EN_CHANGE) {
-                if (owner) |o| if (o.edit_command) |edit| o.markOwnedTextChanged(.command, edit);
-                return 0;
-            }
-            if (id == EDIT_COMMAND and notify == EN_KILLFOCUS) {
-                if (owner) |o| o.syncCommandFromEdit();
-                return 0;
-            }
-            if (id == EDIT_PAD_X and notify == EN_CHANGE) {
-                if (owner) |o| o.syncPaddingFromEdit(.x);
-                return 0;
-            }
-            if (id == EDIT_PAD_Y and notify == EN_CHANGE) {
-                if (owner) |o| o.syncPaddingFromEdit(.y);
-                return 0;
-            }
-            if (id == CHK_TRIM_TRAIL and notify == BN_CLICKED) {
-                if (owner) |o| o.syncTrimTrailFromCheckbox();
-                return 0;
-            }
-            if (id == CHK_DESKTOP_NOTIFICATIONS and notify == BN_CLICKED) {
-                if (owner) |o| o.syncDesktopNotificationsFromCheckbox();
-                return 0;
-            }
-            if (id == CHK_APP_NOTIFY_CLIPBOARD and notify == BN_CLICKED) {
-                if (owner) |o| o.syncAppNotificationsFromCheckbox(.clipboard);
-                return 0;
-            }
-            if (id == CHK_APP_NOTIFY_CONFIG and notify == BN_CLICKED) {
-                if (owner) |o| o.syncAppNotificationsFromCheckbox(.config);
-                return 0;
-            }
-            if (id == COMBO_CONFIRM_CLOSE and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncConfirmCloseFromCombo();
-                return 0;
-            }
-            if (id == COMBO_COPY_ON_SELECT and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncCopyOnSelectFromCombo();
-                return 0;
-            }
-            if (id == COMBO_CLIPBOARD_READ and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncClipboardAccessFromCombo("clipboard-read", o.combo_clipboard_read);
-                return 0;
-            }
-            if (id == COMBO_CLIPBOARD_WRITE and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncClipboardAccessFromCombo("clipboard-write", o.combo_clipboard_write);
-                return 0;
-            }
-            if (id == COMBO_LINK_URL and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncLinkUrlFromCombo();
-                return 0;
-            }
-            if (id == COMBO_LINK_PREVIEWS and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncLinkPreviewsFromCombo();
-                return 0;
-            }
-            if (id == COMBO_WINDOW_THEME and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncWindowThemeFromCombo();
-                return 0;
-            }
-            if (id == COMBO_SHELL_INTEG and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncShellIntegFromCombo();
-                return 0;
-            }
-            if (id == COMBO_CURSOR_STYLE and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncCursorStyleFromCombo();
-                return 0;
-            }
-            if (id == CHK_ACCENT_FOLLOW and notify == BN_CLICKED) {
-                if (owner) |o| o.syncAccentFollowFromCheckbox();
-                return 0;
-            }
-            if (id == CHK_BG_BLUR and notify == BN_CLICKED) {
-                if (owner) |o| o.syncBgBlurFromCheckbox();
-                return 0;
-            }
-            if (id == COMBO_PAD_BALANCE and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncPadBalanceFromCombo();
-                return 0;
-            }
-            if (id == COMBO_AUTO_UPDATE and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncAutoUpdateFromCombo();
-                return 0;
-            }
-            if (id == COMBO_AUTO_UPDATE_CHANNEL and notify == CBN_SELCHANGE) {
-                if (owner) |o| o.syncAutoUpdateChannelFromCombo();
-                return 0;
-            }
+            inline for (field_model.form_fields) |row| if (id == row.native.id) {
+                const adapter = comptime @field(field_adapters, row.native.binding);
+                const changed = switch (comptime row.kind()) {
+                    .choice => CBN_SELCHANGE,
+                    .boolean, .blur => BN_CLICKED,
+                    else => EN_CHANGE,
+                };
+                if (notify == changed) {
+                    if (owner) |o| adapter.changed(o);
+                    return 0;
+                }
+                if (notify == EN_KILLFOCUS) if (adapter.left) |left| {
+                    if (owner) |o| left(o);
+                    return 0;
+                };
+            };
             if (clickedSection(id, notify)) |section| {
                 if (owner) |o| {
                     const source: ?HWND = if (lParam == 0)
@@ -11309,9 +11615,7 @@ fn copyOwnedSetting(target: *Config, source: *const Config, field: OwnedSettingF
 
 fn writeOwnedSettingValue(writer: *std.Io.Writer, config: *const Config, field: OwnedSettingField) !void {
     switch (field) {
-        .font_family => try field_model.writeOwnedSettingValue(.@"font-family", writer, config),
-        .theme => try field_model.writeOwnedSettingValue(.theme, writer, config),
-        .command => try field_model.writeOwnedSettingValue(.command, writer, config),
+        inline else => |owned| try field_model.writeOwnedSettingValue(owned.descriptor().key, writer, config),
     }
 }
 

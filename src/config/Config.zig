@@ -1108,6 +1108,14 @@ palette: Palette = .{},
 /// is 0.15. This value still looks weird but you can at least see what's going
 /// on. A value outside of the range 0.15 to 1 will be clamped to the nearest
 /// valid value.
+///
+/// On Windows the renderer draws the dim over the split's terminal content,
+/// after any `custom-shader` (so a shader that dims an unfocused terminal
+/// itself, for example through `iFocus`, dims it twice). The overlay
+/// scrollbar and a docked search bar are not dimmed. The dim follows the
+/// split each tab has selected, not keyboard focus, so the selected split of
+/// a window that is not in front stays undimmed, and a zoomed split is never
+/// dimmed. High Contrast turns it off.
 @"unfocused-split-opacity": f64 = 0.7,
 
 /// The color to dim the unfocused split. Unfocused splits are dimmed by
@@ -1116,11 +1124,18 @@ palette: Palette = .{},
 ///
 /// This will default to the background color.
 ///
+/// On Windows that is the configured `background`, not a color a program
+/// sets with OSC 11.
+///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"unfocused-split-fill": ?Color = null,
 
 /// The color of the split divider. If this is not set, a default will be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+///
+/// On Windows this colors the gap between split panes, but not the accent line
+/// around the focused split. If it is not set, the window theme's divider color
+/// is used. High Contrast uses the system colors instead.
 ///
 /// Available since: 1.1.0
 @"split-divider-color": ?Color = null,
@@ -1500,12 +1515,26 @@ link: RepeatableLink = .{},
 /// to new windows and does not apply to tabs, splits, etc. However, this setting
 /// will apply to all new windows, not just the first one.
 ///
+/// On Windows this includes a window restored from the saved session (see
+/// `window-save-state`) and a window opened from a named layout. A restored
+/// window is maximized over the rect it was saved at, and that rect is the
+/// one it returns to. It does not apply to the quick terminal or to a console
+/// handed off as the default terminal, which starts in the show state its
+/// program asked for. Changing it does not change windows that are already
+/// open.
+///
 /// Available since: 1.1.0
 maximize: bool = false,
 
 /// Start new windows in fullscreen. This setting applies to new windows and
 /// does not apply to tabs, splits, etc. However, this setting will apply to all
 /// new windows, not just the first one.
+///
+/// On Windows it applies to the same windows as `maximize`. A window that
+/// starts fullscreen leaves fullscreen to the window it would otherwise have
+/// been, maximized when `maximize` is also set. The saved session does not
+/// record fullscreen: a fullscreen window is saved as the window it leaves
+/// fullscreen to. On the command line it needs a value: `--fullscreen=true`.
 ///
 /// Allowable values are:
 ///
@@ -2277,11 +2306,23 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// On Windows the session's owning process saves on exit, at sign-out or
-/// shutdown, when the display configuration changes, and one second after
-/// a burst of window, tab or pane structural changes settles. Checkpoints
-/// use the same ownership and privacy rules as the exit save and never run
-/// during startup restore. The practical window/session shape includes:
+/// On Windows the session's owning process saves as the session ends (the
+/// last window going, however it goes: its close, its last tab or pane, its
+/// last shell exiting; or a quit, which saves every window it closes), at
+/// sign-out or shutdown, when the display configuration changes, and one
+/// second after a burst of window, tab or pane structural changes settles.
+/// The next launch restores what was open when the session ended; undo
+/// history is not saved, and no save deletes the file. One exception: a
+/// session restored at startup that nothing used (no input reached a running
+/// program, and no tab, pane, window or quick terminal was opened) and
+/// whose programs all ended by themselves is not saved back, since it would
+/// open and close again at every launch. Its saved file is renamed to
+/// `session-state.json.restore-ended` instead (up to five copies), and the
+/// next launch starts fresh. With all five names taken, the file is left in
+/// place and the next launch restores it again.
+/// Checkpoints use the same ownership and privacy rules as the save when the
+/// last window goes and never run during startup restore. The practical
+/// window/session shape includes:
 /// host window rectangle/state plus tab, split, profile, working-directory,
 /// and explicit title metadata. Child process state is not restored. The
 /// opt-in `window-save-state-scrollback` setting can additionally restore a
@@ -3577,10 +3618,14 @@ pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
     try self.loadFsFile(alloc, &file, path);
 }
 
+/// The read buffer for a config or theme file. Lines are read through it with
+/// `cli.args.LineIterator`, so the tests place lines on its boundary.
+const file_read_buffer_len = 2048;
+
 /// Load config from the given File.
 fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const u8) !void {
     std.log.info("reading configuration file path={s}", .{path});
-    var buf: [2048]u8 = undefined;
+    var buf: [file_read_buffer_len]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     try self.loadReader(alloc, reader, path);
@@ -3719,11 +3764,7 @@ pub fn dropLaunchLayoutReplaySteps(self: *Config, from: usize) ?[]const u8 {
     }
     while (i > from) {
         i -= 1;
-        const arg: []const u8 = switch (self._replay_steps.items[i]) {
-            .arg => |value| value.value,
-            .conditional_arg => |value| value.arg,
-            else => continue,
-        };
+        const arg = self._replay_steps.items[i].argText() orelse continue;
         const value = launchLayoutArgValue(arg) orelse continue;
         // Iterating backwards, so the first match is the file's last word.
         if (found == null) found = value;
@@ -3763,11 +3804,7 @@ test "launch-layout is ignored in configuration files" {
         // and `changeConditionalState` both re-run `_replay_steps` through
         // `loadIter`, which does not pass through `loadReader`.
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.startsWith(u8, arg, "--launch-layout"));
         }
 
@@ -3833,11 +3870,7 @@ test "launch-layout is ignored in configuration files" {
         try testing.expectEqualStrings("CLI Layout", cfg.@"launch-layout".?);
 
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.eql(u8, arg, "--launch-layout=Theme Layout"));
         }
     }
@@ -4048,6 +4081,100 @@ test "a UTF-16 config file on disk is read through loadFile" {
     try cfg.loadFile(alloc, path);
     try testing.expect(cfg._diagnostics.empty());
     try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
+}
+
+/// `len` bytes of comment lines, each at most 65 bytes, for placing the next
+/// line at a chosen offset in a test config file. `len` must be at least 2.
+fn testCommentLines(alloc: Allocator, len: usize) ![]u8 {
+    assert(len >= 2);
+    const out = try alloc.alloc(u8, len);
+    var pos: usize = 0;
+    while (pos < len) {
+        const remaining = len - pos;
+        // The last line takes what is left, so no 1-byte remainder is left
+        // over for a line that cannot hold a '#'.
+        const line_len = if (remaining >= 66) 64 else remaining;
+        out[pos] = '#';
+        @memset(out[pos + 1 .. pos + line_len - 1], 'x');
+        out[pos + line_len - 1] = '\n';
+        pos += line_len;
+    }
+    return out;
+}
+
+test "loadFile reads lines after an ignored line that ends at the read buffer boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const boundary = file_read_buffer_len;
+    const setting = "font-size = 77\n";
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Case = struct {
+        name: []const u8,
+        /// Bytes before `setting`: comment lines, then `blank` blank lines.
+        before: usize,
+        blank: usize = 0,
+        /// Comment bytes after `setting`, then `tail`.
+        after: usize = 0,
+        tail: []const u8 = "",
+    };
+    const cases = [_]Case{
+        // A comment line ends exactly at the end of the buffer. Before the
+        // fix the loader took that for the end of the file and silently
+        // dropped every setting after it.
+        .{ .name = "comment run", .before = boundary },
+        // The same with blank lines.
+        .{ .name = "blank line run", .before = boundary, .blank = 40 },
+        // The setting itself crosses the boundary.
+        .{ .name = "setting across the boundary", .before = boundary - 8 },
+        // The file ends exactly at the boundary, on the setting...
+        .{ .name = "setting ends the file at the boundary", .before = boundary - setting.len },
+        // ...and on a comment after it.
+        .{ .name = "comment ends the file at the boundary", .before = 100, .after = boundary - 100 - setting.len },
+        // The next call after the setting refills the buffer from just past
+        // the setting, so a comment run of exactly one buffer after it ends
+        // on the next boundary, before a second setting.
+        .{
+            .name = "comment runs end at two boundaries",
+            .before = boundary,
+            .after = boundary,
+            .tail = "cursor-style = underline\n",
+        },
+    };
+
+    for (cases, 0..) |case, i| {
+        errdefer std.debug.print("case failed: {s}\n", .{case.name});
+
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(alloc);
+        const comments_before = try testCommentLines(alloc, case.before - case.blank);
+        defer alloc.free(comments_before);
+        try data.appendSlice(alloc, comments_before);
+        try data.appendNTimes(alloc, '\n', case.blank);
+        try testing.expectEqual(case.before, data.items.len);
+        try data.appendSlice(alloc, setting);
+        if (case.after > 0) {
+            const comments_after = try testCommentLines(alloc, case.after);
+            defer alloc.free(comments_after);
+            try data.appendSlice(alloc, comments_after);
+        }
+        try data.appendSlice(alloc, case.tail);
+
+        const name = try std.fmt.allocPrint(alloc, "case{d}.ghostty", .{i});
+        defer alloc.free(name);
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = data.items });
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadFile(alloc, path);
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 77), cfg.@"font-size");
+        if (case.tail.len > 0) try testing.expect(cfg.@"cursor-style" == .underline);
+    }
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
@@ -4716,7 +4843,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     errdefer new_config.deinit();
 
     // Load our theme
-    var buf: [2048]u8 = undefined;
+    var buf: [file_read_buffer_len]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     var line_iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
@@ -4992,10 +5119,7 @@ pub fn finalize(self: *Config) !void {
 /// Resolve the automatic Windows command without hiding whether it was explicit.
 pub fn resolveWindowsDefaultCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.defaultCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-default value={}", .{cmd});
-    self.command = cmd;
-    self._command_defaulted = true;
+    self.setAutomaticCommand("windows-default", try windows_shell.defaultCommand(self._arena.?.allocator()));
 }
 
 /// Give a config with no `command` the one safe mode starts, so a recovery
@@ -5004,8 +5128,12 @@ pub fn resolveWindowsDefaultCommand(self: *Config) !void {
 /// `PATH`. The command stays marked automatic. A command already set stays.
 pub fn useWindowsRecoveryCommand(self: *Config) !void {
     if (self.command != null) return;
-    const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-recovery value={}", .{cmd});
+    self.setAutomaticCommand("windows-recovery", try windows_shell.recoveryCommand(self._arena.?.allocator()));
+}
+
+/// Set `command` to `cmd`, chosen by noctty rather than a config layer.
+fn setAutomaticCommand(self: *Config, comptime src: []const u8, cmd: Command) void {
+    log.info("default shell src=" ++ src ++ " value={}", .{cmd});
     self.command = cmd;
     self._command_defaulted = true;
 }
@@ -5453,6 +5581,16 @@ const Replay = struct {
         /// Note: when "-e" is used, ONLY this is present and
         /// not an additional "arg" with "-e" value.
         @"-e": cli.Location,
+
+        /// The argument text of an `arg` or `conditional_arg` step, or null
+        /// for any other step.
+        fn argText(self: Step) ?[]const u8 {
+            return switch (self) {
+                .arg => |v| v.value,
+                .conditional_arg => |v| v.arg,
+                else => null,
+            };
+        }
 
         fn clone(
             self: Step,
@@ -9824,10 +9962,46 @@ pub const RepeatableCommand = struct {
             item.* = try item.clone(alloc);
         }
 
+        // Cloning value_c directly would copy Command.C structs
+        // whose string pointers still reference the source config's
+        // memory — the clone must stay valid after the source is
+        // freed.
+        var value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty;
+        try value_c.ensureTotalCapacityPrecise(alloc, value.items.len);
+        for (value.items) |item| {
+            value_c.appendAssumeCapacity(try item.cval(alloc));
+        }
+
         return .{
             .value = value,
-            .value_c = try self.value_c.clone(alloc),
+            .value_c = value_c,
         };
+    }
+
+    test "RepeatableCommand clone owns C command strings" {
+        const testing = std.testing;
+        var copy_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer copy_arena.deinit();
+        const copy = copy: {
+            var source_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer source_arena.deinit();
+            var source: Self = .{};
+            try source.parseCLI(source_arena.allocator(), "title:Custom,description:Description,action:text:payload");
+            const result = try source.clone(copy_arena.allocator());
+            const original_c = source.value_c.items[0];
+            const copied_c = result.value_c.items[0];
+            // Check ownership before releasing the source, so the regression
+            // fails without reading freed memory on the broken clone.
+            try testing.expect(copied_c.action != original_c.action);
+            try testing.expect(copied_c.title == result.value.items[0].title.ptr);
+            try testing.expect(copied_c.description == result.value.items[0].description.ptr);
+            break :copy result;
+        };
+        const command_c = copy.cval().commands[0];
+        try testing.expectEqualStrings("text:payload", std.mem.span(command_c.action));
+        try testing.expectEqualStrings("Custom", std.mem.span(command_c.title));
+        try testing.expectEqualStrings("Description", std.mem.span(command_c.description));
+        try testing.expectEqualStrings("text", std.mem.span(command_c.action_key));
     }
 
     /// Compare if two of our value are equal. Required by Config.
@@ -11421,6 +11595,43 @@ test "clone default" {
 
     // I want to do this but this doesn't work (the API doesn't work)
     // try testing.expectEqualDeep(dest, source);
+}
+
+test "clone command C view survives source config deinit" {
+    const testing = std.testing;
+    var copy = copy: {
+        var source = try Config.default(testing.allocator);
+        defer source.deinit();
+        const alloc = source._arena.?.allocator();
+        try source.@"command-palette-entry".parseCLI(alloc, "title:Custom,action:open_config");
+        var result = try source.clone(testing.allocator);
+        errdefer result.deinit();
+        const original = source.@"command-palette-entry".cval();
+        const cloned = result.@"command-palette-entry".cval();
+        try testing.expectEqual(original.len, cloned.len);
+        // Assert ownership before deinit so broken clones fail without UAF.
+        const custom = cloned.len - 1;
+        try testing.expect(original.commands[custom].action != cloned.commands[custom].action);
+        try testing.expect(original.commands[custom].title != cloned.commands[custom].title);
+        break :copy result;
+    };
+    defer copy.deinit();
+    const commands = copy.@"command-palette-entry".cval();
+    try testing.expectEqual(inputpkg.command.defaults.len + 1, commands.len);
+    for (inputpkg.command.defaultsC, 0..) |expected, i| {
+        try testing.expectEqualStrings(std.mem.span(expected.action), std.mem.span(commands.commands[i].action));
+        try testing.expectEqualStrings(std.mem.span(expected.title), std.mem.span(commands.commands[i].title));
+    }
+    const custom = commands.commands[commands.len - 1];
+    try testing.expectEqualStrings("open_config", std.mem.span(custom.action));
+    try testing.expectEqualStrings("Custom", std.mem.span(custom.title));
+    try testing.expectEqualStrings("", std.mem.span(custom.description));
+
+    // Clearing the palette must stay empty through another complete clone.
+    try copy.@"command-palette-entry".parseCLI(copy._arena.?.allocator(), "");
+    var empty = try copy.clone(testing.allocator);
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.@"command-palette-entry".cval().len);
 }
 
 test "default quit-after-last-window-closed is enabled in the Windows fork" {

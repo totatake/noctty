@@ -3,6 +3,11 @@ param(
     [int] $TimeoutSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'conpty-host-spike.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -533,3 +538,7 @@ if ($failure) {
 
 Write-Output "CONPTY_HOST_SPIKE_RESULT $($result | ConvertTo-Json -Compress)"
 exit 0
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

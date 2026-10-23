@@ -237,8 +237,9 @@ pub const DropTarget = struct {
             return S_OK;
         }
         const accepted = probeFormats(data_object);
+        // Probing calls into the data object, which can detach the target.
         self.has_accepted_format = self.surface_ctx != null and accepted;
-        pdwEffect.* = if (self.surface_ctx != null and self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
+        pdwEffect.* = if (self.has_accepted_format) DROPEFFECT_COPY else DROPEFFECT_NONE;
         return S_OK;
     }
 
@@ -277,39 +278,15 @@ pub const DropTarget = struct {
         const mods = modifiersFromKeyState(grfKeyState);
 
         // Try formats in priority order.
-        if (self.tryExtractHdrop(data_object, mods)) |payload| {
-            defer self.alloc.free(payload);
-            const ctx = self.surface_ctx orelse return S_OK;
-            self.on_payload(ctx, payload);
-            pdwEffect.* = DROPEFFECT_COPY;
+        const payload = self.tryExtractHdrop(data_object, mods) orelse
+            self.tryExtractUnicodeText(data_object, mods) orelse
+            self.tryExtractHtml(data_object, mods) orelse
+            self.tryExtractShellUrl(data_object) orelse
             return S_OK;
-        }
-
-        if (self.tryExtractUnicodeText(data_object, mods)) |payload| {
-            defer self.alloc.free(payload);
-            const ctx = self.surface_ctx orelse return S_OK;
-            self.on_payload(ctx, payload);
-            pdwEffect.* = DROPEFFECT_COPY;
-            return S_OK;
-        }
-
-        if (self.tryExtractHtml(data_object, mods)) |payload| {
-            defer self.alloc.free(payload);
-            const ctx = self.surface_ctx orelse return S_OK;
-            self.on_payload(ctx, payload);
-            pdwEffect.* = DROPEFFECT_COPY;
-            return S_OK;
-        }
-
-        if (self.tryExtractShellUrl(data_object)) |payload| {
-            defer self.alloc.free(payload);
-            const ctx = self.surface_ctx orelse return S_OK;
-            self.on_payload(ctx, payload);
-            pdwEffect.* = DROPEFFECT_COPY;
-            return S_OK;
-        }
-
-        pdwEffect.* = DROPEFFECT_NONE;
+        defer self.alloc.free(payload);
+        const ctx = self.surface_ctx orelse return S_OK;
+        self.on_payload(ctx, payload);
+        pdwEffect.* = DROPEFFECT_COPY;
         return S_OK;
     }
 

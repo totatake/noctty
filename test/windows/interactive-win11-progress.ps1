@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 20
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-progress.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Poll cadence while waiting for progress-window evidence.
 $script:PROGRESS_POLL_MS = 100
@@ -381,3 +386,7 @@ finally {
 }
 
 Write-Host "interactive-win11 progress validation: PASS (stderr=$stderrPath, set-vs-remove-distinct=$visualSetVsRemoveDistinct, pause-vs-error-distinct=$visualPauseVsErrorDistinct, bottom-strip-set-vs-remove-distinct=$bottomStripSetVsRemoveDistinct, bottom-strip-pause-vs-error-distinct=$bottomStripPauseVsErrorDistinct, set=$($screenshots.set), remove=$($screenshots.remove), bottom-strip-set=$($bottomStrips.set), bottom-strip-remove=$($bottomStrips.remove))"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

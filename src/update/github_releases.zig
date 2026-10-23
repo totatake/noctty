@@ -2050,12 +2050,10 @@ fn resolveRedirectTarget(
 /// Response body caps. `std.Io.Reader.streamRemaining` pumps until EOF with
 /// no limit, so an oversized or hostile response would otherwise grow the
 /// caller's buffer (metadata) or the staged file (download) without bound.
-/// Every body read below goes through `streamBounded` with one of these.
+/// Every body read below is bounded by one of these.
 const max_metadata_response_bytes: u64 = 4 * 1024 * 1024;
 const max_download_response_bytes: u64 = 512 * 1024 * 1024;
 const max_redirect_body_bytes: u64 = 1024 * 1024;
-
-const streamBounded = http_windows.streamBounded;
 
 fn clearOptionalOwned(alloc: Allocator, slot: *?[]u8) void {
     if (slot.*) |old| alloc.free(old);
@@ -2082,7 +2080,7 @@ fn fetchHttps(
 
         if (response.status.class() == .redirect) {
             if (redirect_count >= 3) return error.TooManyHttpRedirects;
-            const location = try response.header(alloc, 33) orelse return error.HttpRedirectLocationMissing;
+            const location = try response.header(alloc, http_windows.query_location) orelse return error.HttpRedirectLocationMissing;
             defer alloc.free(location);
             const next_url = try resolveRedirectTarget(alloc, current_url, location);
             errdefer alloc.free(next_url);
@@ -3467,31 +3465,6 @@ test "update release feed resolution" {
         defer resolved.deinit(alloc);
         try std.testing.expectEqual(case.source, resolved.source);
         try std.testing.expectEqual(case.ignored, resolved.ignored_non_https);
-    }
-}
-
-test "bounded response streaming refuses an oversized body" {
-    const alloc = std.testing.allocator;
-    const body = "0123456789";
-
-    // Exactly at the cap is accepted.
-    {
-        var reader: std.Io.Reader = .fixed(body);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try streamBounded(&reader, &out.writer, body.len);
-        try std.testing.expectEqualStrings(body, out.written());
-    }
-
-    // One byte over the cap is refused.
-    {
-        var reader: std.Io.Reader = .fixed(body);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try std.testing.expectError(
-            error.HttpResponseTooLarge,
-            streamBounded(&reader, &out.writer, body.len - 1),
-        );
     }
 }
 

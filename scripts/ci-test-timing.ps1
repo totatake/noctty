@@ -36,6 +36,11 @@ function ConvertFrom-ZigTestLines {
     $open = $null
     $lastEnd = 0.0
     $lastSeen = 0.0
+    $resultPattern = '^(OK|SKIP|FAIL \(.*\))$'
+    # Records a test that ended at $End, charged the time since $lastEnd.
+    function Add-ZigTestRecord($Name, [double] $End, $Result) {
+        $tests.Add([pscustomobject]@{ Name = $Name; Seconds = [math]::Round($End - $lastEnd, 3); Result = $Result })
+    }
     foreach ($line in $Lines) {
         $text = [string] $line.Text
         $seconds = [double] $line.Seconds
@@ -45,25 +50,25 @@ function ConvertFrom-ZigTestLines {
             if ($null -ne $open) {
                 # The previous test never printed its end (it crashed or the log
                 # was cut): close it where the next one starts.
-                $tests.Add([pscustomobject]@{ Name = $open; Seconds = [math]::Round($seconds - $lastEnd, 3); Result = 'incomplete' })
+                Add-ZigTestRecord $open $seconds 'incomplete'
                 $lastEnd = $seconds
             }
             $open = $Matches[3]
             $rest = $Matches[4]
-            if ($rest -match '^(OK|SKIP|FAIL \(.*\))$') { $result = $rest }
+            if ($rest -match $resultPattern) { $result = $rest }
         }
-        elseif ($null -ne $open -and $text -match '^(OK|SKIP|FAIL \(.*\))$') {
+        elseif ($null -ne $open -and $text -match $resultPattern) {
             $result = $text
         }
         if ($null -ne $result) {
-            $tests.Add([pscustomobject]@{ Name = $open; Seconds = [math]::Round($seconds - $lastEnd, 3); Result = $result })
+            Add-ZigTestRecord $open $seconds $result
             $lastEnd = $seconds
             $open = $null
         }
     }
     if ($null -ne $open) {
         # The log ended inside a test: charge it the time up to the last line.
-        $tests.Add([pscustomobject]@{ Name = $open; Seconds = [math]::Round($lastSeen - $lastEnd, 3); Result = 'incomplete' })
+        Add-ZigTestRecord $open $lastSeen 'incomplete'
     }
     return $tests.ToArray()
 }

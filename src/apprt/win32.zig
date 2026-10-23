@@ -16,7 +16,6 @@ const themepkg = @import("../config/theme.zig");
 const windows_shell = @import("../config/windows_shell.zig");
 const windows_ssh_hosts = @import("../config/windows_ssh_hosts.zig");
 const input = @import("../input.zig");
-const homedir = @import("../os/homedir.zig");
 const internal_os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -75,6 +74,7 @@ const applyNewWindowArguments = ipc_server.applyNewWindowArguments;
 const automationTextAllowed = ipc_server.automationTextAllowed;
 const automationWorkingDirectoryAllowed = ipc_server.automationWorkingDirectoryAllowed;
 const forwardedArgvRejection = ipc_server.forwardedArgvRejection;
+const forwardedArgvSetsKey = ipc_server.forwardedArgvSetsKey;
 const forwardedKeyAllowed = ipc_server.forwardedKeyAllowed;
 const logForwardedArgvRejection = ipc_server.logForwardedArgvRejection;
 const resolveIpcPipeNameForTarget = ipc_server.resolveIpcPipeNameForTarget;
@@ -617,14 +617,14 @@ test "win32 clipboard text gets LF line endings" {
 /// one line. Returns null when `text` has no bare LF to expand.
 fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
     var bare: usize = 0;
-    for (text, 0..) |byte, i| {
-        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) bare += 1;
+    for (0..text.len) |i| {
+        if (isBareLf(text, i)) bare += 1;
     }
     if (bare == 0) return null;
     const out = try alloc.alloc(u8, text.len + bare);
     var o: usize = 0;
     for (text, 0..) |byte, i| {
-        if (byte == '\n' and (i == 0 or text[i - 1] != '\r')) {
+        if (isBareLf(text, i)) {
             out[o] = '\r';
             o += 1;
         }
@@ -632,6 +632,10 @@ fn crlfLineEndings(alloc: std.mem.Allocator, text: []const u8) !?[]u8 {
         o += 1;
     }
     return out;
+}
+
+fn isBareLf(text: []const u8, i: usize) bool {
+    return text[i] == '\n' and (i == 0 or text[i - 1] != '\r');
 }
 
 test "win32 clipboard writes get CRLF line endings" {
@@ -1335,6 +1339,10 @@ const recovery_session_set_aside_banner_w = blk: {
 };
 /// Suffix for a saved session that the last launches died restoring.
 const recovery_set_aside_suffix = ".restore-failed";
+/// Suffix for a saved session that was restored and then ended by itself
+/// before it was used (`App.setAsideFailedRestore`). Its own slots: these
+/// copies must never take the ones the crash-loop breaker needs.
+const restore_ended_suffix = ".restore-ended";
 const recovery_safe_mode_caption_w = std.unicode.utf8ToUtf16LeStringLiteral("noctty safe mode");
 
 test "win32 safe mode reload keeps recovery without loading config" {
@@ -1384,12 +1392,7 @@ const RecoveryLedgerLock = struct {
     /// sibling file itself being unusable, which usually means the ledger
     /// directory is too.
     fn acquire(alloc: Allocator, ledger_path: []const u8, wait_ms: u32) !?RecoveryLedgerLock {
-        if (std.fs.path.dirname(ledger_path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
-        }
+        try makeParentDirAbsolute(ledger_path);
         const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{ledger_path});
         defer alloc.free(lock_path);
         // Open-if-exists, never truncate: the file's bytes are irrelevant and
@@ -1747,6 +1750,88 @@ fn setAsideCrashedSessionState(alloc: Allocator, state_path: []const u8) bool {
     return true;
 }
 
+/// Move the saved session at `path` aside, as a restore that ended by itself
+/// before it was used: renamed into a free `.restore-ended` slot, never
+/// deleted or replaced. With every slot taken it stays where it is, and the
+/// next launch restores it again: a session the user can see beats one this
+/// would have to delete or overwrite a copy to move. Returns whether it moved.
+fn setAsideSessionStateAt(alloc: Allocator, path: []const u8) bool {
+    const destination = win32_session_persistence.quarantineFileAlloc(
+        alloc,
+        path,
+        restore_ended_suffix,
+        .keep_source,
+    ) catch |err| {
+        switch (err) {
+            error.FileNotFound => {},
+            error.QuarantineFull => log.warn("win32 session: the restored session ended by itself before any input; left in place, every {s} name is taken", .{restore_ended_suffix}),
+            else => log.warn("win32 session: the restored session ended by itself before any input; not moved aside err={}", .{err}),
+        }
+        return false;
+    };
+    defer alloc.free(destination);
+    log.warn("win32 session: the restored session ended by itself before any input; moved it to {s}", .{destination});
+    return true;
+}
+
+test "win32 a restore that ended by itself is moved aside, never deleted or replaced" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "session-state.json" });
+    defer std.testing.allocator.free(path);
+
+    // Every restore that ends this way is kept, each in a slot of its own.
+    var name_buf: [64]u8 = undefined;
+    for (0..win32_session_persistence.max_quarantined_copies) |index| {
+        var content_buf: [64]u8 = undefined;
+        const content = try std.fmt.bufPrint(&content_buf, "{{\"schema_version\":1,\"windows\":[],\"n\":{d}}}", .{index});
+        try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = content });
+        try std.testing.expect(setAsideSessionStateAt(std.testing.allocator, path));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
+        const name = if (index == 0)
+            "session-state.json" ++ restore_ended_suffix
+        else
+            try std.fmt.bufPrint(&name_buf, "session-state.json{s}.{d}", .{ restore_ended_suffix, index });
+        const moved = try tmp.dir.readFileAlloc(std.testing.allocator, name, 64);
+        defer std.testing.allocator.free(moved);
+        try std.testing.expectEqualStrings(content, moved);
+    }
+    // Nothing left to move.
+    try std.testing.expect(!setAsideSessionStateAt(std.testing.allocator, path));
+
+    // Every slot taken: the session stays, and no copy is replaced.
+    const latest = "{\"schema_version\":1,\"windows\":[],\"n\":5}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = latest });
+    try std.testing.expect(!setAsideSessionStateAt(std.testing.allocator, path));
+    const stayed = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 64);
+    defer std.testing.allocator.free(stayed);
+    try std.testing.expectEqualStrings(latest, stayed);
+    const first = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ restore_ended_suffix, 64);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("{\"schema_version\":1,\"windows\":[],\"n\":0}", first);
+
+    // These copies never take the crash-loop breaker's slots: with all of
+    // them taken, a session the last launches died restoring still moves.
+    try std.testing.expect(setAsideCrashedSessionState(std.testing.allocator, path));
+    const crashed = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json" ++ recovery_set_aside_suffix, 64);
+    defer std.testing.allocator.free(crashed);
+    try std.testing.expectEqualStrings(latest, crashed);
+}
+
+/// Create the directory `path` sits in when it is missing. Only that one
+/// level: its own parent must already exist.
+fn makeParentDirAbsolute(path: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
 fn unixMillis() u64 {
     return @intCast(@max(std.time.milliTimestamp(), 0));
 }
@@ -1783,13 +1868,12 @@ fn settingsEditedValueMasked(
     reloaded: *const configpkg.Config,
     comptime key: SettingsConfigKey,
 ) bool {
-    if (key == .command and pending.command == null and reloaded._command_defaulted) return false;
     if (key == SettingsConfigKey.@"auto-update-channel") {
         const expected = pending.@"auto-update-channel" orelse build_config.release_channel;
         const actual = reloaded.@"auto-update-channel" orelse build_config.release_channel;
         return expected != actual;
     }
-    return pending.changed(reloaded, comptime key);
+    return settingsDiskValueDiffers(pending, reloaded, key);
 }
 
 /// The most bytes `settingsMaskedKeyNames` writes: every editable key, and a
@@ -1892,16 +1976,26 @@ fn settingsFileProbe(
         error.IsDir => return true,
         else => {
             log.warn("settings save: could not open {s} to check it for edits path={s} err={}", .{ what, path, err });
-            if (detail) |d| {
-                const text = std.fmt.allocPrint(alloc, "{s} {s}", .{ what, path }) catch return error.OutOfMemory;
-                defer alloc.free(text);
-                d.set(alloc, text);
-            }
+            try setSettingsFailureDetail(alloc, detail, "{s} {s}", .{ what, path });
             return error.FileUnopenable;
         },
     };
     file.close();
     return true;
+}
+
+/// Tell `detail`, when the caller gave one, which file a refused save is
+/// about, for the Settings status line.
+fn setSettingsFailureDetail(
+    alloc: Allocator,
+    detail: ?*win32_settings.FailureDetail,
+    comptime fmt: []const u8,
+    args: anytype,
+) error{OutOfMemory}!void {
+    const d = detail orelse return;
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    d.set(alloc, text);
 }
 
 /// `settingsFileOpenable` for every file the loaded config pulled in: the
@@ -1980,11 +2074,7 @@ fn settingsDiskVerdict(
     // A UTF-16 file that does not decode is skipped whole, with a diagnostic
     // and everything it set missing: as incomplete as one that will not open.
     if (disk._undecodable_file) |path| {
-        if (detail) |d| {
-            const text = std.fmt.allocPrint(alloc, "the file {s}", .{path}) catch return error.OutOfMemory;
-            defer alloc.free(text);
-            d.set(alloc, text);
-        }
+        try setSettingsFailureDetail(alloc, detail, "the file {s}", .{path});
         return error.UnsupportedEncoding;
     }
     return settingsDiskEditConflict(original, pending, disk, state, user_edited);
@@ -2372,12 +2462,7 @@ fn persistRecoveryRecordAtPath(
     path: []const u8,
     attempts: []win32_recovery.StartupAttempt,
 ) !void {
-    if (std.fs.path.dirname(path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
+    try makeParentDirAbsolute(path);
     const encoded = try win32_recovery.encodeAlloc(alloc, .{ .attempts = attempts });
     defer alloc.free(encoded);
     const nonce = unixMillis();
@@ -2581,17 +2666,6 @@ test "a rate-limited warning logs once per interval and counts the rest" {
     try std.testing.expectEqual(@as(?u32, null), warning.take(61_001, 60_000));
 }
 
-/// An empty snapshot ends the saved session only on the owner's final save;
-/// a checkpoint keeps the file. True when the file was removed.
-fn removeEmptySessionState(path: []const u8, kind: SessionSaveKind) bool {
-    if (kind == .checkpoint) return false;
-    win32_session_persistence.deleteFileIfPresent(path) catch |err| {
-        log.warn("win32 session save: delete stale state failed path={s} err={}", .{ path, err });
-        return false;
-    };
-    return true;
-}
-
 /// Held for the life of the one process that owns `session-state.json`.
 /// An exclusive byte-range lock on the `.lock` sibling, so the kernel drops
 /// it when the owner exits or crashes and the next launch can take over.
@@ -2600,12 +2674,7 @@ const SessionOwnerLock = struct {
 
     /// Null when another live process holds it.
     fn acquire(alloc: Allocator, state_path: []const u8) !?SessionOwnerLock {
-        if (std.fs.path.dirname(state_path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
-        }
+        try makeParentDirAbsolute(state_path);
         const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{state_path});
         defer alloc.free(lock_path);
         const file = std.fs.createFileAbsolute(lock_path, .{
@@ -2786,27 +2855,45 @@ pub const App = struct {
     // when pruning expires (and destroys) that host during dispatch.
     empty_host_key_id: ?u32 = null,
     running: bool = false,
-    /// A normal last-host close destroys the native/session model before
-    /// `terminate` runs. Preserve the successful pre-close snapshot instead
-    /// of replacing it with an empty snapshot during final teardown.
+    /// The session's last window has gone and its snapshot was taken as it
+    /// went (`saveSessionAsItEnds`), however it went: its close, its last tab
+    /// or pane, its last shell exiting, a quit. Nothing replaces that
+    /// snapshot until a window, tab or undo brings the session back, which
+    /// clears this (`Surface.init`, `restoreClosedTabEntry`). Set even when
+    /// the write failed (the file then keeps the previous snapshot), and when
+    /// a restore that failed was moved aside instead (`setAsideFailedRestore`).
     session_state_saved_before_last_host_close: bool = false,
+    /// The startup restore brought the saved session back, and nothing has
+    /// used it since: no input reached a running program
+    /// (`Surface.noteProgramInput`) and no terminal opened after it
+    /// (`Surface.init`). While this holds and every program the session
+    /// shows has ended by itself, the session is a restore that failed
+    /// (`sessionIsFailedRestore`) and is never saved back.
+    restored_session_untouched: bool = false,
+    /// Tests only: how many times `saveSessionAsItEnds` saved. Under test no
+    /// save reaches the disk, and the flag above cannot tell a save from a
+    /// close that left an earlier one standing.
+    test_session_saves_as_it_ends: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
+    /// Tests only: how many times a restore that failed was to be moved
+    /// aside (`setAsideFailedRestore`, past its sign-out check).
+    test_failed_restores_set_aside: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     /// Set only in the process that restored the saved session, or was
     /// eligible to and started with its first window instead. Only that
-    /// process saves or deletes `session-state.json`: a launch that forwarded
-    /// to the primary, an Explorer "Open noctty here" window, an `-Embedding`
-    /// handoff server or a second `single-instance = false` instance never
-    /// loaded it, so writing their own windows (or none) over it destroys the
-    /// user's workspace.
+    /// process saves `session-state.json` or moves it aside: a launch that
+    /// forwarded to the primary, an Explorer "Open noctty here" window, an
+    /// `-Embedding` handoff server or a second `single-instance = false`
+    /// instance never loaded it, so writing their own windows over it
+    /// destroys the user's workspace.
     session_owner: ?SessionOwnerLock = null,
     /// The saved session is not this build's to replace: a newer build wrote
     /// it, or it is larger than any session this build writes. This process
     /// neither restores it nor takes ownership, so it never saves over it or
-    /// deletes it.
+    /// moves it aside.
     session_state_left_alone: bool = false,
     /// Set once WM_ENDSESSION(TRUE) has saved for a sign-out, shutdown or
     /// reboot. That snapshot is final: shells the logoff kills afterwards
     /// close their panes, and the saves those closes would run must not
-    /// shrink or delete it.
+    /// shrink it or move it aside.
     session_ending: bool = false,
     /// `GetTickCount64` of the last `checkpointSessionState`.
     session_checkpoint_ms: ?u64 = null,
@@ -2854,6 +2941,7 @@ pub const App = struct {
     /// Singleton settings window. Lazily created by the `open_config`
     /// action; `App.terminate` destroys the HWND if still alive.
     settings_window: win32_settings.SettingsWindow = undefined,
+    settings_open_trace: bench_trace.SettingsOpenTrace = .{},
     /// Stable core surface id that owned focus when Settings opened. Settings
     /// itself clears terminal focus flags, so close must not guess host zero.
     settings_restore_surface_id: ?u64 = null,
@@ -2944,6 +3032,13 @@ pub const App = struct {
     /// requested surface/window identity and fall back to the newly
     /// created primary surface when the IDs came from a prior process.
     pending_toast_activation: ?win32_toast_activation.ActivationTarget = null,
+    /// The command line's one-shot `--launch-layout=<name>`, which `run`
+    /// opens instead of the first window (or forwards to the running
+    /// instance). `init` moves it here out of the app config
+    /// (`claimStartupLaunchLayout`), because every app config change drops
+    /// `launch-layout` as a request already honored, and on a dark system
+    /// `init`'s own color-scheme sync is one.
+    startup_launch_layout: StartupLaunchLayout = .none,
     /// Ephemeral recovery launch: default config, no saved workspace restore.
     safe_mode: bool = false,
     /// COM SCM activation for the Windows default-terminal handoff server.
@@ -3097,9 +3192,10 @@ pub const App = struct {
         // Be asked to end before the shells under it. Every process starts at
         // the default level 0x280, and Windows ends processes on one level
         // in no set order, so a sign-out could otherwise end the shells
-        // first: each pane closes, the last window goes, and `terminate`
-        // would delete the saved session before WM_ENDSESSION could save
-        // it. A higher level is ended first.
+        // first: each pane closes, and the last one's close would save a
+        // shrunken snapshot (or move aside a restore nobody had used) before
+        // WM_ENDSESSION could save the whole session. A higher level is
+        // ended first.
         if (sys.SetProcessShutdownParameters(0x2FF, 0) == 0) {
             log.warn("win32 SetProcessShutdownParameters failed err={}", .{windows.GetLastError()});
         }
@@ -3212,11 +3308,21 @@ pub const App = struct {
         self.shell_runtime = win32_shell.runtime.Runtime.init(core_app.alloc);
         self.shell_runtime_initialized = true;
 
-        // Core conditional configuration defaults to light. Synchronize it
-        // with Windows before the first surface is created so conditional
-        // themes and terminal color-scheme reports start on the right branch.
-        // No surfaces or hosts exist yet: the resulting app config-change is
-        // intentionally valid before `run`, and its topology loops are empty.
+        self.syncStartupConfig();
+        self.settings_open_trace = bench_trace.SettingsOpenTrace.init(core_app.alloc);
+    }
+
+    /// The end of `init`. Core conditional configuration defaults to light,
+    /// so it is synchronized with Windows before the first surface is
+    /// created, and conditional themes and terminal color-scheme reports
+    /// start on the right branch. No surfaces or hosts exist yet: the
+    /// resulting app config change is intentionally valid before `run`, and
+    /// its topology loops are empty. The command line's `launch-layout` is
+    /// claimed first, because on a dark system that change drops it from the
+    /// app config (`claimStartupLaunchLayout`). Nothing earlier in `init`
+    /// installs an app config.
+    fn syncStartupConfig(self: *App) void {
+        self.claimStartupLaunchLayout();
         self.syncSystemColorScheme() catch |err| {
             log.warn("initial win32 color scheme sync failed err={}", .{err});
         };
@@ -3239,6 +3345,96 @@ pub const App = struct {
                 std.log.warn("COM apartment: OleInitialize failed hr=0x{x:0>8}", .{@as(u32, @bitCast(hr))});
             },
         }
+    }
+
+    pub const StartupLaunchLayout = union(enum) {
+        none,
+        /// Owned by `core_app.alloc`.
+        name: []u8,
+        /// Asked for, but the name could not be copied. Still a layout
+        /// request: taken for none, it would make the launch restore and own
+        /// the session, open nothing under `initial-window = false`, or
+        /// forward as a plain new window.
+        lost,
+    };
+
+    /// Move the command line's `launch-layout` out of the app config into
+    /// `startup_launch_layout`, for `run`. Left in the config, it would not
+    /// last until `run`: the `.app` `config_change` arm drops it from every
+    /// config it installs (a reload parses the original argv again), and on
+    /// a dark system the color-scheme sync at the end of `init` soft-reloads.
+    fn claimStartupLaunchLayout(self: *App) void {
+        const name = self.config.@"launch-layout" orelse return;
+        self.startup_launch_layout = if (self.core_app.alloc.dupe(u8, name)) |owned|
+            .{ .name = owned }
+        else |err| lost: {
+            log.warn("startup launch-layout name could not be kept err={}", .{err});
+            break :lost .lost;
+        };
+        forgetLaunchLayout(&self.config);
+    }
+
+    /// Done with the startup layout request, tried or not.
+    fn releaseStartupLaunchLayout(self: *App) void {
+        switch (self.startup_launch_layout) {
+            .name => |name| self.core_app.alloc.free(name),
+            .none, .lost => {},
+        }
+        self.startup_launch_layout = .none;
+    }
+
+    /// Open the command line's layout as the first window, if it asked for
+    /// one, and say whether it did. It is honored even when `initial-window`
+    /// is disabled, because the user asked for this exact window, and it
+    /// takes the place of session restore. It is also one-shot: `init` took
+    /// it out of the app config, every config installed since drops it
+    /// (`forgetLaunchLayout`), and it is released here once tried, so later
+    /// ordinary new windows and reloads cannot replay it. A layout that
+    /// cannot be opened, or whose name was lost, gets an ordinary window
+    /// that says so.
+    fn openStartupLaunchLayout(self: *App) !bool {
+        const launched = switch (self.startup_launch_layout) {
+            .none => return false,
+            .name => |name| self.launchNamedLayout(name, null),
+            .lost => false,
+        };
+        self.releaseStartupLaunchLayout();
+        if (!launched) {
+            // Handled, as for a skipped restore window.
+            gl_startup.clearOpenGLStartupFailure();
+            try self.createWindow(default_title);
+            if (self.primarySurface()) |surface| if (surface.host) |host| {
+                host.setBanner(.err, "Layout could not be opened.") catch {};
+            };
+        }
+        return true;
+    }
+
+    /// Drop a command-line `launch-layout` from `config`, which is about to
+    /// be, or already is, the long-lived app config: the request is
+    /// one-shot. The replay steps go too: `finalize` -> `loadTheme` and
+    /// `changeConditionalState` replay `_replay_steps` through `loadIter`,
+    /// and a per-window clone inherits that history, so a surviving step
+    /// would turn a later ordinary new window into a layout launch.
+    fn forgetLaunchLayout(config: *configpkg.Config) void {
+        config.@"launch-layout" = null;
+        _ = config.dropLaunchLayoutReplaySteps(0);
+    }
+
+    /// Whether the WM_TIMER `msg` is the tick of thread timer `timer_id`;
+    /// call it only for WM_TIMER. A thread timer (`SetTimer(null, ...)`)
+    /// posts with a null hwnd. Checking that keeps a window timer whose
+    /// numeric id happens to collide from being taken.
+    fn threadTimerFired(msg: *const MSG, timer_id: ?UINT_PTR) bool {
+        const id = timer_id orelse return false;
+        return @intFromPtr(msg.hwnd) == 0 and msg.wParam == id;
+    }
+
+    /// Kill the thread timer in `timer_id`, if one is armed, and forget it.
+    fn killThreadTimer(timer_id: *?UINT_PTR) void {
+        const id = timer_id.* orelse return;
+        _ = sys.KillTimer(null, id);
+        timer_id.* = null;
     }
 
     pub fn run(self: *App) !void {
@@ -3336,31 +3532,13 @@ pub const App = struct {
         // instances' attempts, this one is no longer the last in memory.
         var initial_windows_created = false;
         errdefer if (!initial_windows_created) self.markRecoveryOpenGLUnavailable();
-        if (!self.embedding_mode and self.config.@"launch-layout" != null) {
-            const name = self.config.@"launch-layout".?;
-            // An explicit CLI layout request is honored even when
-            // `initial-window` is disabled, because the user asked for this
-            // exact window. It is also one-shot: later ordinary new-window
-            // actions must not inherit and replay it from the app config.
-            const launched = self.launchNamedLayout(name, null);
-            self.config.@"launch-layout" = null;
-            // Clearing the field is not enough: `finalize` -> `loadTheme` and
-            // `changeConditionalState` replay `_replay_steps` through
-            // `loadIter`, and a per-window clone inherits that history, so a
-            // surviving startup step would turn a later ordinary new window
-            // into a layout launch.
-            _ = self.config.dropLaunchLayoutReplaySteps(0);
-            if (!launched) {
-                // Handled, as for a skipped restore window.
-                gl_startup.clearOpenGLStartupFailure();
-                try self.createWindow(default_title);
-                if (self.primarySurface()) |surface| if (surface.host) |host| {
-                    host.setBanner(.err, "Layout could not be opened.") catch {};
-                };
-            }
-        } else if (!self.embedding_mode and self.config.@"initial-window") {
+        if (self.embedding_mode) {
+            // Every window comes from a terminal handoff.
+        } else if (try self.openStartupLaunchLayout()) {
+            // The command line's layout, or the window saying it failed.
+        } else if (self.config.@"initial-window") {
             // Ownership starts only once the first window exists: a launch
-            // that fails here must not delete, on its way out, the session
+            // that fails here must not save over, on its way out, the session
             // it could not bring back, and a save while restore is half done
             // would keep only the windows restored so far.
             const owner_lock = if (self.sessionRestoreEligible()) self.acquireSessionOwnerLock() else null;
@@ -3373,7 +3551,7 @@ pub const App = struct {
                     if (surface.host) |host| _ = host.toggleProfileOverlay();
                 }
             }
-        } else if (!self.embedding_mode) {
+        } else {
             log.info("initial-window is disabled; win32 runtime waiting without a window", .{});
         }
         initial_windows_created = true;
@@ -3391,13 +3569,10 @@ pub const App = struct {
 
         if (!self.embedding_mode) self.initializeJumpList();
         if (!self.embedding_mode) self.scheduleGlobalHotkeySync();
-        if (!self.embedding_mode and self.global_hotkeys_dirty and self.windows.items.len == 0) {
-            self.global_hotkeys_dirty = false;
-            self.syncGlobalHotkeys() catch |err| {
-                log.err("failed to sync win32 global hotkeys err={}", .{err});
-            };
+        if (!self.embedding_mode and self.windows.items.len == 0) {
+            self.syncDirtyGlobalHotkeys();
+            self.startQuitTimer();
         }
-        if (!self.embedding_mode and self.windows.items.len == 0) self.startQuitTimer();
 
         // Initial window creation must not start a check until the swapped
         // build is healthy and authoritative. Later windows retain the usual
@@ -3512,31 +3687,23 @@ pub const App = struct {
                         continue;
                     }
                 }
-                if (self.program_status_notify_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.flushProgramStatusNotifications();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.program_status_notify_timer_id)) {
+                    self.flushProgramStatusNotifications();
+                    continue;
                 }
-                if (self.session_checkpoint_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.onSessionCheckpointTimer();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.session_checkpoint_timer_id)) {
+                    self.onSessionCheckpointTimer();
+                    continue;
                 }
-                if (self.update_recheck_timer_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.onUpdateRecheckTimer();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.update_recheck_timer_id)) {
+                    self.onUpdateRecheckTimer();
+                    continue;
                 }
-                if (self.profile_discovery_watchdog_id) |timer_id| {
-                    if (@intFromPtr(msg.hwnd) == 0 and msg.wParam == timer_id) {
-                        self.stopProfileDiscoveryWatchdog();
-                        const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
-                        if ((pending or self.anyHostRequestedProfiles()) and self.hosts.items.len > 0) self.startProfileDiscovery();
-                        continue;
-                    }
+                if (threadTimerFired(&msg, self.profile_discovery_watchdog_id)) {
+                    self.stopProfileDiscoveryWatchdog();
+                    const pending = if (self.jump_list) |*jump_list| jump_list.startupProfileDiscoveryPending() else false;
+                    if ((pending or self.anyHostRequestedProfiles()) and self.hosts.items.len > 0) self.startProfileDiscovery();
+                    continue;
                 }
             }
 
@@ -3570,14 +3737,21 @@ pub const App = struct {
             _ = sys.TranslateMessage(&msg);
             _ = sys.DispatchMessageW(&msg);
 
-            self.syncDirtyGlobalHotkeys();
-            try self.tickCoreApp();
-
-            if (!self.running and self.windows.items.len == 0) break;
+            if (try self.finishLoopStep()) break;
         }
     }
 
+    /// What the message loop does after it dispatched a message: sync the
+    /// global hotkeys if they changed, then tick the core. Returns whether
+    /// the loop should exit.
+    fn finishLoopStep(self: *App) !bool {
+        self.syncDirtyGlobalHotkeys();
+        try self.tickCoreApp();
+        return !self.running and self.windows.items.len == 0;
+    }
+
     pub fn terminate(self: *App) void {
+        defer self.settings_open_trace.deinit();
         self.stopUndoPruneTimer();
         self.stopQuitTimer();
         self.stopTerminalHandoffIdleTimer();
@@ -3591,9 +3765,9 @@ pub const App = struct {
         }
         self.unregisterGlobalHotkeys();
         ipc_server.stopIpcServer(self);
-        if (!self.session_state_saved_before_last_host_close or self.hosts.items.len > 0) {
-            _ = self.saveSessionState(.final);
-        }
+        // Windows still open at exit. After a quit or the last window's own
+        // close there are none: they saved as they went.
+        if (self.hasSessionWindows()) self.saveSessionAsItEnds();
         self.releaseSessionOwnership();
         self.destroyAllWindows();
         if (self.shell_runtime_initialized) {
@@ -3654,6 +3828,8 @@ pub const App = struct {
             self.core_app.alloc.free(path);
             self.startup_cwd = null;
         }
+        // Still set when `run` forwarded the launch or never got that far.
+        self.releaseStartupLaunchLayout();
         deinitImeWindowFormsTracePath(self.core_app.alloc);
         self.config.deinit();
         if (self.com_initialized) {
@@ -3710,6 +3886,12 @@ pub const App = struct {
         return self.localAppDataPath("session-state.json");
     }
 
+    /// Resolve `%LOCALAPPDATA%\noctty\startup-attempts.json`, the recovery
+    /// ledger. Caller frees with `core_app.alloc`.
+    fn recoveryLedgerPath(self: *const App) ?[]u8 {
+        return self.localAppDataPath("startup-attempts.json");
+    }
+
     fn namedLayoutPath(self: *const App, name: []const u8) ![]u8 {
         const relative = try win32_layouts.relativePathAlloc(self.core_app.alloc, name);
         defer self.core_app.alloc.free(relative);
@@ -3722,8 +3904,8 @@ pub const App = struct {
 
     fn sessionStateEnabled(self: *const App) bool {
         // Only the owner, the process that was eligible to restore the saved
-        // session and then got its first window, may replace or delete it.
-        // The restore policy is re-checked so a config reload
+        // session and then got its first window, may replace it or move it
+        // aside. The restore policy is re-checked so a config reload
         // (window-save-state = never) still stops it.
         return self.session_owner != null and self.sessionRestoreEligible();
     }
@@ -3774,7 +3956,7 @@ pub const App = struct {
         // an empty window list here says nothing about what the user closed.
         // Latched even when the save fails: any later save would come from
         // panes closing as their shells die, and could only shrink the
-        // previous snapshot or, from `terminate` with no hosts, delete it.
+        // previous snapshot or move it aside as a restore nobody used.
         _ = self.saveSessionState(.checkpoint);
         self.session_ending = true;
     }
@@ -3808,10 +3990,7 @@ pub const App = struct {
     }
 
     fn stopSessionCheckpointTimer(self: *App) void {
-        if (self.session_checkpoint_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.session_checkpoint_timer_id = null;
-        }
+        killThreadTimer(&self.session_checkpoint_timer_id);
     }
 
     fn onSessionCheckpointTimer(self: *App) void {
@@ -4137,7 +4316,7 @@ pub const App = struct {
         } orelse return false;
         defer parsed.deinit();
 
-        const ledger_path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json");
+        const ledger_path = self.recoveryLedgerPath();
         defer if (ledger_path) |value| self.core_app.alloc.free(value);
         if (ledger_path) |value| {
             markRecoveryAttemptAtPath(self.core_app.alloc, value, &self.recovery_startup, .{ .session_restore = unixMillis() });
@@ -4164,6 +4343,9 @@ pub const App = struct {
                 gl_startup.clearOpenGLStartupFailure();
             }
         }
+        // From here on, input that reaches a running program, or a terminal
+        // opening, uses the session.
+        self.restored_session_untouched = restored;
 
         return restored;
     }
@@ -4300,6 +4482,15 @@ pub const App = struct {
         );
     }
 
+    /// The `render` action for one surface: request a repaint, drain the
+    /// terminal output its accessibility session waits for, and tell that
+    /// session the renderer updated.
+    fn renderSurface(self: *App, surface: *Surface) !void {
+        try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
+        surface.drainTerminalAccessibilityOutput();
+        if (surface.terminal_accessibility) |session| session.rendererUpdated();
+    }
+
     test "a failed new window request leaves the app running and the mailbox draining" {
         if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -4414,7 +4605,7 @@ pub const App = struct {
     /// restore markers. A crash, inside any renderer, never gets here.
     fn markRecoveryOpenGLUnavailable(self: *App) void {
         if (!gl_startup.openGLStartupFailed()) return;
-        const path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json") orelse return;
+        const path = self.recoveryLedgerPath() orelse return;
         defer self.core_app.alloc.free(path);
         markRecoveryAttemptAtPath(self.core_app.alloc, path, &self.recovery_startup, .{ .opengl_unavailable = unixMillis() });
     }
@@ -4427,7 +4618,7 @@ pub const App = struct {
         const memory_attempts = self.recovery_startup.attempts[0..self.recovery_startup.count];
         const target_started_at = memory_attempts[memory_attempts.len - 1].started_at_unix_ms;
         if (memory_attempts[memory_attempts.len - 1].ready_at_unix_ms != null) return;
-        const path = localAppDataPathAlloc(self.core_app.alloc, "startup-attempts.json") orelse return;
+        const path = self.recoveryLedgerPath() orelse return;
         defer self.core_app.alloc.free(path);
 
         // The disk read and the replace below are one transaction against
@@ -4508,6 +4699,17 @@ pub const App = struct {
         restored_host.active_tab = @min(window.selected_tab, restored_host.tabs.items.len - 1);
         const active_tab = &restored_host.tabs.items[restored_host.active_tab];
         const selected = active_tab.focusedSurface() orelse window_surface orelse return error.EmptyTabs;
+        // `maximize` and `fullscreen` apply to a restored window too (#496),
+        // and a launched layout, which has no saved state, takes them as any
+        // new window does. The window has its saved rect by now (as the rect
+        // it returns to, if a minimized launch minimized it), so that is the
+        // normal rect it returns to.
+        const start = WindowStart.fromConfig(&self.config);
+        selected.applyWindowStart(start);
+        // Fullscreen is kept per surface, and every tab shares the window's.
+        if (start.fullscreen and selected.fullscreen) self.syncHostWindowState(selected) catch |err| {
+            log.warn("win32 session restore: fullscreen sync failed err={}", .{err});
+        };
         transaction.commit();
         return selected;
     }
@@ -4744,6 +4946,8 @@ pub const App = struct {
             .tab_insert_index = if (host != null and tab_surface == null) tab_index else null,
             .clone_state_from = tab_surface,
             .split_direction = split_direction,
+            // `restoreSessionWindow` applies them once the window is placed.
+            .config_window_start = false,
         });
         transaction.noteSurface(surface);
 
@@ -4800,38 +5004,47 @@ pub const App = struct {
             const works = WorkAreas.collect();
             const dpi_before = sys.GetDpiForWindow(hwnd);
             var target = restoredRectOnScreen(saved, works.slice(), restore_grab);
-            // The rect is in the pixels of the monitor it was saved on, and is
-            // where the window goes: a crossing from the monitor the host was
-            // created on must not swap in the DPI suggestion's rescaled size.
-            host.restore_placing = true;
-            defer host.restore_placing = false;
-            for (0..3) |attempt| {
-                if (sys.SetWindowPos(
-                    hwnd,
-                    null,
-                    target.left,
-                    target.top,
-                    target.right - target.left,
-                    target.bottom - target.top,
-                    c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-                ) == 0) return lastError();
-                // Windows caps what it is given (a left edge to 16 bits, a
-                // width to the largest window), so whether the title bar can
-                // be reached is judged on the rect the window ended up with.
-                var actual: RECT = undefined;
-                if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
-                const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
-                if (!rectEqual(moved, actual)) {
-                    if (attempt == 2) {
-                        log.warn("win32 session restore: window stayed off every monitor", .{});
-                        break;
+            if (sys.IsIconic(hwnd) != 0) {
+                // A launch that asked for a minimized window (`start /min`,
+                // a shortcut set to Run: Minimized) has Windows minimize the
+                // first window's first show. SetWindowPos on a minimized
+                // window moves its icon, and it would come back from the
+                // taskbar where it was created: give it the rect to return to.
+                try setMinimizedNormalRect(hwnd, target);
+            } else {
+                // The rect is in the pixels of the monitor it was saved on, and is
+                // where the window goes: a crossing from the monitor the host was
+                // created on must not swap in the DPI suggestion's rescaled size.
+                host.restore_placing = true;
+                defer host.restore_placing = false;
+                for (0..3) |attempt| {
+                    if (sys.SetWindowPos(
+                        hwnd,
+                        null,
+                        target.left,
+                        target.top,
+                        target.right - target.left,
+                        target.bottom - target.top,
+                        c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                    ) == 0) return lastError();
+                    // Windows caps what it is given (a left edge to 16 bits, a
+                    // width to the largest window), so whether the title bar can
+                    // be reached is judged on the rect the window ended up with.
+                    var actual: RECT = undefined;
+                    if (sys.GetWindowRect(hwnd, &actual) == 0) return lastError();
+                    const moved = restoredRectOnScreen(actual, works.slice(), restore_grab);
+                    if (!rectEqual(moved, actual)) {
+                        if (attempt == 2) {
+                            log.warn("win32 session restore: window stayed off every monitor", .{});
+                            break;
+                        }
+                        target = moved;
+                        continue;
                     }
-                    target = moved;
-                    continue;
+                    // The layout that follows a DPI change can resize it once
+                    // more: apply the same rect again once.
+                    if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
                 }
-                // The layout that follows a DPI change can resize it once
-                // more: apply the same rect again once.
-                if (sys.GetDpiForWindow(hwnd) == dpi_before or rectEqual(actual, target)) break;
             }
         }
         if ((window.state orelse .normal) == .maximized) {
@@ -4839,10 +5052,69 @@ pub const App = struct {
         }
     }
 
-    /// `.final` is the owner's save as its windows close: closing every
-    /// one ends the session, so an empty snapshot deletes the file. A
-    /// `.checkpoint` taken while the app keeps running never deletes, and
-    /// leaves alone the snapshot a last-host close already took.
+    /// Whether a window holds tabs the session records (`hostSessionTabs`).
+    /// The quick terminal and a window kept empty for undo hold none.
+    fn hasSessionWindows(self: *const App) bool {
+        for (self.hosts.items) |host| {
+            if (hostSessionTabs(host).len > 0) return true;
+        }
+        return false;
+    }
+
+    /// Whether `host` is the session's last window: it holds session tabs
+    /// and no other window does.
+    fn closingEndsSession(self: *const App, host: *const Host) bool {
+        if (hostSessionTabs(host).len == 0) return false;
+        for (self.hosts.items) |other| {
+            if (other != host and hostSessionTabs(other).len > 0) return false;
+        }
+        return true;
+    }
+
+    /// Save the session as it ends, while its windows are whole: teardown
+    /// frees their panes' strings before `windowDestroyed`. The saved
+    /// session is what was open, however it ended, unless that was only a
+    /// restore that failed (`setAsideFailedRestore`). A caller whose close
+    /// rolls back clears the flag again.
+    fn saveSessionAsItEnds(self: *App) void {
+        self.session_state_saved_before_last_host_close = true;
+        if (self.sessionIsFailedRestore()) return self.setAsideFailedRestore();
+        if (builtin.is_test) self.test_session_saves_as_it_ends += 1;
+        _ = self.saveSessionState(.final);
+    }
+
+    /// Whether the session is a restore that failed: the startup restore
+    /// brought it back, nothing has used it since, and every program it
+    /// shows has ended by itself. Saving it back would restore the same dead
+    /// panes at every launch.
+    fn sessionIsFailedRestore(self: *const App) bool {
+        if (!self.restored_session_untouched) return false;
+        var panes: usize = 0;
+        for (self.hosts.items) |host| for (hostSessionTabs(host)) |tab| {
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| : (panes += 1) {
+                if (!entry.view.programEnded()) return false;
+            }
+        };
+        return panes > 0;
+    }
+
+    /// The session ends as a restore that failed. Saving it back would open
+    /// and close it again at every launch, so the saved session is moved
+    /// aside instead (`setAsideSessionStateAt`) and the next launch starts
+    /// fresh. A rename, never a delete or a replace. Not at a sign-out,
+    /// which ends the programs itself.
+    fn setAsideFailedRestore(self: *App) void {
+        if (self.session_ending) return;
+        if (builtin.is_test) self.test_failed_restores_set_aside += 1;
+        if (self.session_state_excluded_for_elevation or !self.sessionStateEnabled()) return;
+        const path = self.sessionStatePath() orelse return;
+        defer self.core_app.alloc.free(path);
+        _ = setAsideSessionStateAt(self.core_app.alloc, path);
+    }
+
+    /// `.final` is the owner's save as the session ends; a `.checkpoint`
+    /// leaves alone the snapshot `saveSessionAsItEnds` already took.
     fn saveSessionState(self: *const App, kind: SessionSaveKind) bool {
         if (self.session_state_excluded_for_elevation) return false;
         if (!self.sessionStateEnabled()) return false;
@@ -4851,7 +5123,19 @@ pub const App = struct {
         if (kind == .checkpoint and self.session_state_saved_before_last_host_close) return false;
         const path = self.sessionStatePath() orelse return false;
         defer self.core_app.alloc.free(path);
+        return self.writeSessionStateAt(path);
+    }
 
+    /// Write the session's windows to `path`. With none to write, writes
+    /// nothing and leaves the file as it is: every way the last window goes
+    /// saves it first, so an empty snapshot says only that nothing is open,
+    /// not what to restore, and a delete could not be taken back. Nor does
+    /// it write a restore that failed (`sessionIsFailedRestore`): the file
+    /// holds that session already, or held it until `setAsideFailedRestore`
+    /// moved it, and writing it again (a checkpoint after an undo) would
+    /// bring it back for the next launch, or fill another set-aside slot.
+    fn writeSessionStateAt(self: *const App, path: []const u8) bool {
+        if (self.sessionIsFailedRestore()) return false;
         const scrollback_lines: usize = self.config.@"window-save-state-scrollback";
         for ([_]usize{ scrollback_lines, 0 }, 0..) |attempt_lines, attempt_index| {
             if (attempt_index == 1) {
@@ -4866,7 +5150,7 @@ pub const App = struct {
                 log.warn("win32 session save: snapshot failed scrollback_lines={d} err={}", .{ attempt_lines, err });
                 continue;
             };
-            if (state.windows.len == 0) return removeEmptySessionState(path, kind);
+            if (state.windows.len == 0) return false;
 
             const encoded = win32_session_state.encodeAlloc(self.core_app.alloc, state) catch |err| {
                 log.warn("win32 session save: encode failed scrollback_lines={d} err={}", .{ attempt_lines, err });
@@ -5221,6 +5505,25 @@ pub const App = struct {
     /// the taskbar this machine lacks.
     fn sessionWindowPlacementOn(host: *Host, monitor: ?MONITORINFO) ?SessionWindowPlacement {
         const hwnd = host.hwnd orelse return null;
+        // The session does not record fullscreen, so a fullscreen window is
+        // saved as the window leaving fullscreen gives back. Read as it is,
+        // it is a normal window over its whole monitor (its style drops
+        // WS_MAXIMIZE), and that is what it came back as, every time with
+        // `fullscreen = true`.
+        if (host.activeSurface()) |surface| if (surface.fullscreen) {
+            if (surface.fullscreenReturn(hwnd)) |back| {
+                const maximized = back.placement.showCmd == c.SW_MAXIMIZE;
+                var rect = back.rect;
+                if (maximized) {
+                    rect = back.placement.rcNormalPosition;
+                    if (monitor orelse back.monitor) |info| rect = workspaceRectToScreen(rect, info);
+                }
+                if (rect.right <= rect.left or rect.bottom <= rect.top) return .{ .rect = null, .maximized = maximized };
+                return .{ .rect = rect, .maximized = maximized };
+            } else |err| {
+                log.warn("win32 session save: fullscreen window placement failed err={}", .{err});
+            }
+        };
         var maximized = sys.IsZoomed(hwnd) != 0;
         var rect: RECT = undefined;
         if (maximized or sys.IsIconic(hwnd) != 0) {
@@ -5430,10 +5733,7 @@ pub const App = struct {
     }
 
     fn stopUpdateRecheckTimer(self: *App) void {
-        if (self.update_recheck_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.update_recheck_timer_id = null;
-        }
+        killThreadTimer(&self.update_recheck_timer_id);
     }
 
     /// Applying a staged update sets `running = false` first; nothing is left
@@ -5671,10 +5971,7 @@ pub const App = struct {
     }
 
     fn stopProfileDiscoveryWatchdog(self: *App) void {
-        if (self.profile_discovery_watchdog_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.profile_discovery_watchdog_id = null;
-        }
+        killThreadTimer(&self.profile_discovery_watchdog_id);
     }
 
     fn applyPendingProfileDiscovery(self: *App) void {
@@ -5775,14 +6072,7 @@ pub const App = struct {
             self.setUpdateNotice(release.version_text, release.release_url, completion.staged) catch |err| {
                 log.warn("failed to surface update notice err={}", .{err});
             };
-            if (completion.manual_message) |message| {
-                self.showUpdateInfo(.info, message) catch |err| {
-                    log.warn("failed to show updater status message err={}", .{err});
-                };
-            }
-            return;
         }
-
         if (completion.manual_message) |message| {
             self.showUpdateInfo(.info, message) catch |err| {
                 log.warn("failed to show updater status message err={}", .{err});
@@ -5926,39 +6216,28 @@ pub const App = struct {
             release_feed_url,
             expected_kind,
         ) catch |err| {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(err);
             return err;
         };
         defer staged.deinit(self.core_app.alloc);
 
         const install_dir = currentInstallDir(self.core_app.alloc) catch |err| {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(err);
             return err;
         };
         defer self.core_app.alloc.free(install_dir);
 
         if (staged.kind == .portable) {
             updatepkg.recordPortableApplyPending(self.core_app.alloc, state_path, 0) catch |err| {
-                self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
-                    log.warn("failed to show updater apply failure err={}", .{banner_err});
-                };
+                self.showUpdateApplyFailure(err);
                 return err;
             };
-            self.stopQuitTimer();
-            self.running = false;
-            self.destroyAllWindows();
-            if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+            self.quitConfirmed();
             return;
         }
 
         if (!internal_os.windows.isInstallerManagedInstallDir(install_dir)) {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(error.InvalidInstallPath)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(error.InvalidInstallPath);
             return error.InvalidInstallPath;
         }
 
@@ -5987,9 +6266,7 @@ pub const App = struct {
             c.SW_SHOW,
         );
         if (@intFromPtr(result) <= 32) {
-            self.showUpdateInfo(.err, updateApplyFailureMessage(error.UpdateApplyLaunchFailed)) catch |banner_err| {
-                log.warn("failed to show updater apply failure err={}", .{banner_err});
-            };
+            self.showUpdateApplyFailure(error.UpdateApplyLaunchFailed);
             return error.UpdateApplyLaunchFailed;
         }
 
@@ -5997,10 +6274,14 @@ pub const App = struct {
             log.warn("failed to record updater apply request after launch err={}", .{err});
         };
 
-        self.stopQuitTimer();
-        self.running = false;
-        self.destroyAllWindows();
-        if (self.windows.items.len == 0) sys.PostQuitMessage(0);
+        self.quitConfirmed();
+    }
+
+    /// Say in the banner why Install or Apply could not go ahead.
+    fn showUpdateApplyFailure(self: *App, err: anyerror) void {
+        self.showUpdateInfo(.err, updateApplyFailureMessage(err)) catch |banner_err| {
+            log.warn("failed to show updater apply failure err={}", .{banner_err});
+        };
     }
 
     /// Install quits the app and nothing watches Setup, so the next start is
@@ -6148,10 +6429,7 @@ pub const App = struct {
     }
 
     fn stopQuitTimer(self: *App) void {
-        if (self.quit_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.quit_timer_id = null;
-        }
+        killThreadTimer(&self.quit_timer_id);
     }
 
     fn startTerminalHandoffIdleTimer(self: *App) void {
@@ -6165,10 +6443,7 @@ pub const App = struct {
     }
 
     fn stopTerminalHandoffIdleTimer(self: *App) void {
-        if (self.terminal_handoff_idle_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.terminal_handoff_idle_timer_id = null;
-        }
+        killThreadTimer(&self.terminal_handoff_idle_timer_id);
     }
 
     /// Decide whether the embedding-mode server may exit, and close the race
@@ -6231,10 +6506,7 @@ pub const App = struct {
     }
 
     fn stopRecoveryRetryTimer(self: *App) void {
-        if (self.recovery_retry_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.recovery_retry_timer_id = null;
-        }
+        killThreadTimer(&self.recovery_retry_timer_id);
     }
 
     /// The retry timer fired: this is the tick the deadline was holding out
@@ -6248,10 +6520,7 @@ pub const App = struct {
     }
 
     fn stopUndoPruneTimer(self: *App) void {
-        if (self.undo_prune_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.undo_prune_timer_id = null;
-        }
+        killThreadTimer(&self.undo_prune_timer_id);
     }
 
     fn undoTimeoutMs(self: *const App) u64 {
@@ -6430,6 +6699,7 @@ pub const App = struct {
                 const source = self.newWindowSource(target);
                 _ = self.createWindowSurface(&config, default_title, .{
                     .clone_state_from = source,
+                    .forwarded_arguments = forwarded_arguments,
                 }) catch |err| {
                     // A request forwarded by another process was acknowledged
                     // when it was queued, so say here that nothing opened.
@@ -6581,12 +6851,11 @@ pub const App = struct {
                             !self.config.@"background-blur".win32BlurRequested();
                         // CLI launch-layout is a one-shot startup/new-window
                         // request. Config reload reparses the original argv, so
-                        // strip it before installing the long-lived app config
-                        // -- both the parsed field and the replay step, since
-                        // a later theme or conditional-state reload would
-                        // otherwise put it back.
-                        config.@"launch-layout" = null;
-                        _ = config.dropLaunchLayoutReplaySteps(0);
+                        // strip it before installing the long-lived app config.
+                        // The startup request itself is not here to lose:
+                        // `init` moved it to `startup_launch_layout` before its
+                        // color-scheme sync, the first change to arrive here.
+                        forgetLaunchLayout(&config);
                         // Palette theme preview owns a reversible baseline
                         // around the app-global config. An external/settings
                         // config change supersedes that transaction: dismiss
@@ -6673,33 +6942,18 @@ pub const App = struct {
                 // silently swapping the config source on every manual
                 // reload. Scoped to this path — non-reload code keeps
                 // seeing the sanitized cwd.
-                const cwd_before: ?[]u8 = std.process.getCwdAlloc(self.core_app.alloc) catch null;
-                defer if (cwd_before) |p| self.core_app.alloc.free(p);
-
-                // `defer` + flag so the restore fires even when
+                //
+                // The restore is deferred so it fires even when
                 // `Config.load` returns an error — otherwise a
                 // broken include leaves the process pinned to
                 // `startup_cwd` (same class of bug as the one
                 // fixed in `settingsSaveAndReload`). Relative-path
                 // lookups + child processes spawned after a failed
-                // reload would inherit the wrong cwd.
-                var did_chdir_to_startup: bool = false;
-                if (self.startup_cwd) |cwd| {
-                    if (std.process.changeCurDir(cwd)) |_| {
-                        did_chdir_to_startup = true;
-                    } else |err| {
-                        std.log.warn("reload_config: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
-                    }
-                }
-                defer {
-                    if (did_chdir_to_startup) {
-                        if (cwd_before) |cwd| {
-                            std.process.changeCurDir(cwd) catch |err| {
-                                std.log.warn("reload_config: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                            };
-                        }
-                    }
-                }
+                // reload would inherit the wrong cwd. It runs at the
+                // end of this arm, after the config is applied, as it
+                // always has here.
+                var startup_cwd = self.enterStartupCwd();
+                defer startup_cwd.restore();
 
                 var config = try configpkg.Config.load(self.core_app.alloc);
                 defer config.deinit();
@@ -6898,17 +7152,11 @@ pub const App = struct {
             .render => {
                 return switch (target) {
                     .app => blk: {
-                        for (self.windows.items) |surface| {
-                            try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
-                            surface.drainTerminalAccessibilityOutput();
-                            if (surface.terminal_accessibility) |session| session.rendererUpdated();
-                        }
+                        for (self.windows.items) |surface| try self.renderSurface(surface);
                         break :blk true;
                     },
                     .surface => if (self.findSurfaceForTarget(target)) |surface| blk: {
-                        try surface.requestRepaintWithMode(self.rendererRepaintModeThisTick(surface.host));
-                        surface.drainTerminalAccessibilityOutput();
-                        if (surface.terminal_accessibility) |session| session.rendererUpdated();
+                        try self.renderSurface(surface);
                         break :blk true;
                     } else false,
                 };
@@ -7231,6 +7479,7 @@ pub const App = struct {
             },
 
             .open_config => {
+                self.settings_open_trace.note(.open_config_action);
                 try self.openConfig();
                 return true;
             },
@@ -7449,6 +7698,7 @@ pub const App = struct {
                     .focused, .window_id => return error.InvalidAutomationTarget,
                 } orelse return error.AutomationTargetNotFound;
                 if (!automationTextAllowed(value.text)) return error.AutomationPolicyRefused;
+                surface.noteProgramInput();
 
                 const text_z = try self.core_app.alloc.dupeZ(u8, value.text);
                 defer self.core_app.alloc.free(text_z);
@@ -8255,7 +8505,8 @@ pub const App = struct {
                 if (host.hwnd != null and (host.chrome_brush == null or
                     host.overlay_brush == null or host.edit_brush == null or
                     host.chrome_font == null or host.preview_font == null or
-                    host.titlebar_caption_icon_font == null or host.titlebar_action_icon_font == null or
+                    (!host.titlebar_icons_geometric and
+                        (host.titlebar_caption_icon_font == null or host.titlebar_action_icon_font == null)) or
                     // The search font stays lazy. Only a failed attempt, not
                     // its intentionally unused state, needs another chance.
                     (host.search_icon_font_resolved and host.search_icon_font == null))) break true;
@@ -8283,6 +8534,8 @@ pub const App = struct {
         for (self.hosts.items) |host| {
             host.rebuildThemeBrushes();
             host.recreateChromeFont();
+            // High Contrast turns the split dim off and back on.
+            host.syncSplitDim();
             if (frame_mode_changed) {
                 // A stock<->integrated frame flip can cancel the old
                 // NC hover tracking without delivering
@@ -8541,7 +8794,14 @@ pub const App = struct {
         };
     }
 
-    fn createHost(self: *App, title: LPCWSTR, clone_state_from: ?*const Surface, quick_terminal: bool) !*Host {
+    /// A hidden top-level window for the window `Surface.init` creates with
+    /// `config` and `opts`: placed and decorated as that window's own config
+    /// says (a forwarded launch's keys included, see `WindowKeeps`), or as
+    /// the window it is opened from.
+    fn createHost(self: *App, title: LPCWSTR, config: *const configpkg.Config, opts: SurfaceInitOptions) !*Host {
+        const clone_state_from = opts.clone_state_from;
+        const quick_terminal = opts.quick_terminal;
+        const keeps = WindowKeeps.forNewSurface(config, opts);
         try self.ensureHostWindowClass();
         try self.ensurePaletteListClass();
         try self.ensureScrollbarClass();
@@ -8563,10 +8823,12 @@ pub const App = struct {
             try appendOwnedString(self.core_app.alloc, &host.selected_profile_key, key);
         }
 
-        const position = configuredHostWindowPosition(&self.config);
-        const startup_decorations_visible = initialDecorationsVisibleForSource(&self.config, clone_state_from);
+        const position = configuredHostWindowPosition(config);
+        const startup_decorations_visible = Surface.initialDecorationsVisible(config, opts);
         host.cached_decorations_visible = startup_decorations_visible;
-        const startup_fullscreen = if (clone_state_from) |source| source.fullscreen else false;
+        // A window with a size of its own starts framed, so core init sizes
+        // the window it leaves fullscreen to.
+        const startup_fullscreen = if (clone_state_from) |source| source.fullscreen and !keeps.size else false;
         const keeps_frame = startup_decorations_visible or undecoratedKeepsFrame(self.os_build, quick_terminal);
         const startup_style = startupHostWindowStyle(keeps_frame, startup_fullscreen);
 
@@ -8622,7 +8884,7 @@ pub const App = struct {
         }
         if (self.jump_list) |*jump_list| jump_list.scheduleIfStartupPending();
         if (clone_state_from) |source| {
-            if (source.host) |existing| try self.inheritHostWindowState(host, existing);
+            if (source.host) |existing| try self.inheritHostWindowState(host, existing, keeps.position);
         }
 
         host.power_notifications = win32_power.Notifications.init(hwnd);
@@ -8817,15 +9079,9 @@ pub const App = struct {
         return null;
     }
 
-    fn activeTab(host: *Host) ?*Tab {
-        if (host.tabs.items.len == 0 or host.active_tab >= host.tabs.items.len) return null;
-        return &host.tabs.items[host.active_tab];
-    }
-
     fn activeSurfaceForHost(self: *App, host_id: u32) ?*Surface {
         const host = self.findHostById(host_id) orelse return null;
-        const tab = activeTab(host) orelse return null;
-        return tab.focusedSurface();
+        return host.activeSurface();
     }
 
     fn findSurfaceById(self: *App, surface_id: u64) ?*Surface {
@@ -8861,11 +9117,12 @@ pub const App = struct {
         return false;
     }
 
-    fn inheritHostWindowState(self: *App, destination: *Host, source: *Host) !void {
+    /// `positioned`: `WindowKeeps.position`.
+    fn inheritHostWindowState(self: *App, destination: *Host, source: *Host, positioned: bool) !void {
         const dst_hwnd = destination.hwnd orelse return;
         const src_hwnd = source.hwnd orelse return;
         const fullscreen = if (source.activeSurface()) |surface| surface.fullscreen else false;
-        const placed = try newWindowPlacement(self, src_hwnd, fullscreen, dst_hwnd);
+        const placed = try newWindowPlacement(self, src_hwnd, fullscreen, dst_hwnd, null);
         if (sys.SetWindowPos(
             dst_hwnd,
             null,
@@ -8873,7 +9130,7 @@ pub const App = struct {
             placed.rect.top,
             placed.rect.right - placed.rect.left,
             placed.rect.bottom - placed.rect.top,
-            newWindowSetPosFlags(&self.config, placed),
+            newWindowSetPosFlags(positioned, false, placed),
         ) == 0) {
             return lastError();
         }
@@ -9169,6 +9426,7 @@ pub const App = struct {
                 surface.window_focused,
             );
             if (found.tab.focused != handle) found.tab.focused = handle;
+            found.host.syncSplitDim();
             if (!needs_host_sync) {
                 surface.presentWindow();
                 self.commitShellSurfaceFocus(surface);
@@ -9256,6 +9514,7 @@ pub const App = struct {
                 if (window.active_tab) |active| if (active.eql(tab_id)) {
                     host.active_tab = index;
                 };
+                host.syncSplitDim();
                 return;
             }
             return;
@@ -9305,11 +9564,7 @@ pub const App = struct {
                         return surface;
                     }
                 }
-                if (activeTab(host)) |tab| {
-                    if (tab.focusedSurface()) |surface| {
-                        return surface;
-                    }
-                }
+                if (host.activeSurface()) |surface| return surface;
             }
         }
 
@@ -9353,6 +9608,7 @@ pub const App = struct {
                 surface.window_visible,
             );
             if (found.tab.focused != handle) found.tab.focused = handle;
+            found.host.syncSplitDim();
             if (!needs_host_sync) {
                 surface.setVisible(true);
                 self.commitShellSurfaceActivation(surface);
@@ -9382,6 +9638,7 @@ pub const App = struct {
         found.host.active_tab = found.index;
         found.host.notifyActiveTabUiaSelectionChanged(previous_tab_id);
         found.tab.focused = handle;
+        found.host.syncSplitDim();
         self.commitShellSurfaceFocus(surface);
         runUiActionOrLog("input mode focus sync failed", found.host.refreshModeIndicator());
         return changed;
@@ -9393,7 +9650,7 @@ pub const App = struct {
         defer host_surfaces.deinit(self.core_app.alloc);
         for (host_surfaces.items) |candidate| {
             if (candidate == source) continue;
-            try candidate.inheritWindowStateFrom(source);
+            try candidate.inheritWindowStateFrom(source, .{});
         }
     }
 
@@ -9519,7 +9776,7 @@ pub const App = struct {
                 // A close never restores, raises or takes focus from a
                 // window the user is not looking at, and moves focus only
                 // when the pane that had it closed.
-                if (activeTab(host)) |tab| if (tab.focusedSurface()) |replacement| {
+                if (host.activeTab()) |tab| if (tab.focusedSurface()) |replacement| {
                     if (was_active_surface and tabSeenByUser(host, host.active_tab))
                         self.activateSurface(replacement)
                     else
@@ -9708,7 +9965,18 @@ pub const App = struct {
     /// nothing: `closeTab` decides whether the close needs a prompt first.
     fn closeTabUndoable(self: *App, host: *Host, current_idx: usize) !bool {
         const previous_active = host.active_tab;
-        const entry = host.detachTabForUndo(current_idx) orelse return false;
+        // The session's last tab: saved now, as its window's close would save
+        // it, and not left to the empty window's undo expiry. Undo history is
+        // never saved; an undo reopens the session (`restoreClosedTabEntry`).
+        const saved_here = host.tabs.items.len == 1 and self.closingEndsSession(host);
+        if (saved_here) self.saveSessionAsItEnds();
+        errdefer if (saved_here) {
+            self.session_state_saved_before_last_host_close = false;
+        };
+        const entry = host.detachTabForUndo(current_idx) orelse {
+            if (saved_here) self.session_state_saved_before_last_host_close = false;
+            return false;
+        };
         const stored_entry = host.pushStructuralUndo(entry) catch |err| {
             log.warn("close_tab undo snapshot failed err={}", .{err});
             var failed = entry;
@@ -10162,10 +10430,7 @@ pub const App = struct {
     fn requestQuit(self: *App, near: ?*Surface) void {
         if (!self.session_ending) {
             if (self.settings_window.holdQuitForUnsavedChanges()) return;
-            if (self.pendingCloseAsk(&appQuitConfirmAccept, if (near) |surface| surface.host else null)) |ask| {
-                ask.host.askBeforeClosing(.app, ask.count, &appQuitConfirmAccept, self);
-                return;
-            }
+            if (self.askBeforeAppClose(.app, &appQuitConfirmAccept, if (near) |surface| surface.host else null)) return;
         }
         self.quitConfirmed();
     }
@@ -10177,10 +10442,7 @@ pub const App = struct {
         // install that then declines.
         if (self.settingsHoldInstall()) return;
         if (!self.session_ending) {
-            if (self.pendingCloseAsk(&updateApplyConfirmAccept, self.update_action_host)) |ask| {
-                ask.host.askBeforeClosing(.update, ask.count, &updateApplyConfirmAccept, self);
-                return;
-            }
+            if (self.askBeforeAppClose(.update, &updateApplyConfirmAccept, self.update_action_host)) return;
         }
         try self.queueApplyStagedUpdate();
     }
@@ -10237,13 +10499,37 @@ pub const App = struct {
         return .{ .count = count, .host = prompt_host };
     }
 
+    /// Raise the prompt `pendingCloseAsk` finds for an app-wide close that
+    /// `on_accept` resumes. False when no terminal needs asking about.
+    fn askBeforeAppClose(
+        self: *App,
+        scope: CloseScope,
+        on_accept: *const fn (userdata: ?*anyopaque) void,
+        near_host: ?*Host,
+    ) bool {
+        const ask = self.pendingCloseAsk(on_accept, near_host) orelse return false;
+        ask.host.askBeforeClosing(scope, ask.count, on_accept, self);
+        return true;
+    }
+
     fn quitConfirmed(self: *App) void {
         self.stopQuitTimer();
         self.running = false;
+        // Quit, close_all_windows and an update install end the session with
+        // its windows: save them while they are whole.
+        if (self.hasSessionWindows()) self.saveSessionAsItEnds();
         self.destroyAllWindows();
         if (self.windows.items.len == 0) sys.PostQuitMessage(0);
     }
 
+    /// Each window goes a pane at a time, as closing it does: the last pane's
+    /// teardown destroys and removes its host. Not through the host's own
+    /// DestroyWindow while it has panes: a pane's teardown can destroy the
+    /// window right below it (its tab's button, made after the pane), and
+    /// Windows then sends WM_DESTROY to none of the host's other children.
+    /// Those panes never ran `destroy`, kept their cores' threads and stayed
+    /// in `windows`, so a quit with two tabs left the process running with
+    /// no window.
     fn destroyAllWindows(self: *App) void {
         self.quitting = true;
         defer self.quitting = false;
@@ -10254,8 +10540,21 @@ pub const App = struct {
                 continue;
             };
             host.clearStructuralHistory(.normal);
+            // Its last one may have taken the host with it.
+            if (self.destroyPaneOf(host)) continue;
             _ = sys.DestroyWindow(hwnd);
         }
+    }
+
+    /// Destroys one of `host`'s panes through its own window. False when
+    /// none is left that could be.
+    fn destroyPaneOf(self: *App, host: *const Host) bool {
+        for (self.windows.items) |surface| {
+            if (surface.host != host) continue;
+            const pane = surface.hwnd orelse continue;
+            if (sys.DestroyWindow(pane) != 0) return true;
+        }
+        return false;
     }
 
     fn rollbackSessionRestoreHost(self: *App, host: *Host) void {
@@ -10372,11 +10671,7 @@ pub const App = struct {
                 }
                 break :loaded @import("win32/wgl.zig").ensureLoaded();
             };
-            if (!loaded) {
-                const err = windows.kernel32.GetLastError();
-                recordOpenGLStartupWin32Failure(.load_opengl32, err);
-                return windows.unexpectedError(err);
-            }
+            if (!loaded) return windows.unexpectedError(recordOpenGLStartupLastError(.load_opengl32));
         }
 
         const hdc = sys.GetDC(hwnd) orelse {
@@ -10408,11 +10703,8 @@ pub const App = struct {
                     },
                 );
 
-                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    recordOpenGLStartupWin32Failure(.set_pixel_format, err);
-                    return windows.unexpectedError(err);
-                }
+                if (sys.SetPixelFormat(hdc, selection.pixel_format, &selection.descriptor) == 0)
+                    return windows.unexpectedError(recordOpenGLStartupLastError(.set_pixel_format));
                 pixel_format.validatePixelFormatSetTransition(
                     format_before,
                     selection.pixel_format,
@@ -10427,24 +10719,28 @@ pub const App = struct {
             },
         };
 
-        const hglrc = sys.wglCreateContext(hdc) orelse {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.create_context, err);
-            return windows.unexpectedError(err);
-        };
+        const hglrc = sys.wglCreateContext(hdc) orelse
+            return windows.unexpectedError(recordOpenGLStartupLastError(.create_context));
         errdefer _ = sys.wglDeleteContext(hglrc);
 
-        if (sys.wglMakeCurrent(hdc, hglrc) == 0) {
-            const err = windows.kernel32.GetLastError();
-            recordOpenGLStartupWin32Failure(.initial_make_current, err);
-            return windows.unexpectedError(err);
-        }
+        if (sys.wglMakeCurrent(hdc, hglrc) == 0)
+            return windows.unexpectedError(recordOpenGLStartupLastError(.initial_make_current));
 
         return .{
             .hdc = hdc,
             .hglrc = hglrc,
             .provenance = provenance,
         };
+    }
+
+    /// Record that OpenGL startup failed at `step` with the thread's last
+    /// Win32 error, and return that error code. The caller turns it into
+    /// `error.Unexpected` with `windows.unexpectedError`, so a Debug build's
+    /// stack dump still starts at the failing call.
+    fn recordOpenGLStartupLastError(step: OpenGLStartupStep) windows.Win32Error {
+        const err = windows.kernel32.GetLastError();
+        recordOpenGLStartupWin32Failure(step, err);
+        return err;
     }
 
     /// Checks the target now, so a refused one still fails at the caller,
@@ -10529,9 +10825,7 @@ pub const App = struct {
     /// whether the loop should exit.
     fn drainDeferredOpens(self: *App) !bool {
         while (self.runDeferredOpens()) {
-            self.syncDirtyGlobalHotkeys();
-            try self.tickCoreApp();
-            if (!self.running and self.windows.items.len == 0) return true;
+            if (try self.finishLoopStep()) return true;
         }
         return false;
     }
@@ -10950,10 +11244,23 @@ pub const App = struct {
         // shell-out path so `open_config` never becomes a dead action.
         // Skipping the fallback would regress CI / sandboxed flows
         // that previously worked.
+        self.settings_open_trace.note(.settings_open_enter);
+        // The window's own steps, timed in memory and written after the
+        // outcome so no file write lands inside the work being timed. They
+        // are taken only while this runs: the trace covers this route alone.
+        const stamps = &self.settings_window.creation_stamps;
+        stamps.enabled = self.settings_open_trace.enabled();
+        defer {
+            self.settings_open_trace.noteCreation(stamps);
+            stamps.enabled = false;
+        }
         self.settings_window.open() catch |err| {
+            self.settings_open_trace.note(.settings_open_error);
             std.log.warn("settings window unavailable (err={}); falling back to editor", .{err});
             try self.openConfigInEditor();
+            return;
         };
+        self.settings_open_trace.note(.settings_open_ok);
     }
 
     /// Patch the edited settings into the target file (`persistSettings`:
@@ -11078,30 +11385,150 @@ pub const App = struct {
     /// return short-circuited the restore, leaving the process pinned to
     /// `startup_cwd` whenever a reload hit a broken config file.
     fn loadConfigAtStartupCwd(self: *App) !configpkg.Config {
-        const alloc = self.core_app.alloc;
-        const cwd_before: ?[]u8 = std.process.getCwdAlloc(alloc) catch null;
-        defer if (cwd_before) |p| alloc.free(p);
+        var startup_cwd = self.enterStartupCwd();
+        defer startup_cwd.restore();
+        return configpkg.Config.load(self.core_app.alloc);
+    }
 
-        var did_chdir_to_startup: bool = false;
+    /// The process cwd moved to `startup_cwd` until `restore` puts the
+    /// sanitized cwd back, so a `Config.load` in between resolves relative
+    /// `--config-file` entries as the launch did. Shared by
+    /// `loadConfigAtStartupCwd` (Settings saves) and the `reload_config`
+    /// action, which keeps it until the reloaded config is applied.
+    ///
+    /// A startup directory that no longer exists is not created again: the
+    /// files under it went with it, so an empty directory in its place
+    /// brings none of them back. The load then runs in the current
+    /// directory, and the warning says the move failed.
+    const StartupCwd = struct {
+        alloc: Allocator,
+        /// The cwd to go back to; null when it could not be read.
+        before: ?[]u8,
+        moved: bool,
+
+        fn restore(self: *StartupCwd) void {
+            defer if (self.before) |path| self.alloc.free(path);
+            if (!self.moved) return;
+            const cwd = self.before orelse return;
+            std.process.changeCurDir(cwd) catch |err| {
+                std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
+            };
+        }
+    };
+
+    fn enterStartupCwd(self: *const App) StartupCwd {
+        var scope: StartupCwd = .{
+            .alloc = self.core_app.alloc,
+            .before = std.process.getCwdAlloc(self.core_app.alloc) catch null,
+            .moved = false,
+        };
         if (self.startup_cwd) |cwd| {
-            std.fs.cwd().makePath(cwd) catch {}; // no-op if exists
             if (std.process.changeCurDir(cwd)) |_| {
-                did_chdir_to_startup = true;
+                scope.moved = true;
             } else |err| {
                 std.log.warn("config load: couldn't restore startup cwd path={s} err={}", .{ cwd, err });
             }
         }
-        defer {
-            if (did_chdir_to_startup) {
-                if (cwd_before) |cwd| {
-                    std.process.changeCurDir(cwd) catch |err| {
-                        std.log.warn("config load: couldn't restore sanitized cwd path={s} err={}", .{ cwd, err });
-                    };
-                }
-            }
-        }
+        return scope;
+    }
 
-        return configpkg.Config.load(alloc);
+    test "StartupCwd resolves a relative config-file in the startup directory and never creates a missing one" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.makeDir("launch");
+        try tmp.dir.makeDir("sanitized");
+        try tmp.dir.writeFile(.{ .sub_path = "launch/custom.conf", .data = "font-size = 17\n" });
+        const launch = try tmp.dir.realpathAlloc(alloc, "launch");
+        defer alloc.free(launch);
+        const sanitized = try tmp.dir.realpathAlloc(alloc, "sanitized");
+        defer alloc.free(sanitized);
+        const missing = try std.fs.path.join(alloc, &.{ launch, "deleted" });
+        defer alloc.free(missing);
+
+        // The test borrows the process cwd. It goes back before the
+        // temporary directory, which Windows cannot delete while it is the
+        // cwd, is cleaned up.
+        const original_cwd = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(original_cwd);
+        defer std.process.changeCurDir(original_cwd) catch |err| {
+            std.debug.panic("could not restore the test's cwd err={}", .{err});
+        };
+        try std.process.changeCurDir(sanitized);
+        defer app.startup_cwd = null;
+
+        const Cases = struct {
+            /// What `Config.load` does with `--config-file=custom.conf` on the
+            /// command line, run inside the scope: `loadCliArgs` parses the
+            /// argument, then expands it against `realpath(".")` (its private
+            /// `expandPaths` calls the same `RepeatablePath.expand`), and
+            /// `loadRecursiveFiles` reads the file.
+            fn loadRelativeConfigFile(test_app: *App, load_alloc: Allocator, expected_cwd: []const u8) !configpkg.Config {
+                var startup_cwd = test_app.enterStartupCwd();
+                defer startup_cwd.restore();
+                var config = try configpkg.Config.default(load_alloc);
+                errdefer config.deinit();
+                var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+                    .iterator = cli_args.sliceIterator(&.{"--config-file=custom.conf"}),
+                };
+                try config.loadIter(load_alloc, &args);
+                var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const base = try std.fs.cwd().realpath(".", &base_buf);
+                try std.testing.expectEqualStrings(expected_cwd, base);
+                try config.@"config-file".expand(config._arena.?.allocator(), base, &config._diagnostics);
+                try config.loadRecursiveFiles(load_alloc);
+                try config.finalize();
+                return config;
+            }
+
+            /// An error injected inside the scope, as a load that fails.
+            fn failInside(test_app: *App) !void {
+                var startup_cwd = test_app.enterStartupCwd();
+                defer startup_cwd.restore();
+                return error.TestInjectedLoadFailure;
+            }
+        };
+
+        // A relative config-file resolves in the startup directory, and the
+        // sanitized cwd is back afterwards.
+        app.startup_cwd = launch;
+        {
+            var config = try Cases.loadRelativeConfigFile(&app, alloc, launch);
+            defer config.deinit();
+            try std.testing.expectEqual(@as(f32, 17), config.@"font-size");
+        }
+        const after = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after);
+        try std.testing.expectEqualStrings(sanitized, after);
+
+        // A startup directory that is gone stays gone: the scope stays in the
+        // current directory, so the relative file is not found there, and the
+        // current directory is as it was afterwards.
+        app.startup_cwd = missing;
+        {
+            var config = try Cases.loadRelativeConfigFile(&app, alloc, sanitized);
+            defer config.deinit();
+            try std.testing.expectEqual(@as(f32, 12), config.@"font-size");
+        }
+        try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(missing, .{}));
+        const after_missing = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after_missing);
+        try std.testing.expectEqualStrings(sanitized, after_missing);
+
+        // A failure inside the scope still puts the sanitized cwd back.
+        app.startup_cwd = launch;
+        try std.testing.expectError(error.TestInjectedLoadFailure, Cases.failInside(&app));
+        const after_failure = try std.process.getCwdAlloc(alloc);
+        defer alloc.free(after_failure);
+        try std.testing.expectEqualStrings(sanitized, after_failure);
     }
 
     /// Before a Settings save: has the config file been edited since the
@@ -11301,6 +11728,69 @@ pub const App = struct {
                 const actual = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, text[0..@intCast(len)]);
                 defer std.testing.allocator.free(actual);
                 try std.testing.expectEqualStrings(@import("../os/windows_text_editor.zig").failure_message, actual);
+            }
+        }.body);
+    }
+
+    test "SET open_config writes creation steps only for the window it created" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnHiddenDesktop(struct {
+            fn body() !void {
+                var core_app: CoreApp = undefined;
+                var app: App = undefined;
+                var session: TestSession = .{};
+                try session.init(.{ .core_app = &core_app, .app = &app });
+                defer session.deinit();
+                app.initComApartment();
+                if (!app.com_initialized) return error.SkipZigTest;
+                defer sys.OleUninitialize();
+                app.settings_window.handle.deferUiaDisconnect = null;
+                const settings_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings");
+                const viewport_class = comptime std.unicode.utf8ToUtf16LeStringLiteral("noctty.win32.settings.viewport");
+                defer {
+                    app.settings_window.deinit();
+                    _ = sys.UnregisterClassW(settings_class, app.settings_window.handle.hinstance);
+                    _ = sys.UnregisterClassW(viewport_class, app.settings_window.handle.hinstance);
+                }
+                var tmp = std.testing.tmpDir(.{});
+                defer tmp.cleanup();
+                try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = "font-size = 12\n" });
+                const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.ghostty");
+                defer std.testing.allocator.free(path);
+                app.cli_config_override_path = path;
+                defer app.cli_config_override_path = null;
+                const Hook = struct {
+                    var calls: usize = 0;
+                    fn open(_: *App, _: []const u8) !void {
+                        calls += 1;
+                    }
+                };
+                Hook.calls = 0;
+                app.test_open_target = &Hook.open;
+                const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+                defer std.testing.allocator.free(dir);
+                const trace_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "settings-open.jsonl" });
+                defer std.testing.allocator.free(trace_path);
+                app.settings_open_trace = .{ .file = try std.fs.createFileAbsolute(trace_path, .{ .exclusive = true }) };
+                defer app.settings_open_trace.deinit();
+
+                // open_config creates the window and writes its steps.
+                try app.openConfig();
+                try std.testing.expect(!app.settings_window.creation_stamps.enabled);
+                _ = sys.DestroyWindow(app.settings_window.hwnd.?);
+                // The palette's Settings rows create it without the trace.
+                try app.settings_window.openField(.font_size);
+                try std.testing.expectEqual(@as(usize, 0), app.settings_window.creation_stamps.len);
+                // open_config only raises it now: no creation steps follow.
+                try app.openConfig();
+                try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+
+                const data = try tmp.dir.readFileAlloc(std.testing.allocator, "settings-open.jsonl", 64 * 1024);
+                defer std.testing.allocator.free(data);
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data, "\"stage\":\"settings_open_ok\""));
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, data, "\"stage\":\"create_begin\""));
+                const raise = std.mem.lastIndexOf(u8, data, "\"stage\":\"settings_open_enter\"").?;
+                try std.testing.expect(std.mem.indexOf(u8, data[raise..], "\"stage\":\"create_") == null);
             }
         }.body);
     }
@@ -11682,31 +12172,16 @@ pub const App = struct {
         var waiting = false;
         for (self.windows.items) |surface| {
             if (!surface.program_status_notify_pending) continue;
-            // Notifications may have been turned off while it waited.
-            if (!surface.core().config.desktop_notifications) {
-                surface.program_status_notify_pending = false;
-                continue;
-            }
-            const found = self.findTabForSurface(surface) orelse {
+            const owed = self.owedProgramStatus(surface) orelse {
                 surface.program_status_notify_pending = false;
                 continue;
             };
-            const record = surface.program_status.headline() orelse {
-                surface.program_status_notify_pending = false;
-                continue;
-            };
-            if (tabSeenByUser(found.host, found.index) or
-                !win32_program_status.Indicator.of(record).needsUser())
-            {
-                surface.program_status_notify_pending = false;
-                continue;
-            }
             if (!self.program_status_notify.allow(&surface.program_status_notified_ms, sys.GetTickCount64())) {
                 waiting = true;
                 continue;
             }
             surface.program_status_notify_pending = false;
-            self.showProgramStatusToast(surface, found.host, found.index, record) catch |err| {
+            self.showProgramStatusToast(surface, owed.host, owed.index, owed.record) catch |err| {
                 log.warn("deferred program status notification failed err={}", .{err});
             };
             // The toast may have pumped messages that closed windows, so
@@ -11715,6 +12190,23 @@ pub const App = struct {
             break;
         }
         if (!waiting) self.stopProgramStatusNotifyTimer();
+    }
+
+    /// What `surface`'s held-back notification would say now, and about
+    /// which tab, or null when it is no longer owed: notifications were
+    /// turned off while it waited, the pane left its tab, it shows nothing
+    /// that needs the user, or its tab is in sight.
+    fn owedProgramStatus(self: *App, surface: *Surface) ?struct {
+        host: *Host,
+        index: usize,
+        record: *const win32_program_status.Record,
+    } {
+        if (!surface.core().config.desktop_notifications) return null;
+        const found = self.findTabForSurface(surface) orelse return null;
+        const record = surface.program_status.headline() orelse return null;
+        if (tabSeenByUser(found.host, found.index) or
+            !win32_program_status.Indicator.of(record).needsUser()) return null;
+        return .{ .host = found.host, .index = found.index, .record = record };
     }
 
     fn startProgramStatusNotifyTimer(self: *App) void {
@@ -11728,10 +12220,7 @@ pub const App = struct {
     }
 
     fn stopProgramStatusNotifyTimer(self: *App) void {
-        if (self.program_status_notify_timer_id) |timer_id| {
-            _ = sys.KillTimer(null, timer_id);
-            self.program_status_notify_timer_id = null;
-        }
+        killThreadTimer(&self.program_status_notify_timer_id);
     }
 
     /// Focus the next tab whose programs need the user; see
@@ -12563,31 +13052,110 @@ fn createIconFontForFace(face: [*:0]const u16, height_px: i32) ?*anyopaque {
     return sys.CreateFontIndirectW(&lf);
 }
 
-/// Whether `font` has a glyph for every search bar button. This, not the
-/// face name, decides whether the Codicons font is used: GDI never fails a
-/// missing face but hands back a substitute such as Arial, which has none of
-/// these private-use code points, and an older "Symbols Nerd Font" installed
-/// on the system can shadow the registered one without having them all.
-/// Any GDI failure counts as missing, so the buttons fall back to
-/// `win32_icons` rather than risk empty boxes.
+/// Every search bar button's Codicon, one UTF-16 unit each.
+const search_codicon_glyphs = glyphs: {
+    var units: [search_bar_button_roles.len]u16 = undefined;
+    for (search_bar_button_roles, &units) |role, *unit| unit.* = searchButtonCodicon(role)[0];
+    break :glyphs units;
+};
+
+/// Whether `font` has a glyph for every search bar button. An older
+/// "Symbols Nerd Font" installed on the system can shadow the registered one
+/// without having them all. A failed check counts as missing.
 fn fontHasSearchCodicons(font: *anyopaque) bool {
-    const hdc = sys.CreateCompatibleDC(null) orelse return false;
+    return fontGlyphCoverage(font, &search_codicon_glyphs) == .all;
+}
+
+/// What `fontGlyphCoverage` found.
+const GlyphCoverage = enum {
+    all,
+    /// At least one glyph is not in the font.
+    missing,
+    /// GDI failed before it could say. Unlike `missing`, a later attempt
+    /// may succeed.
+    unknown,
+};
+
+/// Tests set this to fail `fontGlyphCoverage` as a GDI error would, which
+/// nothing else can do on demand.
+var test_glyph_check_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// Whether `font` has a glyph for every UTF-16 unit in `units`. This, not
+/// the face name, decides whether an icon font is used: GDI never fails a
+/// missing face but hands back a substitute such as Arial, which has none of
+/// these private-use code points.
+fn fontGlyphCoverage(font: *anyopaque, units: []const u16) GlyphCoverage {
+    if (builtin.is_test) {
+        if (test_glyph_check_fails) return .unknown;
+    }
+    const hdc = sys.CreateCompatibleDC(null) orelse return .unknown;
     defer _ = sys.DeleteDC(hdc);
-    const old_font = sys.SelectObject(hdc, font) orelse return false;
+    const old_font = sys.SelectObject(hdc, font) orelse return .unknown;
     defer _ = sys.SelectObject(hdc, old_font);
-    for (search_bar_button_roles) |role| {
-        const glyph = searchButtonCodicon(role);
+    for (units) |unit| {
+        const glyph = [1]u16{unit};
         var index: [1]u16 = undefined;
         if (sys.GetGlyphIndicesW(
             hdc,
-            glyph.ptr,
+            &glyph,
             1,
             &index,
             c.GGI_MARK_NONEXISTING_GLYPHS,
-        ) != 1) return false;
-        if (index[0] == 0xFFFF) return false;
+        ) != 1) return .unknown;
+        if (index[0] == 0xFFFF) return .missing;
     }
-    return true;
+    return .all;
+}
+
+/// The titlebar icon faces, best first. Windows 11 ships Segoe Fluent Icons;
+/// Windows 10 ships only Segoe MDL2 Assets, which has the same code points.
+const titlebar_icon_faces = [_][*:0]const u16{ titlebar_icon_font_fluent, titlebar_icon_font_mdl2 };
+
+/// Every glyph `drawTitlebarGlyph` draws. Both titlebar icon fonts must have
+/// all of them, so the caption buttons and the tab row's buttons come from
+/// the same face.
+const titlebar_icon_glyphs = glyphs: {
+    const kinds = std.enums.values(TitlebarGlyphKind);
+    var units: [kinds.len]u16 = undefined;
+    for (kinds, &units) |kind, *unit| unit.* = titlebarGlyphText(kind)[0];
+    break :glyphs units;
+};
+
+/// An icon font from `createIconFontWithGlyphs`.
+const IconFontChoice = struct {
+    font: ?*anyopaque = null,
+    /// No font: every face was created and checked, and none has the
+    /// glyphs, so the caller draws `win32_icons` by design. Without this, a
+    /// null font means GDI failed to create or check one, which a later
+    /// theme message retries.
+    geometric: bool = false,
+};
+
+/// The first of `faces` whose font has every one of `glyphs`, at a
+/// `height_px` device-pixel em. `CreateFontIndirectW` succeeding says
+/// nothing: it substitutes another face for a missing one (Arial for
+/// "Segoe Fluent Icons" on Windows 10), so the glyph table decides. A face
+/// GDI failed to create or check is passed over like a missing one, but
+/// the result is then not `geometric`.
+fn createIconFontWithGlyphs(
+    faces: []const [*:0]const u16,
+    glyphs: []const u16,
+    height_px: i32,
+) IconFontChoice {
+    var checked_every_face = true;
+    for (faces) |face| {
+        const font = createIconFontForFace(face, height_px) orelse {
+            checked_every_face = false;
+            continue;
+        };
+        switch (fontGlyphCoverage(font, glyphs)) {
+            .all => return .{ .font = font },
+            .missing => {},
+            .unknown => checked_every_face = false,
+        }
+        _ = sys.DeleteObject(font);
+    }
+    return .{ .geometric = checked_every_face };
 }
 
 /// The Codicon for each search bar button, by its Nerd Fonts code point.
@@ -13268,8 +13836,15 @@ const Host = struct {
     /// proportional, which would misrepresent whitespace and column
     /// alignment in the very bytes the user is judging.
     preview_font: ?*anyopaque = null, // HFONT, owned
+    /// Icon fonts for the caption buttons and the tab row's new-tab and
+    /// dropdown buttons (`recreateTitlebarIconFonts`). Null when no face has
+    /// the glyphs, and `win32_icons` draws them.
     titlebar_caption_icon_font: ?*anyopaque = null, // HFONT, owned
     titlebar_action_icon_font: ?*anyopaque = null, // HFONT, owned
+    /// Both titlebar icon fonts are null because no icon face has the
+    /// glyphs, not because GDI failed to create or check one, so
+    /// `reconfigureSystemTheme` does not count them as missing.
+    titlebar_icons_geometric: bool = false,
     /// Codicons for the search bar buttons (`search_icon_font_face`). Null
     /// until first use (`searchIconFont`), and when the font is unavailable.
     search_icon_font: ?*anyopaque = null, // HFONT, owned
@@ -13968,6 +14543,9 @@ const Host = struct {
             return err;
         };
         if (shell_prepared) |*prepared| self.app.applyShellEffects(prepared.effects(), .{});
+        // The session is open again: the next close saves it, and checkpoints
+        // resume. The quick terminal is never part of it.
+        if (!self.quick_terminal) self.app.session_state_saved_before_last_host_close = false;
         // Detaching destroys the tab button and its UIA provider. Rebuild the
         // restored button before raising the selected-item notification so
         // assistive clients receive the event from a live provider.
@@ -13994,6 +14572,12 @@ const Host = struct {
             shell_prepared = try self.app.shell_runtime.prepare(.{ .detach_tab = shell_id });
         }
         defer if (shell_prepared) |*prepared| prepared.deinit();
+        // As the close it redoes: the session's last tab is saved as it goes.
+        const saved_here = self.tabs.items.len == 1 and self.app.closingEndsSession(self);
+        if (saved_here) self.app.saveSessionAsItEnds();
+        errdefer if (saved_here) {
+            self.app.session_state_saved_before_last_host_close = false;
+        };
         var removed = self.tabs.orderedRemove(index);
         self.destroyTabButton(&removed);
         removed.button_placement = .{};
@@ -14662,19 +15246,23 @@ const Host = struct {
         // Arm a one-shot WM_NCMOUSELEAVE so we can clear the hover
         // when the cursor exits the non-client area. Without this the
         // last-hovered button would paint highlighted indefinitely.
-        if (!self.caption_track_armed) {
-            var track: TRACKMOUSEEVENT = .{
-                .cbSize = @sizeOf(TRACKMOUSEEVENT),
-                .dwFlags = c.TME_LEAVE | c.TME_NONCLIENT,
-                .hwndTrack = hwnd,
-                .dwHoverTime = 0,
-            };
-            if (sys.TrackMouseEvent(&track) != 0) {
-                self.caption_track_armed = true;
-            }
+        if (!self.caption_track_armed and trackMouseLeave(hwnd, c.TME_LEAVE | c.TME_NONCLIENT)) {
+            self.caption_track_armed = true;
         }
 
         return null; // fall through to DefWindowProcW for native feedback
+    }
+
+    /// `TrackMouseEvent` for `hwnd` with `flags` (a leave, its non-client or
+    /// cancel form), no hover. True when it succeeded.
+    fn trackMouseLeave(hwnd: HWND, flags: DWORD) bool {
+        var track: TRACKMOUSEEVENT = .{
+            .cbSize = @sizeOf(TRACKMOUSEEVENT),
+            .dwFlags = flags,
+            .hwndTrack = hwnd,
+            .dwHoverTime = 0,
+        };
+        return sys.TrackMouseEvent(&track) != 0;
     }
 
     fn handleNcMouseLeave(self: *Host) void {
@@ -15486,10 +16074,26 @@ const Host = struct {
         try preview.loadDefaultFiles(alloc);
         try preview.loadCliArgs(alloc);
         try preview.loadRecursiveFiles(alloc);
-        preview._conditional_state = self.app.config._conditional_state;
-        try setConfigTheme(&preview, name);
-        try preview.finalize();
+        try finishPaletteThemeConfig(&preview, self.app.config._conditional_state, name);
         return preview;
+    }
+
+    /// Finish `preview`, loaded as `Config.load` loads, with the palette
+    /// theme `name`. It parsed the command line again, so it carries a
+    /// startup `--launch-layout` (`finalize` replays it with the theme).
+    /// `swapRuntimeConfigFromPalette` installs it as the app config without
+    /// the `.app` `config_change` that drops the request, so it is dropped
+    /// here; left in, a `new_window` while the preview is live would open
+    /// the layout.
+    fn finishPaletteThemeConfig(
+        preview: *configpkg.Config,
+        state: configpkg.ConditionalState,
+        name: []const u8,
+    ) !void {
+        preview._conditional_state = state;
+        try setConfigTheme(preview, name);
+        try preview.finalize();
+        App.forgetLaunchLayout(preview);
     }
 
     fn swapRuntimeConfigFromPalette(self: *Host, new_config: configpkg.Config) configpkg.Config {
@@ -15772,6 +16376,8 @@ const Host = struct {
             self.postDeferredNewTab();
             return;
         }
+        // A command the user runs on the pane, as a key would.
+        surface.noteProgramInput();
         const performed = surface.core_surface.performBindingAction(action) catch |err| {
             if (outcome_provider) |provider| {
                 win32_uia.events.raiseNotification(
@@ -17797,22 +18403,7 @@ const Host = struct {
             try appendOwnedString(self.app.core_app.alloc, &self.selected_profile_key, null);
             return false;
         }
-        if (preferredProfileIndex(
-            profiles,
-            self.selected_profile_key,
-            self.app.launcher_profile_key,
-            self.app.launcher_profile_hint,
-            self.selected_profile,
-        )) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return true;
-        }
-        if (self.app.defaultShellProfileIndex(profiles)) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return true;
-        }
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        _ = try self.setSelectedProfileIndex(self.selected_profile);
+        try self.selectPreferredProfile(profiles);
         return true;
     }
 
@@ -17829,22 +18420,24 @@ const Host = struct {
         const profiles = self.profiles orelse return;
         if (profiles.len == 0) return;
         self.app.applyLauncherQuickSlotPreferences(profiles);
-        if (preferredProfileIndex(
+        try self.selectPreferredProfile(profiles);
+    }
+
+    /// Select the profile `preferredProfileIndex` picks, else the default
+    /// shell's, else the one at the current index (the first when that is
+    /// past the end). `profiles` is not empty.
+    fn selectPreferredProfile(self: *Host, profiles: []const windows_shell.Profile) !void {
+        const index = preferredProfileIndex(
             profiles,
             self.selected_profile_key,
             self.app.launcher_profile_key,
             self.app.launcher_profile_hint,
             self.selected_profile,
-        )) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return;
-        }
-        if (self.app.defaultShellProfileIndex(profiles)) |index| {
-            _ = try self.setSelectedProfileIndex(index);
-            return;
-        }
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        _ = try self.setSelectedProfileIndex(self.selected_profile);
+        ) orelse self.app.defaultShellProfileIndex(profiles) orelse current: {
+            if (self.selected_profile >= profiles.len) self.selected_profile = 0;
+            break :current self.selected_profile;
+        };
+        _ = try self.setSelectedProfileIndex(index);
     }
 
     /// For actions that need a list now (open a profile by key or index,
@@ -17857,10 +18450,7 @@ const Host = struct {
         {
             return try self.reloadProfiles();
         }
-        const profiles = self.profiles.?;
-        if (profiles.len == 0) return false;
-        if (self.selected_profile >= profiles.len) self.selected_profile = 0;
-        return true;
+        return self.clampSelectedProfile();
     }
 
     /// The picker's and the palette's way to a list: never discovers on
@@ -17872,6 +18462,12 @@ const Host = struct {
             // With no worker to run it, the discovery ran on this thread.
             if (self.profiles == null) return false;
         }
+        return self.clampSelectedProfile();
+    }
+
+    /// Whether the loaded list has a profile to select, with the selection
+    /// moved to the first one when it is past the end.
+    fn clampSelectedProfile(self: *Host) bool {
         const profiles = self.profiles.?;
         if (profiles.len == 0) return false;
         if (self.selected_profile >= profiles.len) self.selected_profile = 0;
@@ -18512,11 +19108,15 @@ const Host = struct {
 
     fn refreshModeIndicatorAt(self: *Host, now_ms: u64) !void {
         const surface = self.activeSurface();
-        const since = if (surface) |s| s.key_sequence_since_ms else null;
-        const delay: ?u32 = if (since) |start|
-            if (now_ms -| start < 250) @intCast(250 - (now_ms -| start)) else null
-        else
-            null;
+        // A pending key sequence shows in the banner only after this long;
+        // until then a timer comes back for it.
+        const sequence_delay_ms = 250;
+        const delay: ?u32 = delay: {
+            const active = surface orelse break :delay null;
+            const start = active.key_sequence_since_ms orelse break :delay null;
+            const elapsed = now_ms -| start;
+            break :delay if (elapsed < sequence_delay_ms) @intCast(sequence_delay_ms - elapsed) else null;
+        };
         // Recompute from the active surface on every tick. A queued tick from
         // a canceled sequence or another tab cannot resurrect its indicator.
         if (self.hwnd) |hwnd| {
@@ -18759,10 +19359,8 @@ const Host = struct {
         if (text.len == 0) return 0;
         const hdc = sys.GetDC(hwnd) orelse return 0;
         defer _ = sys.ReleaseDC(hwnd, hdc);
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
         var rect = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         _ = sys.DrawTextW(hdc, text.ptr, @intCast(text.len), &rect, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
         return rect.right - rect.left;
@@ -18787,13 +19385,7 @@ const Host = struct {
             if (self.banner_pointer_inside) {
                 // A leave armed before the hide could otherwise arrive after
                 // the next show and start a countdown under a resting pointer.
-                var track: TRACKMOUSEEVENT = .{
-                    .cbSize = @sizeOf(TRACKMOUSEEVENT),
-                    .dwFlags = c.TME_LEAVE | c.TME_CANCEL,
-                    .hwndTrack = hwnd,
-                    .dwHoverTime = 0,
-                };
-                _ = sys.TrackMouseEvent(&track);
+                _ = trackMouseLeave(hwnd, c.TME_LEAVE | c.TME_CANCEL);
                 self.banner_pointer_inside = false;
             }
             // A leave for a hidden button may never come; a stale hover
@@ -18838,6 +19430,7 @@ const Host = struct {
             !self.banner_focused;
         if (!run) return self.stopBannerExpiry();
         if (self.banner_expires_at != null) return;
+        if (!infoBannersExpire()) return;
         const duration_ms = bannerMessageDurationMs();
         self.banner_expires_at = sys.GetTickCount64() + duration_ms;
         _ = sys.SetTimer(hwnd, c.BANNER_TIMER_ID, duration_ms, null);
@@ -18870,13 +19463,7 @@ const Host = struct {
     fn bannerPointerMoved(self: *Host) void {
         if (self.banner_pointer_inside) return;
         const hwnd = self.banner_hwnd orelse return;
-        var track: TRACKMOUSEEVENT = .{
-            .cbSize = @sizeOf(TRACKMOUSEEVENT),
-            .dwFlags = c.TME_LEAVE,
-            .hwndTrack = hwnd,
-            .dwHoverTime = 0,
-        };
-        _ = sys.TrackMouseEvent(&track);
+        _ = trackMouseLeave(hwnd, c.TME_LEAVE);
         self.banner_pointer_inside = true;
         self.syncBannerExpiry();
     }
@@ -18980,10 +19567,8 @@ const Host = struct {
         const accent = if (self.banner_text != null and self.banner_kind == .err) theme.error_fg else theme.info_fg;
         fillSolidRect(hdc, parts.stripe, accent);
 
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
         const prev_bk_mode = sys.SetBkMode(hdc, c.TRANSPARENT);
         defer _ = sys.SetBkMode(hdc, prev_bk_mode);
         const prev_color = sys.SetTextColor(hdc, accent);
@@ -19025,10 +19610,8 @@ const Host = struct {
                 .bottom = draw.rcItem.bottom - inset,
             }, colors.bg, if (primary) theme.button_accept_focus_ring else theme.button_overlay_focus_ring, self.scaled(3));
         }
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(draw.hDC, pf);
-        };
+        const prev_font = self.selectChromeFont(draw.hDC);
+        defer restoreFont(draw.hDC, prev_font);
         _ = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
         _ = sys.SetTextColor(draw.hDC, if (bare) theme.text_secondary else colors.fg);
         const label = self.bannerButtonLabel(button);
@@ -19513,6 +20096,43 @@ const Host = struct {
         try std.testing.expect(host.banner_expires_at != null);
     }
 
+    test "NOCTTY_RENDERER_KEEP_NOTICES keeps info banners up in test-tools builds only" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(bannerKeepNoticesTestBody);
+    }
+
+    fn bannerKeepNoticesTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host }},
+        });
+        defer session.deinit();
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        host.layoutBanner(window.content, window.content.top);
+        _ = sys.ShowWindow(window.parent, c.SW_SHOWNOACTIVATE);
+        host.refreshSurfaceVisibility();
+
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_RENDERER_KEEP_NOTICES");
+        if (windows.kernel32.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) == 0) return lastError();
+        defer _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+        try host.setBanner(.info, "OpenGL could not start.");
+        if (build_config.renderer_test_tools) {
+            // No countdown, so nothing clears it, however long the UI
+            // thread is busy before a harness reads it.
+            try std.testing.expectEqual(@as(?u64, null), host.banner_expires_at);
+            try std.testing.expectEqualStrings("OpenGL could not start.", host.banner_text.?);
+        } else {
+            // Shipped builds never read the switch.
+            try std.testing.expect(host.banner_expires_at != null);
+        }
+    }
+
     fn setOverlayDefaultBanner(self: *Host, mode: HostOverlayMode) !void {
         _ = mode;
         try self.setBanner(.none, null);
@@ -19838,12 +20458,19 @@ const Host = struct {
         return false;
     }
 
-    fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
-        const self: *Host = @ptrCast(@alignCast(ctx));
+    /// The on-screen button of tab `tab_id` while the tab strip offers its
+    /// close button, which is what its UIA close element stands for.
+    fn closableTabButton(self: *Host, tab_id: usize) ?HWND {
         if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return null;
         const index = self.findTabIndexById(@intCast(tab_id)) orelse return null;
         const hwnd = self.tabs.items[index].button_hwnd orelse return null;
         if (sys.IsWindowVisible(hwnd) == 0) return null;
+        return hwnd;
+    }
+
+    fn tabCloseUiaBounds(ctx: *anyopaque, tab_id: usize) ?win32_uia.UiaRect {
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        const hwnd = self.closableTabButton(tab_id) orelse return null;
         var rect: RECT = undefined;
         if (sys.GetWindowRect(hwnd, &rect) == 0) return null;
         // Same close zone as the pointer path, always at full alpha. An
@@ -19859,10 +20486,7 @@ const Host = struct {
 
     fn tabCloseUiaInvoke(ctx: *anyopaque, tab_id: usize) bool {
         const self: *Host = @ptrCast(@alignCast(ctx));
-        if (tabCloseAction(self.tabs.items.len) == .none or !self.shouldShowTabBar()) return false;
-        const index = self.findTabIndexById(@intCast(tab_id)) orelse return false;
-        const hwnd = self.tabs.items[index].button_hwnd orelse return false;
-        if (sys.IsWindowVisible(hwnd) == 0) return false;
+        const hwnd = self.closableTabButton(tab_id) orelse return false;
         return sys.PostMessageW(hwnd, win32_uia.widgets.tab_close_message, tab_id, 0) != 0;
     }
 
@@ -20366,10 +20990,8 @@ const Host = struct {
         // cache and is released when the control's `WM_PAINT` returns, so
         // nothing leaks today, but leaving half the state changed is how
         // the next handler added here inherits a surprise.
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(draw.hDC, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(draw.hDC, pf);
-        };
+        const prev_font = self.selectChromeFont(draw.hDC);
+        defer restoreFont(draw.hDC, prev_font);
         const prev_bk_mode = sys.SetBkMode(draw.hDC, c.TRANSPARENT);
         defer _ = sys.SetBkMode(draw.hDC, prev_bk_mode);
         const prev_color = sys.SetTextColor(draw.hDC, self.confirmPromptTextColor(title));
@@ -21305,9 +21927,8 @@ const Host = struct {
         return sys.CreateFontIndirectW(&lf);
     }
 
-    fn createTitlebarIconFont(self: *Host, logical_px: i32) ?*anyopaque {
-        return createIconFontForFace(titlebar_icon_font_fluent, self.scaled(logical_px)) orelse
-            createIconFontForFace(titlebar_icon_font_mdl2, self.scaled(logical_px));
+    fn createTitlebarIconFont(self: *Host, faces: []const [*:0]const u16, logical_px: i32) IconFontChoice {
+        return createIconFontWithGlyphs(faces, &titlebar_icon_glyphs, self.scaled(logical_px));
     }
 
     /// The search bar's Codicons font, created at its first use rather than
@@ -21320,6 +21941,17 @@ const Host = struct {
             self.search_icon_font_resolved = true;
         }
         return self.search_icon_font;
+    }
+
+    /// Select the chrome font into `hdc`, returning what it replaced for
+    /// `restoreFont`; null, and nothing selected, when there is none.
+    fn selectChromeFont(self: *const Host, hdc: HDC) HGDIOBJ {
+        const font = self.chrome_font orelse return null;
+        return sys.SelectObject(hdc, font);
+    }
+
+    fn restoreFont(hdc: HDC, previous: HGDIOBJ) void {
+        if (previous) |font| _ = sys.SelectObject(hdc, font);
     }
 
     /// Monospace font for the confirm preview. `window-title-font-family`
@@ -21338,11 +21970,18 @@ const Host = struct {
     }
 
     fn recreateTitlebarIconFonts(self: *Host) void {
+        self.recreateTitlebarIconFontsFrom(&titlebar_icon_faces);
+    }
+
+    fn recreateTitlebarIconFontsFrom(self: *Host, faces: []const [*:0]const u16) void {
         if (self.titlebar_caption_icon_font) |old| _ = sys.DeleteObject(old);
         if (self.titlebar_action_icon_font) |old| _ = sys.DeleteObject(old);
         if (self.search_icon_font) |old| _ = sys.DeleteObject(old);
-        self.titlebar_caption_icon_font = self.createTitlebarIconFont(10);
-        self.titlebar_action_icon_font = self.createTitlebarIconFont(12);
+        const caption = self.createTitlebarIconFont(faces, 10);
+        const action = self.createTitlebarIconFont(faces, 12);
+        self.titlebar_caption_icon_font = caption.font;
+        self.titlebar_action_icon_font = action.font;
+        self.titlebar_icons_geometric = caption.geometric and action.geometric;
         self.search_icon_font = null;
         self.search_icon_font_resolved = false;
     }
@@ -22956,6 +23595,7 @@ const Host = struct {
                     self.postDeferredNewTab();
                     return true;
                 }
+                surface.noteProgramInput();
                 _ = try surface.core_surface.performBindingAction(action);
                 return true;
             },
@@ -23037,8 +23677,7 @@ const Host = struct {
     /// a 0 px caption row. Its top band lies inside the client area, where
     /// a terminal pane with no tab bar above it covers the band.
     fn resizesFrom(self: *Host, lParam: LPARAM) bool {
-        if ((self.clientCaptionHeight() orelse return false) != 0) return false;
-        const ht = self.handleNcHitTest(self.hwnd orelse return false, lParam) orelse return false;
+        const ht = self.zeroCaptionHitTest(lParam) orelse return false;
         return ht >= c.HTLEFT and ht <= c.HTBOTTOMRIGHT;
     }
 
@@ -23048,9 +23687,15 @@ const Host = struct {
     /// which is narrower above 96 DPI (13 vs 16 px at 192), so a side strip
     /// overlaps a button's outer columns there; the button keeps those.
     fn resizesFromTop(self: *Host, lParam: LPARAM) bool {
-        if ((self.clientCaptionHeight() orelse return false) != 0) return false;
-        const ht = self.handleNcHitTest(self.hwnd orelse return false, lParam) orelse return false;
+        const ht = self.zeroCaptionHitTest(lParam) orelse return false;
         return ht == c.HTTOP or ht == c.HTTOPLEFT or ht == c.HTTOPRIGHT;
+    }
+
+    /// The host's `WM_NCHITTEST` answer at `lParam` when it has a 0 px
+    /// caption row, else null.
+    fn zeroCaptionHitTest(self: *Host, lParam: LPARAM) ?LRESULT {
+        if ((self.clientCaptionHeight() orelse return null) != 0) return null;
+        return self.handleNcHitTest(self.hwnd orelse return null, lParam);
     }
 
     fn tabBarHeight(self: *Host) i32 {
@@ -23284,14 +23929,13 @@ const Host = struct {
     /// `prompt` borrows; null leaves the prompt as it was (the tab in front,
     /// or no memory for the words).
     fn nameBackgroundTab(self: *Host, prompt: *ConfirmPrompt, count: usize, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
-        const found = self.app.findTabForSurface(surface) orelse return null;
-        if (found.host != self or found.index == self.active_tab) return null;
+        const index = self.backgroundTabIndex(surface) orelse return null;
         // The title needs no memory, so it names the tab even if the body cannot.
-        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, found.index + 1);
+        prompt.title = labels.backgroundTabClosePromptTitle(title_buf, index + 1);
         const body = labels.buildBackgroundTabClosePromptBody(
             self.app.core_app.alloc,
             count,
-            found.index + 1,
+            index + 1,
             surface.effectiveTitle(),
         ) catch return null;
         prompt.body = body;
@@ -23301,17 +23945,24 @@ const Host = struct {
     /// The same for the prompt of a terminal that closes by itself, which
     /// `Surface.close` raises whatever tab the terminal is in.
     fn nameBackgroundTerminal(self: *Host, prompt: *ConfirmPrompt, surface: *Surface, title_buf: *[32]u8) ?[]u8 {
-        const found = self.app.findTabForSurface(surface) orelse return null;
-        if (found.host != self or found.index == self.active_tab) return null;
-        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, found.index + 1);
+        const index = self.backgroundTabIndex(surface) orelse return null;
+        prompt.title = labels.backgroundTerminalClosePromptTitle(title_buf, index + 1);
         const body = labels.buildBackgroundTerminalClosePromptBody(
             self.app.core_app.alloc,
-            found.index + 1,
+            index + 1,
             surface.effectiveTitle(),
             surface.core_initialized and surface.core_surface.child_exited,
         ) catch return null;
         prompt.body = body;
         return body;
+    }
+
+    /// The index of the tab of this window that holds `surface`, unless
+    /// that tab is the one in front.
+    fn backgroundTabIndex(self: *Host, surface: *Surface) ?usize {
+        const found = self.app.findTabForSurface(surface) orelse return null;
+        if (found.host != self or found.index == self.active_tab) return null;
+        return found.index;
     }
 
     /// Shown on screen, minimized included; a hidden quick terminal is not.
@@ -23360,9 +24011,9 @@ const Host = struct {
             self.app.removeHost(self);
             return;
         }
-        if (self.app.hosts.items.len == 1) {
-            self.app.session_state_saved_before_last_host_close = self.app.saveSessionState(.final);
-        }
+        // The session's last window, whatever else is open: a quick terminal
+        // or a window kept empty for undo is not part of the session.
+        if (self.app.closingEndsSession(self)) self.app.saveSessionAsItEnds();
         for (surfaces.items) |surface| surface.close(false);
     }
 
@@ -23662,16 +24313,21 @@ const Host = struct {
         try std.testing.expectEqual(applied, app.theme_rebuilds);
 
         inline for (.{ "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "chrome_font" }) |name| {
-            const slot = &@field(host, name);
-            const font = slot.* orelse return error.FontCreateFailed;
-            _ = sys.DeleteObject(font);
-            slot.* = null;
-            const before = app.theme_rebuilds;
-            app.reconfigureSystemTheme();
-            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
-            try std.testing.expect(slot.* != null);
-            app.reconfigureSystemTheme();
-            try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+            // Null by design without an icon face that has the glyphs; the
+            // geometric titlebar icons test retries those fonts instead.
+            const by_design = comptime std.mem.startsWith(u8, name, "titlebar_");
+            if (!(by_design and host.titlebar_icons_geometric)) {
+                const slot = &@field(host, name);
+                const font = slot.* orelse return error.FontCreateFailed;
+                _ = sys.DeleteObject(font);
+                slot.* = null;
+                const before = app.theme_rebuilds;
+                app.reconfigureSystemTheme();
+                try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+                try std.testing.expect(slot.* != null);
+                app.reconfigureSystemTheme();
+                try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+            }
         }
         // A previous failed lazy search-font attempt must get another chance.
         host.search_icon_font_resolved = true;
@@ -23681,6 +24337,85 @@ const Host = struct {
         try std.testing.expect(!host.search_icon_font_resolved);
         app.reconfigureSystemTheme();
         try std.testing.expectEqual(before + 1, app.theme_rebuilds);
+    }
+
+    test "titlebar icons are drawn geometrically when no icon face has the glyphs, and a failed check is retried" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        try runOnPrivateDesktop(geometricTitlebarIconsTestBody);
+    }
+
+    /// The titlebar icon fonts as the default faces leave them on this
+    /// machine: from `face`, the first icon face it has (Segoe MDL2 Assets
+    /// where Segoe Fluent Icons is missing), or the geometric state when
+    /// `face` is null.
+    fn expectDefaultTitlebarIconFonts(self: *const Host, face: ?[*:0]const u16) !void {
+        try std.testing.expectEqual(face == null, self.titlebar_icons_geometric);
+        inline for (.{ "titlebar_caption_icon_font", "titlebar_action_icon_font" }) |name| {
+            if (@field(self, name)) |font| {
+                try std.testing.expect(try fontIsFaceForTest(font, face orelse return error.TestUnexpectedFont));
+                try std.testing.expectEqual(GlyphCoverage.all, fontGlyphCoverage(font, &titlebar_icon_glyphs));
+            } else try std.testing.expect(face == null);
+        }
+    }
+
+    fn geometricTitlebarIconsTestBody() !void {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app, .hosts = &.{.{ .storage = &host, .register = true }} });
+        defer session.deinit();
+        defer {
+            inline for (.{ "chrome_font", "preview_font", "titlebar_caption_icon_font", "titlebar_action_icon_font", "search_icon_font", "chrome_brush", "overlay_brush", "edit_brush" }) |name| {
+                if (@field(host, name)) |object| _ = sys.DeleteObject(object);
+            }
+        }
+        const window = try BannerTestWindow.init(&host);
+        defer window.deinit(&host);
+        app.reconfigureSystemTheme();
+        const installed_face = try installedTitlebarIconFaceForTest();
+        try host.expectDefaultTitlebarIconFonts(installed_face);
+
+        // Every face missing, as Segoe Fluent Icons is on Windows 10.
+        host.recreateTitlebarIconFontsFrom(&.{icon_font_test_missing_face});
+        try std.testing.expect(host.titlebar_caption_icon_font == null);
+        try std.testing.expect(host.titlebar_action_icon_font == null);
+        try std.testing.expect(host.titlebar_icons_geometric);
+
+        // `win32_icons` draws the tab row's buttons and the caption buttons.
+        const canvas = try BannerTestCanvas.init(32, 32);
+        defer canvas.deinit();
+        const rect: RECT = .{ .left = 0, .top = 0, .right = 32, .bottom = 32 };
+        const background: u32 = 0x000000;
+        for (std.enums.values(TitlebarGlyphKind)) |kind| {
+            fillSolidRect(canvas.dc, rect, background);
+            host.drawTitlebarGlyph(canvas.dc, rect, kind, 0xFFFFFF, kind != .new_tab and kind != .dropdown);
+            _ = BannerTestCanvas.raw.GdiFlush();
+            try std.testing.expect(canvas.inked(rect, background) > 0);
+        }
+
+        // Fonts absent by design are not a failed resource: an unchanged
+        // theme message leaves them alone.
+        const geometric_rebuilds = app.theme_rebuilds;
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(geometric_rebuilds, app.theme_rebuilds);
+        try std.testing.expect(host.titlebar_icons_geometric);
+
+        // A glyph check GDI failed is no verdict: the fonts count as
+        // missing, and the next unchanged theme message rebuilds them from
+        // the default faces.
+        {
+            test_glyph_check_fails = true;
+            defer test_glyph_check_fails = false;
+            host.recreateTitlebarIconFonts();
+        }
+        try std.testing.expect(host.titlebar_caption_icon_font == null);
+        try std.testing.expect(host.titlebar_action_icon_font == null);
+        try std.testing.expect(!host.titlebar_icons_geometric);
+        const failed_rebuilds = app.theme_rebuilds;
+        app.reconfigureSystemTheme();
+        try std.testing.expectEqual(failed_rebuilds + 1, app.theme_rebuilds);
+        try host.expectDefaultTitlebarIconFonts(installed_face);
     }
 
     fn setWindowActive(self: *Host, active: bool) void {
@@ -23977,13 +24712,7 @@ const Host = struct {
         // Same rect `layout` uses, so a title change while minimized does not
         // cut every label down to a 0 px strip that survives the restore.
         const rect = (try self.layoutClientRect()) orelse return false;
-        const width = @max(0, rect.right - rect.left);
-        const right_buttons_width = self.rightButtonsWidth();
-        const caption_buttons_w = self.captionButtonsWidth();
-        const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
-        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
-        const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
+        const button_width = self.tabStripGeometry(@max(0, rect.right - rect.left)).button_width;
         const label_max_width = hostTabLabelMaxWidth(button_width, self.current_dpi);
         var tooltip_title_changed = false;
         var button_created = false;
@@ -24134,17 +24863,35 @@ const Host = struct {
         try self.ensureChromeButtons();
     }
 
-    fn layoutChromeForRect(self: *Host, rect: RECT, changed: *bool) bool {
-        const width = @max(0, rect.right - rect.left);
-        const right_buttons_width = self.rightButtonsWidth();
+    const TabStripGeometry = struct {
+        /// The tabs shown, as `visibleTabRange` picks them.
+        start: usize,
+        count: usize,
+        button_width: i32,
+    };
+
+    /// Which tabs the strip shows in a client area `width` px wide, and how
+    /// wide each tab button is. `syncTabButtons` budgets the labels to the
+    /// same width `layoutChromeForRect` gives the buttons.
+    fn tabStripGeometry(self: *const Host, width: i32) TabStripGeometry {
         // When integrated titlebar is active, reserve the rightmost
         // 3 × caption_button_w pixels for min/max/close so the
         // [+][▾] cluster and tab strip don't collide with them.
+        const tab_area_width = @max(1, width - self.rightButtonsWidth() - self.captionButtonsWidth());
+        const range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
+        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(range.count)));
+        return .{
+            .start = range.start,
+            .count = range.count,
+            .button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width)),
+        };
+    }
+
+    fn layoutChromeForRect(self: *Host, rect: RECT, changed: *bool) bool {
+        const width = @max(0, rect.right - rect.left);
         const caption_buttons_w = self.captionButtonsWidth();
-        const tab_area_width = @max(1, width - right_buttons_width - caption_buttons_w);
-        const tab_range = visibleTabRange(self.tabs.items.len, self.active_tab, tab_area_width, self.current_dpi);
-        const visible_count = @max(@as(i32, 1), @as(i32, @intCast(tab_range.count)));
-        const button_width = @min(@max(1, @divTrunc(tab_area_width, visible_count)), self.scaled(host_tab_max_button_width));
+        const tab_strip = self.tabStripGeometry(width);
+        const button_width = tab_strip.button_width;
         const button_y = self.scaled(3);
         // Scale button height with the actual tab-bar height so
         // buttons fill the integrated-titlebar row in Win11 (40 px)
@@ -24164,9 +24911,9 @@ const Host = struct {
             if (tab.button_hwnd) |button_hwnd| {
                 if (tabStripChildVisible(
                     tab_strip_visible,
-                    i >= tab_range.start and i < tab_range.start + tab_range.count,
+                    i >= tab_strip.start and i < tab_strip.start + tab_strip.count,
                 )) {
-                    const visible_index: i32 = @intCast(i - tab_range.start);
+                    const visible_index: i32 = @intCast(i - tab_strip.start);
                     const tab_left = visible_index * button_width;
                     changed.* = applyChromeChildRect(
                         button_hwnd,
@@ -24208,7 +24955,7 @@ const Host = struct {
         // rect so a screen reader reading by position lands on the tabs
         // rather than on a degenerate box at the window origin.
         if (self.tab_container_hwnd) |container_hwnd| {
-            const visible_tabs: i32 = @intCast(tab_range.count);
+            const visible_tabs: i32 = @intCast(tab_strip.count);
             if (tabStripChildVisible(tab_strip_visible, visible_tabs > 0)) {
                 changed.* = applyChromeChildRect(
                     container_hwnd,
@@ -24612,7 +25359,134 @@ const Host = struct {
         );
     }
 
+    /// Put `surface` where `placement` says: its docked search frame (or
+    /// none), its pane, then what a moved or newly shown pane needs
+    /// (`surfaceLayoutRuntimeSync`). A search frame at the top of the
+    /// content area pushes `banner_top` below it. Returns whether anything
+    /// moved.
+    fn applySurfacePlacement(
+        surface: *Surface,
+        placement: win32_layout.SurfacePlacement,
+        content_top: i32,
+        visibility_changed: bool,
+        banner_top: *i32,
+    ) !bool {
+        var changed = false;
+        if (placement.search_frame_rect) |search_frame_rect| {
+            changed = try surface.layoutSearchBarControls(layoutRectToWin32(search_frame_rect), true);
+            if (search_frame_rect.top == content_top) banner_top.* = @max(banner_top.*, search_frame_rect.bottom);
+        } else {
+            changed = surface.hideSearchBarControls();
+        }
+        var pane_rect_changed = false;
+        if (surface.hwnd) |surface_hwnd| {
+            pane_rect_changed = applyChildRect(surface_hwnd, &surface.placement, layoutRectToWin32(placement.pane_rect));
+        }
+        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
+        if (runtime_sync.scrollbar_refresh) try surface.refreshScrollbarWindow();
+        if (runtime_sync.core_size_sync) surface.syncCoreSizeFromClientRect();
+        return changed or pane_rect_changed;
+    }
+
+    /// Tell every pane whether the renderer dims it as an unfocused split
+    /// (`win32_chrome_state.splitDimmed`), in every tab, so a background
+    /// tab is right when it shows. It follows `tab.focused`, the split the
+    /// tab has selected, not keyboard focus: an inactive window keeps its
+    /// focused split undimmed, as upstream does. Called wherever
+    /// `tab.focused` or the split tree changes (`layout`, the activation
+    /// and focus funnels, `App.followShellFocus`) and from
+    /// `App.reconfigureTheme` for High Contrast.
+    fn syncSplitDim(self: *Host) void {
+        const high_contrast = isHighContrastActive();
+        for (self.tabs.items) |*tab| {
+            const pane_count = tab.leafCount();
+            var it = tab.tree.iterator();
+            while (it.next()) |entry| {
+                const selected = entry.handle == tab.focused or
+                    (if (tab.tree.zoomed) |zoomed| entry.handle == zoomed else false);
+                entry.view.setSplitDimmed(win32_chrome_state.splitDimmed(pane_count, selected, high_contrast));
+            }
+        }
+    }
+
+    test "only unfocused splits of a two-pane tab are dimmed" {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
+        if (isHighContrastActive()) return error.SkipZigTest;
+
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var host: Host = undefined;
+        var surface_a: Surface = undefined;
+        var surface_b: Surface = undefined;
+        var surface_c: Surface = undefined;
+        var session: TestSession = .{};
+        try session.init(.{
+            .core_app = &core_app,
+            .app = &app,
+            .hosts = &.{.{ .storage = &host, .register = true }},
+            .surfaces = &.{
+                .{ .storage = &surface_a, .host = &host, .register = true },
+                .{ .storage = &surface_b, .host = &host },
+                .{ .storage = &surface_c, .host = &host, .register = true },
+            },
+            .tabs = &.{.{ .host = &host, .surface = &surface_a, .id = 1 }},
+        });
+        defer session.deinit();
+
+        // Tab 1 is [A | B] with A selected; tab 2 holds C alone.
+        const inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+        defer {
+            var cleanup = inserted;
+            cleanup.deinit();
+        }
+        const next_tree = try host.tabs.items[0].tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+        host.tabs.items[0].tree.deinit();
+        host.tabs.items[0].tree = next_tree;
+        host.tabs.items[0].focused = host.tabs.items[0].findHandle(&surface_a).?;
+        try host.tabs.append(std.testing.allocator, try Tab.init(std.testing.allocator, 2, &surface_c));
+
+        host.syncSplitDim();
+        try std.testing.expect(!surface_a.split_dimmed);
+        try std.testing.expect(surface_b.split_dimmed);
+        try std.testing.expect(!surface_c.split_dimmed);
+
+        // Focus moving to B within the tab swaps them.
+        _ = app.noteSurfaceFocused(&surface_b);
+        try std.testing.expect(surface_a.split_dimmed);
+        try std.testing.expect(!surface_b.split_dimmed);
+
+        // The keyboard leaving (an inactive window) keeps B, the split the
+        // tab has selected, undimmed.
+        surface_b.focusChanged(false);
+        try std.testing.expect(!surface_b.split_dimmed);
+
+        // A no-focus activation, as a docked search edit taking focus does.
+        app.activateSurfaceNoFocus(&surface_a);
+        try std.testing.expect(!surface_a.split_dimmed);
+        try std.testing.expect(surface_b.split_dimmed);
+
+        // A zoomed pane shows alone and is never dimmed.
+        host.tabs.items[0].tree.zoom(host.tabs.items[0].findHandle(&surface_b).?);
+        host.syncSplitDim();
+        try std.testing.expect(!surface_b.split_dimmed);
+        host.tabs.items[0].tree.zoom(null);
+
+        // One pane left: nothing to compare it with.
+        const alone = try host.tabs.items[0].tree.remove(std.testing.allocator, host.tabs.items[0].findHandle(&surface_b).?);
+        host.tabs.items[0].tree.deinit();
+        host.tabs.items[0].tree = alone;
+        host.tabs.items[0].focused = host.tabs.items[0].findHandle(&surface_a).?;
+        surface_a.split_dimmed = true;
+        host.syncSplitDim();
+        try std.testing.expect(!surface_a.split_dimmed);
+        // A surface without a started core tells no renderer yet.
+        try std.testing.expect(!surface_b.split_dimmed_sent);
+    }
+
     fn layout(self: *Host) !void {
+        // Every structural change ends in a layout, including the ones that
+        // fail or return before placing panes.
+        defer self.syncSplitDim();
         const rect = (try self.layoutClientRect()) orelse return;
         var chrome_layout_changed = false;
         if (!self.layoutChromeForRect(rect, &chrome_layout_changed)) return;
@@ -24665,32 +25539,13 @@ const Host = struct {
                     entry.view.search_bar.visible,
                     search_bar_height,
                 );
-                if (placement.search_frame_rect) |search_frame_rect| {
-                    content_layout_changed = (try entry.view.layoutSearchBarControls(
-                        layoutRectToWin32(search_frame_rect),
-                        true,
-                    )) or content_layout_changed;
-                    if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                } else {
-                    content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                }
-                const pane_rect = layoutRectToWin32(placement.pane_rect);
-                var pane_rect_changed = false;
-                if (entry.view.hwnd) |surface_hwnd| {
-                    pane_rect_changed = applyChildRect(
-                        surface_hwnd,
-                        &entry.view.placement,
-                        pane_rect,
-                    );
-                    content_layout_changed = pane_rect_changed or content_layout_changed;
-                }
-                const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                if (runtime_sync.scrollbar_refresh) {
-                    try entry.view.refreshScrollbarWindow();
-                }
-                if (runtime_sync.core_size_sync) {
-                    entry.view.syncCoreSizeFromClientRect();
-                }
+                content_layout_changed = (try applySurfacePlacement(
+                    entry.view,
+                    placement,
+                    content_rect.top,
+                    visibility_changed,
+                    &banner_top,
+                )) or content_layout_changed;
                 entry.view.syncContentScaleToHostDpi();
             }
         } else {
@@ -24706,7 +25561,7 @@ const Host = struct {
                     if (entry.view.window_visible != on_screen) continue;
                     const visibility_changed = !entry.view.window_visible;
                     content_layout_changed = content_layout_changed or visibility_changed;
-                    if (entry.view.hwnd) |surface_hwnd| {
+                    if (entry.view.hwnd != null) {
                         const placement = self.splitPanePlacement(
                             content_rect,
                             spatial,
@@ -24714,29 +25569,13 @@ const Host = struct {
                             has_multi_panes,
                             entry.view.search_bar.visible,
                         );
-                        if (placement.search_frame_rect) |search_frame_rect| {
-                            content_layout_changed = (try entry.view.layoutSearchBarControls(
-                                layoutRectToWin32(search_frame_rect),
-                                true,
-                            )) or content_layout_changed;
-                            if (search_frame_rect.top == content_rect.top) banner_top = @max(banner_top, search_frame_rect.bottom);
-                        } else {
-                            content_layout_changed = entry.view.hideSearchBarControls() or content_layout_changed;
-                        }
-                        const pane_rect = layoutRectToWin32(placement.pane_rect);
-                        const pane_rect_changed = applyChildRect(
-                            surface_hwnd,
-                            &entry.view.placement,
-                            pane_rect,
-                        );
-                        content_layout_changed = pane_rect_changed or content_layout_changed;
-                        const runtime_sync = surfaceLayoutRuntimeSync(visibility_changed, pane_rect_changed);
-                        if (runtime_sync.scrollbar_refresh) {
-                            try entry.view.refreshScrollbarWindow();
-                        }
-                        if (runtime_sync.core_size_sync) {
-                            entry.view.syncCoreSizeFromClientRect();
-                        }
+                        content_layout_changed = (try applySurfacePlacement(
+                            entry.view,
+                            placement,
+                            content_rect.top,
+                            visibility_changed,
+                            &banner_top,
+                        )) or content_layout_changed;
                     }
                     // In its slot first: shown at the rect it had before, a pane
                     // that came out of a zoom would cover its neighbours.
@@ -25525,10 +26364,8 @@ const Host = struct {
         const alloc = self.app.core_app.alloc;
         const theme = &self.app.resolved_theme;
 
-        const prev_font = if (self.chrome_font) |font| sys.SelectObject(hdc, font) else null;
-        defer if (prev_font) |pf| {
-            _ = sys.SelectObject(hdc, pf);
-        };
+        const prev_font = self.selectChromeFont(hdc);
+        defer restoreFont(hdc, prev_font);
 
         var client_rect: RECT = undefined;
         if (sys.GetClientRect(hwnd, &client_rect) == 0) return;
@@ -25625,7 +26462,125 @@ const SurfaceInitOptions = struct {
     /// and by a handed-off console that asked not to take focus.
     show: InitialShow = .activate,
     adopted_session: ?*win32_terminal_handoff.PendingSession = null,
+    /// Whether a new window takes `maximize` and `fullscreen` from `config`
+    /// while `Surface.init` shows it. Session restore turns this off: it
+    /// moves the window to its saved rect first and applies them afterwards
+    /// (`App.restoreSessionWindow`).
+    config_window_start: bool = true,
+    /// The argv a forwarded launch (a second `noctty`, or `noctty
+    /// +new-window`) applied to `config`, for `WindowKeeps`.
+    forwarded_arguments: ?[]const [:0]const u8 = null,
 };
+
+/// What a new window keeps of its own config over the state it copies from
+/// the window it is opened from (`new_window`, a forwarded launch, a profile
+/// in a new window; `Surface.inheritWindowStateFrom`). By default it copies
+/// that window's size, one cascade step off it, its maximized or fullscreen
+/// state, its decorations and its background opacity.
+const WindowKeeps = struct {
+    /// `window-position-x/y` place it: it stays where `App.createHost` put
+    /// it and takes only the size.
+    position: bool = false,
+    /// The size core init gave it from its `window-width`/`window-height`.
+    /// Its state is still the source's: maximized or fullscreen, it returns
+    /// to that size.
+    size: bool = false,
+    /// Its own `window-decoration`.
+    decoration: bool = false,
+    /// Its own `background-opacity`.
+    background_opacity: bool = false,
+
+    /// What a window `Surface.init` creates keeps: its position whenever its
+    /// config places it, as for every new window, and the rest when a
+    /// forwarded launch set them. docs/windows.md ("Forwarded arguments")
+    /// says the running noctty honors them, and copying the source dropped
+    /// them all. The same keys from the app config are still the source's.
+    fn forNewSurface(config: *const configpkg.Config, opts: SurfaceInitOptions) WindowKeeps {
+        const argv = opts.forwarded_arguments orelse &.{};
+        return .{
+            .position = configuredHostWindowPosition(config) != null,
+            // Core init sizes the window only when both are set.
+            .size = (forwardedArgvSetsKey(argv, "window-width") or forwardedArgvSetsKey(argv, "window-height")) and
+                config.@"window-width" > 0 and config.@"window-height" > 0,
+            .decoration = forwardedArgvSetsKey(argv, "window-decoration"),
+            .background_opacity = forwardedArgvSetsKey(argv, "background-opacity"),
+        };
+    }
+};
+
+test "win32 a new window keeps the forwarded window keys and the configured position" {
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    try std.testing.expectEqual(WindowKeeps{}, WindowKeeps.forNewSurface(&config, .{}));
+    const argv: []const [:0]const u8 = &.{ "--window-width=80", "--window-decoration=none", "--background-opacity=0.5" };
+    // A size needs both keys in the window's config, as core init does.
+    try std.testing.expectEqual(
+        WindowKeeps{ .decoration = true, .background_opacity = true },
+        WindowKeeps.forNewSurface(&config, .{ .forwarded_arguments = argv }),
+    );
+    config.@"window-width" = 80;
+    config.@"window-height" = 24;
+    try std.testing.expectEqual(
+        WindowKeeps{ .size = true, .decoration = true, .background_opacity = true },
+        WindowKeeps.forNewSurface(&config, .{ .forwarded_arguments = argv }),
+    );
+    // From the app config they stay the source's; the position is the
+    // window's either way.
+    config.@"window-position-x" = 10;
+    try std.testing.expectEqual(WindowKeeps{}, WindowKeeps.forNewSurface(&config, .{}));
+    config.@"window-position-y" = 20;
+    try std.testing.expectEqual(WindowKeeps{ .position = true }, WindowKeeps.forNewSurface(&config, .{}));
+}
+
+/// The state a new top-level window starts in from its config's `maximize`
+/// and `fullscreen` (#496). Both apply to every new window, restored and
+/// forwarded ones included, but never to a tab, a split, the quick terminal
+/// or a handed-off console, which keeps the show state its client asked for.
+/// A config reload does not change the windows already open.
+const WindowStart = struct {
+    maximize: bool = false,
+    fullscreen: bool = false,
+
+    fn fromConfig(config: *const configpkg.Config) WindowStart {
+        return .{ .maximize = config.maximize, .fullscreen = config.fullscreen != .false };
+    }
+
+    /// What `Surface.init` applies to the window it creates.
+    fn forNewSurface(config: *const configpkg.Config, opts: SurfaceInitOptions) WindowStart {
+        if (opts.host_id != null or opts.quick_terminal or opts.adopted_session != null or
+            !opts.config_window_start) return .{};
+        return fromConfig(config);
+    }
+};
+
+test "win32 maximize and fullscreen start only a new ordinary window" {
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.maximize = true;
+    config.fullscreen = .true;
+    const both: WindowStart = .{ .maximize = true, .fullscreen = true };
+    try std.testing.expectEqual(both, WindowStart.forNewSurface(&config, .{}));
+    // A clone of another window takes them too (after it copies the
+    // source's state), and so does a window a forwarded argv configured.
+    var source: Surface = undefined;
+    try std.testing.expectEqual(both, WindowStart.forNewSurface(&config, .{ .clone_state_from = &source }));
+    // Not a tab or a split of a window that is already open, the quick
+    // terminal, a handed-off console, or a restored window, which applies
+    // them once it is at its saved rect.
+    var pending: win32_terminal_handoff.PendingSession = undefined;
+    for ([_]SurfaceInitOptions{
+        .{ .host_id = 1 },
+        .{ .host_id = 1, .tab_id = 1, .clone_state_from = &source },
+        .{ .quick_terminal = true },
+        .{ .adopted_session = &pending },
+        .{ .config_window_start = false },
+    }) |opts| {
+        try std.testing.expectEqual(WindowStart{}, WindowStart.forNewSurface(&config, opts));
+    }
+    config.maximize = false;
+    config.fullscreen = .false;
+    try std.testing.expectEqual(WindowStart{}, WindowStart.forNewSurface(&config, .{}));
+}
 
 /// The first show of a new host window.
 const InitialShow = enum {
@@ -26808,10 +27763,9 @@ fn rendererTickRepaintMode(
 }
 
 fn surfaceSizeChangeRepaintMode(host: ?*const Host, now_ms: u64) SurfaceRepaintRequestMode {
-    const h = host orelse return surfaceRepaintRequestMode(null, now_ms);
-    if (h.is_live_resize.load(.acquire)) return .update_now;
-    if (resizeSettleActive(h, now_ms)) return .update_now;
-    return surfaceRepaintRequestMode(h, now_ms);
+    const h = host orelse return .queue;
+    if (h.is_live_resize.load(.acquire) or resizeSettleActive(h, now_ms)) return .update_now;
+    return .queue;
 }
 
 fn surfaceSizeChangePrimesRenderer(repaint_mode: SurfaceRepaintRequestMode) bool {
@@ -27015,23 +27969,24 @@ fn isSystemDarkMode() bool {
 
 const immersive_color_set_w = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
 
+/// The setting a `WM_SETTINGCHANGE` names in its lParam, or null when it
+/// names none.
+fn settingChangeName(lParam: LPARAM) ?[:0]const u16 {
+    if (lParam == 0) return null;
+    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lParam)));
+    return std.mem.span(name);
+}
+
 fn settingChangeIsImmersiveColorSet(lParam: LPARAM) bool {
-    if (lParam == 0) return false;
-    const raw: usize = @bitCast(lParam);
-    const setting_name: [*:0]const u16 = @ptrFromInt(raw);
-    return std.mem.eql(
-        u16,
-        std.mem.span(setting_name),
-        immersive_color_set_w[0..immersive_color_set_w.len],
-    );
+    const name = settingChangeName(lParam) orelse return false;
+    return std.mem.eql(u16, name, immersive_color_set_w);
 }
 
 fn settingChangeAffectsTheme(lparam: LPARAM) bool {
-    if (lparam == 0) return true;
-    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    const name = settingChangeName(lparam) orelse return true;
     inline for (.{ "Environment", "intl", "Policy" }) |irrelevant| {
         const value = std.unicode.utf8ToUtf16LeStringLiteral(irrelevant);
-        if (std.mem.eql(u16, std.mem.span(name), value)) return false;
+        if (std.mem.eql(u16, name, value)) return false;
     }
     return true;
 }
@@ -27157,7 +28112,38 @@ fn resolveTheme(config: *const configpkg.Config) ThemeColors {
         .ghostty => darkTheme(),
     };
     const follow = config.@"accent-follow-system";
-    return withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null);
+    return withSplitDividerColor(
+        withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null),
+        config.@"split-divider-color",
+    );
+}
+
+/// `split-divider-color` recolors the gap between split panes; unset, the
+/// theme's divider stays. The focused pane's accent is not this color. High
+/// Contrast never gets here (`resolveTheme`), so it keeps system colors.
+fn withSplitDividerColor(theme: ThemeColors, color: ?configpkg.Config.Color) ThemeColors {
+    var result = theme;
+    if (color) |value| result.pane_divider = rgb(value.r, value.g, value.b);
+    return result;
+}
+
+test "split-divider-color recolors the pane gap" {
+    const dark = darkTheme();
+    const recolored = withSplitDividerColor(dark, .{ .r = 0x12, .g = 0x34, .b = 0x56 });
+    try std.testing.expectEqual(rgb(0x12, 0x34, 0x56), recolored.pane_divider);
+    try std.testing.expectEqual(dark.pane_divider_focused, recolored.pane_divider_focused);
+    try std.testing.expectEqual(dark.pane_divider, withSplitDividerColor(dark, null).pane_divider);
+    try std.testing.expectEqual(lightTheme().pane_divider, withSplitDividerColor(lightTheme(), null).pane_divider);
+
+    // Through the config, as a reload resolves it.
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.@"window-theme" = .dark;
+    config.@"accent-follow-system" = false;
+    config.@"split-divider-color" = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    if (!isHighContrastActive()) {
+        try std.testing.expectEqual(rgb(0x12, 0x34, 0x56), resolveTheme(&config).pane_divider);
+    }
 }
 
 /// DESIGN.md's floor for essential non-text indicators against the surface
@@ -28339,6 +29325,7 @@ fn surfaceConfirmWriteCancel(userdata: ?*anyopaque, _: ConfirmCancelReason) void
 fn surfaceDropPayloadCallback(ctx: *anyopaque, payload: []const u8) void {
     const surface: *Surface = @ptrCast(@alignCast(ctx));
     if (payload.len == 0) return;
+    surface.noteProgramInput();
     const alloc = surface.app.core_app.alloc;
     const payload_z = alloc.dupeZ(u8, payload) catch |err| {
         std.log.warn("drop payload dupe failed err={}", .{err});
@@ -28467,7 +29454,7 @@ test "win32 DPI suggestions preserve a quick terminal tween but resize ordinary 
         _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
         _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
     }
-    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, true);
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{ .quick_terminal = true });
     const hwnd = host.hwnd.?;
     var before: RECT = undefined;
     try std.testing.expect(sys.GetWindowRect(hwnd, &before) != 0);
@@ -28521,7 +29508,7 @@ test "win32 a DPI change holds the terminal grid from WM_GETDPISCALEDSIZE to WM_
         _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
         _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
     }
-    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, true);
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{ .quick_terminal = true });
     const hwnd = host.hwnd.?;
     var size: extern struct { cx: i32, cy: i32 } = .{ .cx = 900, .cy = 600 };
     const size_param: LPARAM = @bitCast(@intFromPtr(&size));
@@ -28890,13 +29877,14 @@ const FullscreenMonitor = struct {
 };
 
 fn fullscreenRestoreRect(rect: RECT, old_work: RECT, new_work: RECT, old_dpi: u32, new_dpi: u32) RECT {
-    const scaled_width = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.right - rect.left, @intCast(new_dpi), @intCast(old_dpi)) else rect.right - rect.left;
-    const scaled_height = if (old_dpi > 0 and new_dpi > 0) sys.MulDiv(rect.bottom - rect.top, @intCast(new_dpi), @intCast(old_dpi)) else rect.bottom - rect.top;
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+    const scale = old_dpi > 0 and new_dpi > 0;
     return fitRectInWork(
         rect.left + new_work.left - old_work.left,
         rect.top + new_work.top - old_work.top,
-        scaled_width,
-        scaled_height,
+        if (scale) sys.MulDiv(width, @intCast(new_dpi), @intCast(old_dpi)) else width,
+        if (scale) sys.MulDiv(height, @intCast(new_dpi), @intCast(old_dpi)) else height,
         new_work,
     );
 }
@@ -28938,14 +29926,63 @@ fn workspaceRectToScreen(rect: RECT, monitor: MONITORINFO) RECT {
     };
 }
 
+/// Makes `rect` (screen coordinates) the rect the minimized `hwnd` returns
+/// to, and leaves it minimized.
+fn setMinimizedNormalRect(hwnd: HWND, rect: RECT) !void {
+    var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+    placement.length = @sizeOf(WINDOWPLACEMENT);
+    if (sys.GetWindowPlacement(hwnd, &placement) == 0) return lastError();
+    // Workspace coordinates of the monitor the rect is on, as
+    // `sessionWindowPlacementOn` reads them.
+    const center: POINT = .{
+        .x = @divTrunc(rect.left, 2) + @divTrunc(rect.right, 2),
+        .y = @divTrunc(rect.top, 2) + @divTrunc(rect.bottom, 2),
+    };
+    const monitor = sys.MonitorFromPoint(center, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+    var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+    info.cbSize = @sizeOf(MONITORINFO);
+    if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+    placement.rcNormalPosition = Surface.screenRectToWorkspace(rect, info);
+    placement.showCmd = c.SW_SHOWMINNOACTIVE;
+    if (sys.SetWindowPlacement(hwnd, &placement) == 0) return lastError();
+}
+
 /// `SetWindowPos` flags for a window placed like the one it was opened from.
-/// `window-position-x/y` says where every new window goes, so with it set the
-/// window keeps that place and takes only the source's size. A fullscreen
-/// window covers its monitor wherever the config would put it.
-fn newWindowSetPosFlags(config: *const configpkg.Config, placed: NewWindowPlacement) UINT {
+/// `window-position-x/y` says where every new window goes, so when its config
+/// sets them (`positioned`, `WindowKeeps.position`) the window keeps that
+/// place and takes only the size. With a size of its own as well (`sized`,
+/// `WindowKeeps.size`) it takes neither: core init already gave it that size
+/// where it is, which can be another monitor than the source's, whose work
+/// area `newWindowPlacement` fits the rect to. A fullscreen window covers its
+/// monitor wherever the config would put it.
+fn newWindowSetPosFlags(positioned: bool, sized: bool, placed: NewWindowPlacement) UINT {
     var flags: UINT = c.SWP_NOACTIVATE;
-    if (!placed.copied and configuredHostWindowPosition(config) != null) flags |= c.SWP_NOMOVE;
+    if (!placed.copied and positioned) {
+        flags |= c.SWP_NOMOVE;
+        if (sized) flags |= c.SWP_NOSIZE;
+    }
     return flags;
+}
+
+test "win32 a new window placed and sized by its own config takes neither from the window it copies" {
+    const cascaded: NewWindowPlacement = .{ .rect = std.mem.zeroes(RECT), .maximize = null };
+    const fullscreen: NewWindowPlacement = .{ .rect = std.mem.zeroes(RECT), .maximize = null, .copied = true };
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(false, false, cascaded));
+    // A size alone is still moved one cascade step off the source and
+    // fitted to its monitor, where the window goes.
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(false, true, cascaded));
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE | c.SWP_NOMOVE), newWindowSetPosFlags(true, false, cascaded));
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE | c.SWP_NOMOVE | c.SWP_NOSIZE), newWindowSetPosFlags(true, true, cascaded));
+    // A fullscreen window covers the source's monitor all the same.
+    try std.testing.expectEqual(@as(UINT, c.SWP_NOACTIVATE), newWindowSetPosFlags(true, true, fullscreen));
+}
+
+/// A window's outer size, in physical pixels.
+const WindowSize = struct { width: i32, height: i32 };
+
+/// `rect` with its top-left corner kept and its size `size`.
+fn rectWithSize(rect: RECT, size: WindowSize) RECT {
+    return .{ .left = rect.left, .top = rect.top, .right = rect.left + size.width, .bottom = rect.top + size.height };
 }
 
 /// Where a window opened from another one (`new_window`, a profile in a new
@@ -28966,8 +30003,10 @@ const NewWindowPlacement = struct {
 };
 
 /// `destination` is the window being placed, if it already exists: it is not
-/// one of the windows the new one steps past.
-fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?HWND) !NewWindowPlacement {
+/// one of the windows the new one steps past. `size` is the window's own
+/// size (`WindowKeeps.size`), which replaces the source's. A fullscreen window
+/// covers the monitor whatever its size.
+fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?HWND, size: ?WindowSize) !NewWindowPlacement {
     var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
     placement.length = @sizeOf(WINDOWPLACEMENT);
     if (sys.GetWindowPlacement(source, &placement) == 0) return lastError();
@@ -28986,10 +30025,12 @@ fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?H
     if (restoresMaximized(source, &placement)) {
         // It is maximized again, never minimized with it.
         placement.showCmd = c.SW_MAXIMIZE;
-        return .{
-            .rect = workspaceRectToScreen(placement.rcNormalPosition, info),
-            .maximize = placement,
-        };
+        var normal = workspaceRectToScreen(placement.rcNormalPosition, info);
+        if (size) |own| {
+            normal = fitRectInWork(normal.left, normal.top, own.width, own.height, info.rcWork);
+            placement.rcNormalPosition = Surface.screenRectToWorkspace(normal, info);
+        }
+        return .{ .rect = normal, .maximize = placement };
     }
 
     var rect: RECT = undefined;
@@ -28998,27 +30039,21 @@ fn newWindowPlacement(app: *App, source: HWND, fullscreen: bool, destination: ?H
     } else if (sys.GetWindowRect(source, &rect) == 0) {
         return lastError();
     }
+    if (size) |own| rect = rectWithSize(rect, own);
     const step = cascadeStep(sys.GetDpiForWindow(source));
     // One step off the source, and on past any window already there: every
     // new window of a forwarded launch is opened from the same first window.
-    var placed = fitRectInWork(
-        rect.left + step,
-        rect.top + step,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        info.rcWork,
-    );
+    var placed = cascadedRect(rect, step, info.rcWork);
     var steps: u8 = 0;
     while (steps < 8 and app.windowStartsAt(placed, destination)) : (steps += 1) {
-        placed = fitRectInWork(
-            placed.left + step,
-            placed.top + step,
-            placed.right - placed.left,
-            placed.bottom - placed.top,
-            info.rcWork,
-        );
+        placed = cascadedRect(placed, step, info.rcWork);
     }
     return .{ .rect = placed, .maximize = null };
+}
+
+/// `rect` moved `step` down and right, kept inside `work`.
+fn cascadedRect(rect: RECT, step: i32, work: RECT) RECT {
+    return fitRectInWork(rect.left + step, rect.top + step, rect.right - rect.left, rect.bottom - rect.top, work);
 }
 
 test "win32 fullscreen restore translates work areas and scales size to fit" {
@@ -29376,13 +30411,10 @@ fn appendSettingsPayload(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 /// it leaves a file that mixes encodings, of which the loader reads only the
 /// appended lines. A byte-order mark, or a NUL byte anywhere (UTF-16 and UTF-32
 /// without one), marks such a file; a config never contains NUL.
-fn settingsTextPatchable(raw: []const u8) bool {
-    return settingsTextProblem(raw) == null;
-}
-
-/// Why `raw` cannot be patched, named for the status line: a byte order mark
-/// says UTF-16 (what Windows PowerShell 5.1 writes), bare NUL bytes say a
-/// binary file or UTF-16/UTF-32 without a mark.
+///
+/// Why `raw` cannot be patched, or null when it can, named for the status
+/// line: a byte order mark says UTF-16 (what Windows PowerShell 5.1 writes),
+/// bare NUL bytes say a binary file or UTF-16/UTF-32 without a mark.
 fn settingsTextProblem(raw: []const u8) ?win32_settings.SaveError {
     if (std.mem.startsWith(u8, raw, "\xff\xfe") or std.mem.startsWith(u8, raw, "\xfe\xff")) return error.UnsupportedEncoding;
     if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.BinaryConfig;
@@ -29435,11 +30467,7 @@ fn persistSettings(
     };
     defer alloc.free(raw_before);
     if (settingsTextProblem(raw_before)) |problem| {
-        if (detail) |d| {
-            const text = std.fmt.allocPrint(alloc, "the config file {s}", .{target.path}) catch return error.OutOfMemory;
-            defer alloc.free(text);
-            d.set(alloc, text);
-        }
+        try setSettingsFailureDetail(alloc, detail, "the config file {s}", .{target.path});
         return problem;
     }
 
@@ -29495,7 +30523,6 @@ fn patchOrAppendEdits(
     out: *std.ArrayListUnmanaged(u8),
 ) !void {
     @setEvalBranchQuota(10_000);
-    const ConfigFormatter = @import("../config/formatter.zig");
     const keys_total = comptime std.enums.values(SettingsConfigKey).len;
     var last_line: [keys_total]usize = @splat(std.math.maxInt(usize));
     var lines: std.ArrayListUnmanaged([]const u8) = .{};
@@ -29528,10 +30555,7 @@ fn patchOrAppendEdits(
                 if (last_line[@intFromEnum(key)] == index) {
                     var scratch: std.Io.Writer.Allocating = .init(alloc);
                     defer scratch.deinit();
-                    // An empty list's formatter already emits its reset.
-                    if (repeatable and @field(pending, field.name).list.items.len != 0)
-                        try scratch.writer.print("{s} = \n", .{field.name});
-                    try ConfigFormatter.formatEntry(field.type, field.name, @field(pending, field.name), &scratch.writer);
+                    try writeSettingsEntry(field, @field(pending, field.name), &scratch.writer);
                     const payload = std.mem.trimEnd(u8, scratch.written(), "\n");
                     const has_cr = std.mem.endsWith(u8, line, "\r");
                     const ending: []const u8 = if (has_cr) "\r\n" else if (index + 1 < lines.items.len) "\n" else dominant_ending;
@@ -29561,12 +30585,23 @@ fn patchOrAppendEdits(
                 try out.appendSlice(alloc, dominant_ending);
             var scratch: std.Io.Writer.Allocating = .init(alloc);
             defer scratch.deinit();
-            if (field.type == configpkg.Config.RepeatableString and @field(pending, field.name).list.items.len != 0)
-                try scratch.writer.print("{s} = \n", .{field.name});
-            try ConfigFormatter.formatEntry(field.type, field.name, @field(pending, field.name), &scratch.writer);
+            try writeSettingsEntry(field, @field(pending, field.name), &scratch.writer);
             try appendSettingsPayload(alloc, out, scratch.written(), dominant_ending);
         }
     }
+}
+
+/// One edited setting as config text, each line ending in a newline. A
+/// repeatable list that is not empty starts with `<key> = `, which resets
+/// what lower layers set; an empty list's formatter already emits that reset.
+fn writeSettingsEntry(
+    comptime field: std.builtin.Type.StructField,
+    value: field.type,
+    writer: *std.Io.Writer,
+) !void {
+    if (field.type == configpkg.Config.RepeatableString and value.list.items.len != 0)
+        try writer.print("{s} = \n", .{field.name});
+    try @import("../config/formatter.zig").formatEntry(field.type, field.name, value, writer);
 }
 
 test "win32 settings automatic command is not masked by default resolution" {
@@ -29754,6 +30789,13 @@ test "win32 a config with an unknown key, a bad value, a missing include and a m
     try std.testing.expect(std.mem.startsWith(u8, banner, "4 config problems: "));
 }
 
+/// Free what reporting config problems leaves on `app`: the banner text, then
+/// the problems.
+fn testFreeConfigProblems(app: *App, alloc: Allocator) void {
+    if (app.config_problems_banner) |text| alloc.free(text);
+    app.config_problems.deinit(alloc);
+}
+
 test "win32 config problems raise an error banner that only a clean load takes down" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -29771,8 +30813,7 @@ test "win32 config problems raise an error banner that only a clean load takes d
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29820,8 +30861,7 @@ test "win32 config problems reach every host even without a primary surface" {
         },
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .key = "theme", .message = "missing theme" });
     try std.testing.expect(app.reportConfigProblems(&app.config));
     try std.testing.expectEqual(HostBannerKind.err, first.banner_kind);
@@ -29844,8 +30884,7 @@ test "win32 config problems preserve a pending launch-layout error until dismiss
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     try host.setBanner(.err, "Layout could not be opened.");
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
     try std.testing.expect(app.reportConfigProblems(&app.config));
@@ -29871,8 +30910,7 @@ test "win32 config problems wait for a later host and clear queued errors on a c
         .hosts = &.{ .{ .storage = &first }, .{ .storage = &later } },
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     app.config.@"initial-window" = false;
     try app.config._diagnostics.append(app.config._arena.?.allocator(), .{ .message = "missing theme" });
     // No hosts exist when an initial-window=false process loads its config.
@@ -29909,8 +30947,7 @@ test "win32 config problems list configured fonts once per load without any term
         .hosts = &.{.{ .storage = &host }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
     const arena = app.config._arena.?.allocator();
     try app.config.@"font-family".parseCLI(arena, "Consolas");
     try app.config.@"font-family".parseCLI(arena, "Small05 Missing Fallback");
@@ -29946,8 +30983,7 @@ test "win32 a config change that brings other problems refreshes the list and sp
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     // The system switched to dark under `theme = light:Installed,dark:Missing`:
     // the config now in effect carries the other half's problem.
@@ -29993,8 +31029,7 @@ test "win32 a Settings save does not replace the config problems banner with its
         .tabs = &.{.{ .host = &host, .surface = &surface, .id = 1 }},
     });
     defer session.deinit();
-    defer app.config_problems.deinit(alloc);
-    defer if (app.config_problems_banner) |text| alloc.free(text);
+    defer testFreeConfigProblems(&app, alloc);
 
     // No problems: the save says so, as an info banner.
     settingsNotifySuccessThunk(&app, "Settings saved", "");
@@ -30521,14 +31556,14 @@ test "win32 settings save refuses UTF-16 text and leaves the file as it was" {
 }
 
 test "win32 settings text is patchable unless a UTF-16 or UTF-32 marker or NUL says it is not" {
-    try std.testing.expect(settingsTextPatchable(""));
-    try std.testing.expect(settingsTextPatchable("font-size = 14\n"));
-    try std.testing.expect(settingsTextPatchable("\xef\xbb\xbffont-size = 14\n"));
-    try std.testing.expect(settingsTextPatchable("# caf\xe9\n"));
-    try std.testing.expect(!settingsTextPatchable("\xff\xfe"));
-    try std.testing.expect(!settingsTextPatchable("\xfe\xff"));
-    try std.testing.expect(!settingsTextPatchable("a\x00"));
-    try std.testing.expect(!settingsTextPatchable("\x00a"));
+    try std.testing.expect(settingsTextProblem("") == null);
+    try std.testing.expect(settingsTextProblem("font-size = 14\n") == null);
+    try std.testing.expect(settingsTextProblem("\xef\xbb\xbffont-size = 14\n") == null);
+    try std.testing.expect(settingsTextProblem("# caf\xe9\n") == null);
+    try std.testing.expect(settingsTextProblem("\xff\xfe") != null);
+    try std.testing.expect(settingsTextProblem("\xfe\xff") != null);
+    try std.testing.expect(settingsTextProblem("a\x00") != null);
+    try std.testing.expect(settingsTextProblem("\x00a") != null);
 }
 
 test "win32 settings clone does not edit include or shader paths" {
@@ -31193,7 +32228,7 @@ const searchBarSearchedStateForSelected = labels.searchBarSearchedStateForSelect
 
 const searchBarDisplayStateChanged = labels.searchBarDisplayStateChanged;
 
-const profileChromeVisible = labels.profileChromeVisible;
+const profileChromeVisible = win32_chrome_state.profileVisible;
 
 const inspectorVisibilityChangeNeedsHostRelayout = labels.inspectorVisibilityChangeNeedsHostRelayout;
 
@@ -31212,7 +32247,7 @@ const OverlayFocusSlot = labels.OverlayFocusSlot;
 
 const nextVisibleOverlayFocusSlot = labels.nextVisibleOverlayFocusSlot;
 
-const inspectorChromeVisible = labels.inspectorChromeVisible;
+const inspectorChromeVisible = win32_chrome_state.inspectorVisible;
 
 const inspectorBannerStateChanged = labels.inspectorBannerStateChanged;
 
@@ -31700,9 +32735,6 @@ fn appMessageWindowProc(hwnd: HWND, message: UINT, wparam: WPARAM, lparam: LPARA
 /// Native modal delivery tests run on a private desktop without a shell,
 /// renderer, clipboard operation, or COM initialization.
 const Pkg19NativeDeliveryTest = struct {
-    extern "user32" fn CreateDesktopW(name: [*:0]const u16, device: ?*anyopaque, mode: ?*anyopaque, flags: u32, access: u32, attributes: ?*anyopaque) callconv(.winapi) ?*anyopaque;
-    extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-    extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
     extern "user32" fn EndMenu() callconv(.winapi) BOOL;
 
     const FakeUia = struct {
@@ -31784,24 +32816,6 @@ const Pkg19NativeDeliveryTest = struct {
             }
         }
     };
-
-    fn run(comptime body: anytype) !void {
-        const Thread = struct {
-            fn entry(desktop: *anyopaque, result: *anyerror!void) void {
-                result.* = if (SetThreadDesktop(desktop) == 0) lastError() else body();
-            }
-        };
-        var name_buf: [80]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "noctty-pkg19-test-{x}-{d}", .{ @intFromPtr(&name_buf), sys.GetTickCount64() });
-        const wide_name = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
-        defer std.testing.allocator.free(wide_name);
-        const desktop = CreateDesktopW(wide_name.ptr, null, null, 0, 0x10000000, null) orelse return error.SkipZigTest;
-        defer _ = CloseDesktop(desktop);
-        var result: anyerror!void = {};
-        const thread = try std.Thread.spawn(.{}, Thread.entry, .{ desktop, &result });
-        thread.join();
-        try result;
-    }
 
     fn pending(fake: *FakeUia) !*DeferredUiaDisconnect {
         const value = try std.heap.page_allocator.create(DeferredUiaDisconnect);
@@ -32008,12 +33022,12 @@ const Pkg19NativeDeliveryTest = struct {
 
 test "win32 App delivery drains title and UIA in native popup while close and quit wait" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.popupBody);
+    try runOnHiddenDesktop(Pkg19NativeDeliveryTest.popupBody);
 }
 
 test "win32 App delivery validates owned tokens by kind HWND and single consumption" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    try Pkg19NativeDeliveryTest.run(Pkg19NativeDeliveryTest.capabilitiesBody);
+    try runOnHiddenDesktop(Pkg19NativeDeliveryTest.capabilitiesBody);
 }
 
 fn postDeferredUiaDisconnect(delivery: ?*AppDelivery, pending: *DeferredUiaDisconnect) bool {
@@ -32367,6 +33381,35 @@ fn bannerMessageDurationMs() UINT {
     return std.math.clamp(seconds, 5, 300) * std.time.ms_per_s;
 }
 
+/// False only in a `-Drenderer-test-tools` build started with
+/// `NOCTTY_RENDERER_KEEP_NOTICES`. A countdown starts when the banner is
+/// set, so a UI thread busy past it (a slow cold start) clears the banner
+/// before a harness can read it through UIA; the renderer harness's OpenGL
+/// startup fallback case sets this switch so it can read the banner.
+fn infoBannersExpire() bool {
+    return infoBannersExpireIn(build_config.renderer_test_tools);
+}
+
+/// `infoBannersExpire` for a build with or without test tools, so that the
+/// default test build, which is what CI runs, checks both.
+fn infoBannersExpireIn(comptime test_tools: bool) bool {
+    if (!test_tools) return true;
+    return !std.process.hasEnvVarConstant("NOCTTY_RENDERER_KEEP_NOTICES");
+}
+
+test "infoBannersExpire reads NOCTTY_RENDERER_KEEP_NOTICES only with test tools" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("NOCTTY_RENDERER_KEEP_NOTICES");
+    defer _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    _ = windows.kernel32.SetEnvironmentVariableW(name, null);
+    try std.testing.expect(infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    if (windows.kernel32.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) == 0) return lastError();
+    try std.testing.expect(!infoBannersExpireIn(true));
+    try std.testing.expect(infoBannersExpireIn(false));
+    try std.testing.expectEqual(infoBannersExpireIn(build_config.renderer_test_tools), infoBannersExpire());
+}
+
 /// Mouse on a banner button, or null for a message it leaves alone. The
 /// BUTTON class takes keyboard focus on a press. A banner button must not:
 /// every click would pull focus, and the focus reports a program asked for,
@@ -32400,6 +33443,11 @@ fn bannerButtonMouse(host: *Host, hwnd: HWND, button: BannerButton, msg: UINT, l
     }
 }
 
+fn paintBannerClient(host: *Host, hwnd: HWND, hdc: HDC) void {
+    var client: RECT = undefined;
+    if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+}
+
 fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT {
     if (getHost(hwnd)) |host| {
         switch (msg) {
@@ -32423,14 +33471,11 @@ fn hostBannerProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 var ps: PAINTSTRUCT = undefined;
                 const hdc = sys.BeginPaint(hwnd, &ps) orelse return 0;
                 defer _ = sys.EndPaint(hwnd, &ps);
-                var client: RECT = undefined;
-                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                paintBannerClient(host, hwnd, hdc);
                 return 0;
             },
             c.WM_PRINTCLIENT => {
-                const hdc: HDC = @ptrFromInt(wParam);
-                var client: RECT = undefined;
-                if (sys.GetClientRect(hwnd, &client) != 0) host.paintBanner(hdc, client, isHighContrastActive());
+                paintBannerClient(host, hwnd, @ptrFromInt(wParam));
                 return 0;
             },
             c.WM_MOUSEMOVE => {
@@ -32734,7 +33779,7 @@ fn hostButtonProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
                 if (msg == c.WM_SYSKEYDOWN) {
                     v.noteChromeKeyInput(c.VK_TAB);
                     if (searchToggleKey(surface, wParam, lParam)) return 0;
-                } else if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) {
+                } else if (surface.search_toggle_keys.consumeChar(lParamBits(lParam))) {
                     return 0;
                 }
             }
@@ -33160,7 +34205,7 @@ fn searchEditProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             },
             // The WM_SYSCHAR of Alt+R / Alt+C / Alt+W; see below.
             c.WM_SYSCHAR => {
-                if (surface.search_toggle_keys.consumeChar(wParam, lParamBits(lParam))) return 0;
+                if (surface.search_toggle_keys.consumeChar(lParamBits(lParam))) return 0;
             },
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
                 v.noteChromeKeyInput(wParam);
@@ -33409,14 +34454,13 @@ fn hostWindowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callcon
             // belt-and-braces path for a missed or unavailable hook: a
             // cloaked host renders nothing, so a stale `surfaces_visible`
             // would otherwise mean a permanently frozen window.
-            if (host) |v| v.refreshSurfaceVisibility();
-            if ((wParam & 0xFFFF) != c.WA_INACTIVE) {
-                // The user brought this window forward: its active tab is
-                // seen even if focus lands on the chrome, not a terminal.
-                if (host) |v| v.app.acknowledgeTab(v, v.active_tab);
-            }
-            if ((wParam & 0xFFFF) == c.WA_INACTIVE) {
-                if (host) |v| {
+            if (host) |v| {
+                v.refreshSurfaceVisibility();
+                if ((wParam & 0xFFFF) != c.WA_INACTIVE) {
+                    // The user brought this window forward: its active tab is
+                    // seen even if focus lands on the chrome, not a terminal.
+                    v.app.acknowledgeTab(v, v.active_tab);
+                } else {
                     // The tab tooltip is a top-level popup, so losing the
                     // window is not enough to take it down: a pointer that
                     // never left the tab sends no WM_MOUSELEAVE, and the popup
@@ -34565,6 +35609,15 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
 
     const surface = getSurface(hwnd);
 
+    // Record only F9 key-down at the terminal HWND, before character
+    // collection can pump sent messages. This is input observation; the
+    // performAction hook records actual open_config dispatch separately.
+    if ((msg == c.WM_KEYDOWN or msg == c.WM_SYSKEYDOWN) and wParam == c.VK_F1 + 8) {
+        if (surface) |v| if (v.app.settings_open_trace.enabled()) {
+            v.app.settings_open_trace.note(if (v.core_initialized) .f9_keydown else .f9_before_core_initialized);
+        };
+    }
+
     switch (msg) {
         c.WM_WINHOSTTY_WAKE => return 0,
 
@@ -34936,6 +35989,8 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.w
                         5 => .next_tab,
                         6 => .close_surface,
                         7 => .reload_config,
+                        8 => .{ .goto_split = .previous },
+                        9 => .toggle_split_zoom,
                         else => return 0,
                     };
                     return @intFromBool(v.core_surface.performBindingAction(action) catch false);
@@ -35117,18 +36172,18 @@ fn terminalAccessibilityScroll(ctx: *anyopaque, request: win32_uia.widgets.Scrol
     if (!surface.core_initialized) return error.ElementNotAvailable;
     const core = &surface.core_surface;
     if (!core.renderer_state.mutex.tryLock()) return error.WouldBlock;
-    const scrolled = @import("win32_uia/text.zig").scrollFrozenRange(
-        core.alloc,
-        core.renderer_state.terminal,
-        request.token,
-        request.document_window,
-        request.absolute_row,
-        request.align_to_top,
-    ) catch |err| {
-        core.renderer_state.mutex.unlock();
-        return err;
+    const scrolled = scrolled: {
+        // Unlocked before the refresh below.
+        defer core.renderer_state.mutex.unlock();
+        break :scrolled try @import("win32_uia/text.zig").scrollFrozenRange(
+            core.alloc,
+            core.renderer_state.terminal,
+            request.token,
+            request.document_window,
+            request.absolute_row,
+            request.align_to_top,
+        );
     };
-    core.renderer_state.mutex.unlock();
     if (scrolled) try core.refreshCallback();
 }
 
@@ -35351,6 +36406,11 @@ pub const Surface = struct {
     mouse_visible: bool = true,
     hovered_link: ?[:0]const u8 = null,
     window_focused: bool = false,
+    /// This pane is an unfocused split, which the renderer dims
+    /// (`Host.syncSplitDim`), and what the renderer was last told; the
+    /// renderer starts undimmed.
+    split_dimmed: bool = false,
+    split_dimmed_sent: bool = false,
     /// The bell rang here while the user was not looking; the tab label and
     /// the window caption carry the glyph until `clearBell`.
     bell_ringing: bool = false,
@@ -35644,7 +36704,8 @@ pub const Surface = struct {
     }
 
     fn initialDecorationsVisible(config: *const configpkg.Config, opts: SurfaceInitOptions) bool {
-        return initialDecorationsVisibleForSource(config, opts.clone_state_from);
+        const keeps = WindowKeeps.forNewSurface(config, opts);
+        return initialDecorationsVisibleForSource(config, if (keeps.decoration) null else opts.clone_state_from);
     }
 
     /// The `Surface.init` steps `App.test_surface_init_stage` stands in for.
@@ -35665,8 +36726,7 @@ pub const Surface = struct {
         var shell_prepared = try app.prepareShellSurfaceCreate(existing_host, opts);
         defer if (shell_prepared) |*prepared| prepared.deinit();
 
-        const host = existing_host orelse
-            try app.createHost(title, opts.clone_state_from, opts.quick_terminal);
+        const host = existing_host orelse try app.createHost(title, config, opts);
         const created_host = existing_host == null;
         errdefer if (created_host) {
             // Its shell window was never committed. Clear it, or the focus
@@ -35881,6 +36941,9 @@ pub const Surface = struct {
             // The core's `set_title` may have relabelled a host that stays
             // for the tabs it had; `windowDestroyed` would refresh them.
             if (!created_host) runUiActionOrLog("failed surface chrome refresh failed", host.refreshChrome());
+            // A layout during init may have dimmed the pane this split
+            // came from, which is alone in its tab again.
+            if (!created_host) host.syncSplitDim();
         }
 
         // The core opens the pty at the size read below. Give a new split its
@@ -35914,7 +36977,7 @@ pub const Surface = struct {
 
         if (opts.clone_state_from) |source| {
             if (sharesHostWindowState(self.host_id, source.host_id)) {
-                self.copySharedWindowStateFrom(source);
+                self.copySharedWindowStateFrom(source, .{});
             }
         }
 
@@ -35928,6 +36991,9 @@ pub const Surface = struct {
             );
             self.core_initialized = true;
             log.debug("surface.init core surface initialized", .{});
+            // A pane made behind its tab's focus (a restored layout) was
+            // marked dimmed before it had a renderer to tell.
+            self.flushSplitDimmed();
             // The core read the child's size when its init began, and the
             // core's own init-time actions can lay the host out again before
             // it ends. `syncCoreSizeFromClientRect` recorded any such move in
@@ -35956,6 +37022,8 @@ pub const Surface = struct {
         // need an initial occlusion sync so hidden child GL surfaces stop
         // rendering before activation ordering runs.
         const activate_during_init = shouldShowSurfaceImmediately(opts.host_id);
+        const window_start = WindowStart.forNewSurface(config, opts);
+        const keeps = WindowKeeps.forNewSurface(config, opts);
         self.setVisible(activate_during_init);
         sys.DragAcceptFiles(hwnd, 1);
 
@@ -35973,9 +37041,15 @@ pub const Surface = struct {
             // layered style to an already-visible window is what produces an
             // opaque-then-fade flash. No unit test observes that ordering
             // — see the doc comment on `applyInitialBackgroundOpacity`.
-            self.applyInitialBackgroundOpacity(opts.clone_state_from);
+            self.applyInitialBackgroundOpacity(if (keeps.background_opacity) null else opts.clone_state_from);
             try host.refreshChrome();
             try host.layout();
+            // `maximize` and `fullscreen` (#496), before the first show, so
+            // the window first appears in that state. Core init has already
+            // given it `window-width`/`window-height`, so that is the normal
+            // rect it returns to. A clone takes them once it has the
+            // source's state, below.
+            if (opts.clone_state_from == null) self.applyWindowStart(window_start);
             // The top-level host was created hidden and stays hidden until GL
             // and core initialization have succeeded, so a startup failure
             // reaches the fatal dialog without first presenting a blank host
@@ -35998,7 +37072,9 @@ pub const Surface = struct {
 
         if (opts.clone_state_from) |source| {
             if (!sharesHostWindowState(self.host_id, source.host_id)) {
-                try self.inheritWindowStateFrom(source);
+                try self.inheritWindowStateFrom(source, keeps);
+                // After it: a normal source ends in SW_RESTORE.
+                self.applyWindowStart(window_start);
             }
         }
         if (shell_prepared) |*prepared| {
@@ -36021,11 +37097,17 @@ pub const Surface = struct {
         // DestroyWindow free the Surface under these errdefers, and then
         // `createWindowSurface` frees it again.
         self.destroy_on_wm_destroy = true;
-        // A terminal opened after a last-host close (quit-after-last-window-
-        // closed = false, or inside its delay) is part of the session again.
+        // A terminal opened after the session's last window went (quit-after-
+        // last-window-closed = false, inside its delay, or while a quick
+        // terminal or a window kept for undo stays) opens the session again.
         // Not before init commits: a failed one leaves no window, and the
-        // last-host-close snapshot must still stand.
-        app.session_state_saved_before_last_host_close = false;
+        // snapshot must still stand. Nor for the quick terminal, which is
+        // never part of the session.
+        if (!host.quick_terminal) app.session_state_saved_before_last_host_close = false;
+        // Any terminal the user opens after the startup restore, quick
+        // terminal included, uses the session; the restore's own panes all
+        // commit before `restoreSessionState` sets this.
+        app.restored_session_untouched = false;
     }
 
     test "Surface.init that fails after the core starts is unwound once, by init" {
@@ -36109,6 +37191,8 @@ pub const Surface = struct {
         try std.testing.expect(app.quit_timer_id != null);
         // The owner's last window already took the session's final snapshot.
         app.session_state_saved_before_last_host_close = true;
+        // And the startup restore brought the session back, untouched since.
+        app.restored_session_untouched = true;
 
         // A reader was told about the new tab's button, so it hears that the
         // button is gone again when init fails.
@@ -36136,12 +37220,27 @@ pub const Surface = struct {
         try std.testing.expectEqual(@as(usize, 0), core_app.surfaces.items.len);
         try std.testing.expect(app.quit_timer_id != null);
         // No terminal opened, so `terminate` must still keep that snapshot
-        // rather than save the empty app over it.
+        // rather than save the empty app over it, and nothing used the
+        // restored session.
         try std.testing.expect(app.session_state_saved_before_last_host_close);
+        try std.testing.expect(app.restored_session_untouched);
+
+        // A tab the quick terminal opens is never part of the session, so the
+        // snapshot stands (#497). Before, any committed init cleared it.
+        Stage.stale = false;
+        host.quick_terminal = true;
+        const in_quick_terminal = try app.createWindowSurface(&app.config, default_title, .{ .host_id = host.id });
+        host.quick_terminal = false;
+        const snapshot_stood = app.session_state_saved_before_last_host_close;
+        core_app.deleteSurface(in_quick_terminal);
+        try std.testing.expect(sys.DestroyWindow(in_quick_terminal.hwnd.?) != 0);
+        try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+        try std.testing.expect(snapshot_stood);
+        // But the user opened a terminal, so the restored session is used.
+        try std.testing.expect(!app.restored_session_untouched);
 
         // Once init returns, the window owns the Surface: destroying it frees
         // the Surface once, and its tab and button with it.
-        Stage.stale = false;
         const created = try app.createWindowSurface(&app.config, default_title, .{ .host_id = host.id });
         try std.testing.expect(created.destroy_on_wm_destroy);
         // A terminal that did open is part of the session again.
@@ -36193,8 +37292,8 @@ pub const Surface = struct {
             error.TestGLContextFailed,
             app.createWindowSurface(&app.config, default_title, .{}),
         );
-        // No window opened, so `terminate` must keep that snapshot rather
-        // than delete the session for an app with no windows.
+        // No window opened, so that snapshot must stand: no checkpoint may
+        // write over it until a terminal opens.
         try std.testing.expect(app.session_state_saved_before_last_host_close);
         const host_hwnd = Stage.host_hwnd.?;
         defer if (sys.IsWindow(host_hwnd) != 0) {
@@ -36301,8 +37400,7 @@ pub const Surface = struct {
     /// process, `always`, or read-only mode), for a close that ends more
     /// than this pane. A pane whose core is not up has no process to lose.
     fn needsCloseConfirm(self: *Surface) bool {
-        if (!self.core_initialized) return false;
-        return self.core_surface.needsConfirmQuit();
+        return self.core_initialized and self.core_surface.needsConfirmQuit();
     }
 
     fn requestClose(self: *Surface) bool {
@@ -36356,8 +37454,17 @@ pub const Surface = struct {
         next_tree = null;
         self.pending_shell_close = shell_close;
         shell_close = null;
+        // The session's last pane (`close_surface`, its shell exiting): saved
+        // now, while it is whole; `destroy` frees its strings first. Not
+        // when its window's close (`closeConfirmed`) saved the whole window
+        // and is closing its panes one by one.
+        const saved_here = !self.app.session_state_saved_before_last_host_close and
+            found.tab.tree.nodes.len == 1 and found.host.tabs.items.len == 1 and
+            self.app.closingEndsSession(found.host);
+        if (saved_here) self.app.saveSessionAsItEnds();
         if (sys.DestroyWindow(hwnd) != 0) return true;
 
+        if (saved_here) self.app.session_state_saved_before_last_host_close = false;
         if (self.pending_close_tree) |*tree| tree.deinit();
         self.pending_close_tree = null;
         if (self.pending_shell_close) |*prepared| prepared.deinit();
@@ -36771,6 +37878,8 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
     ) !bool {
         if (clipboard_type != .standard) return false;
+        // A paste, from any key, menu or palette; a program's own read is not.
+        if (state == .paste) self.noteProgramInput();
         // A program's read that would only be declined does not read the
         // clipboard first.
         if (state == .osc_52_read and self.core_surface.config.clipboard_read == .ask) {
@@ -37004,7 +38113,9 @@ pub const Surface = struct {
 
     fn finishRendererRepaintRequest(self: *Surface) void {
         self.renderer_repaint_requested.store(false, .release);
-        if (self.consumeRendererRepaintRetryPending()) {
+        // As `requestRendererFrameNow`: a surface whose core is not running
+        // has no renderer to wake.
+        if (self.consumeRendererRepaintRetryPending() and self.core_initialized) {
             self.core_surface.renderer_state.noteWakeSource(.apprt_repaint_retry);
             self.core_surface.renderer_thread.wakeup.notify() catch |err| {
                 log.warn("win32 renderer repaint retry wake failed err={}", .{err});
@@ -37416,6 +38527,12 @@ pub const Surface = struct {
                 if (sys.PeekMessageW(&message, surface.host.?.hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) == 0) return error.MissingVisibilityRequest;
                 applyConsoleWindowVisibility(message.hwnd, message.wParam != 0);
             }
+            fn drain(owner_hwnd: HWND) void {
+                var message: MSG = undefined;
+                while (sys.PeekMessageW(&message, owner_hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
+                    applyConsoleWindowVisibility(owner_hwnd, message.wParam != 0);
+                }
+            }
         };
         const surfaces = [_]*Surface{ &first, &background };
         try Check.sync(&host, &surfaces, false);
@@ -37432,17 +38549,12 @@ pub const Surface = struct {
         // either native command. The last request must still win.
         try background.core_surface.handleMessage(.{ .window_visibility = false });
         try background.core_surface.handleMessage(.{ .window_visibility = true });
-        var burst: MSG = undefined;
-        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
-            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
-        }
+        Check.drain(hwnd);
         try std.testing.expect(sys.IsIconic(hwnd) == 0);
         _ = sys.ShowWindow(hwnd, c.SW_MINIMIZE);
         try background.core_surface.handleMessage(.{ .window_visibility = true });
         try background.core_surface.handleMessage(.{ .window_visibility = false });
-        while (sys.PeekMessageW(&burst, hwnd, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.WM_WINHOSTTY_CONSOLE_VISIBILITY, c.PM_REMOVE) != 0) {
-            applyConsoleWindowVisibility(hwnd, burst.wParam != 0);
-        }
+        Check.drain(hwnd);
         try std.testing.expect(sys.IsIconic(hwnd) != 0);
         _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
         try Check.request(&background, true);
@@ -37478,12 +38590,13 @@ pub const Surface = struct {
         defer _ = sys.DestroyWindow(hwnd);
         host.hwnd = hwnd;
         const termio = @import("../termio.zig");
-        for ([_]*Surface{ &first, &later }) |surface| {
+        const surfaces = [_]*Surface{ &first, &later };
+        for (surfaces) |surface| {
             surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(core_app.alloc);
             surface.window_visible = false;
             surface.core_surface.rt_surface = surface;
         }
-        defer for ([_]*Surface{ &first, &later }) |surface| surface.core_surface.io.mailbox.deinit(core_app.alloc);
+        defer for (surfaces) |surface| surface.core_surface.io.mailbox.deinit(core_app.alloc);
         defer {
             first.core_initialized = false;
             later.core_initialized = false;
@@ -37521,7 +38634,7 @@ pub const Surface = struct {
         // adopted one's.
         _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
         host.refreshSurfaceVisibility();
-        for ([_]*Surface{ &first, &later }) |surface| {
+        for (surfaces) |surface| {
             try std.testing.expect(!(try Queue.expectNext(surface)).pty_visibility);
             try Queue.expectEmpty(surface);
         }
@@ -37611,7 +38724,7 @@ pub const Surface = struct {
     /// The user focused this terminal or typed into it: the bell has been
     /// answered.
     fn clearBell(self: *Surface) void {
-        if (self.bell_ringing) self.setBellRinging(false);
+        self.setBellRinging(false);
     }
 
     /// A reload that turns the title bell off takes the glyph already up
@@ -38354,7 +39467,8 @@ pub const Surface = struct {
             return;
         }
 
-        const action = win32_hints.resolveAction(payload, ctrl, alt);
+        // Outside WSL, `/c/x` opens as `C:\x`, as a Ctrl+click on it does.
+        const action = win32_hints.resolveAction(payload, ctrl, alt, !self.core().launchesWsl());
 
         self.closeQuickSelect(true);
         if (action == .open) {
@@ -38364,6 +39478,7 @@ pub const Surface = struct {
             return;
         }
         if (action == .paste) {
+            self.noteProgramInput();
             // Defense-in-depth classifier pass, same as the drop path.
             //
             // Core's `isSafe` only flags newlines and bracketed-paste-end
@@ -39278,6 +40393,17 @@ pub const Surface = struct {
         return applyChildVisibility(hwnd, self.searchBarButtonPlacement(role), false);
     }
 
+    /// Places a search bar button at `rect` and shows it. The controls
+    /// exist once `ensureSearchBarControls` has run.
+    fn showSearchBarButton(self: *Surface, role: SearchBarButtonRole, rect: RECT) bool {
+        const hwnd = self.searchBarButtonHwnd(role).?;
+        const placement = self.searchBarButtonPlacement(role);
+        // Both run: a move and a show are separate changes.
+        const moved = applyChildRect(hwnd, placement, rect);
+        const shown = applyChildVisibility(hwnd, placement, true);
+        return moved or shown;
+    }
+
     fn layoutSearchBarControls(self: *Surface, frame_rect: RECT, visible: bool) !bool {
         if (!visible or !self.search_bar.visible) return self.hideSearchBarControls();
 
@@ -39300,52 +40426,28 @@ pub const Surface = struct {
         );
         changed = bg_changed or changed;
 
-        changed = applyChildRect(
-            self.search_bar_close_hwnd.?,
-            &self.search_bar_close_placement,
+        changed = self.showSearchBarButton(
+            .close,
             childRect(right - layout.close_w, control_top, layout.close_w, layout.control_h),
-        ) or changed;
-        changed = applyChildVisibility(
-            self.search_bar_close_hwnd.?,
-            &self.search_bar_close_placement,
-            true,
         ) or changed;
         right -= layout.close_w + layout.close_gap;
 
         if (fit.toggles) {
-            changed = applyChildRect(
-                self.search_bar_word_hwnd.?,
-                &self.search_bar_word_placement,
+            changed = self.showSearchBarButton(
+                .whole_word,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_word_hwnd.?,
-                &self.search_bar_word_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_case_hwnd.?,
-                &self.search_bar_case_placement,
+            changed = self.showSearchBarButton(
+                .case_sensitive,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_case_hwnd.?,
-                &self.search_bar_case_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_regex_hwnd.?,
-                &self.search_bar_regex_placement,
+            changed = self.showSearchBarButton(
+                .regex,
                 childRect(right - layout.toggle_w, control_top, layout.toggle_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_regex_hwnd.?,
-                &self.search_bar_regex_placement,
-                true,
             ) or changed;
             right -= layout.toggle_w + layout.section_gap;
         } else {
@@ -39355,27 +40457,15 @@ pub const Surface = struct {
         }
 
         if (fit.nav) {
-            changed = applyChildRect(
-                self.search_bar_next_hwnd.?,
-                &self.search_bar_next_placement,
+            changed = self.showSearchBarButton(
+                .next,
                 childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_next_hwnd.?,
-                &self.search_bar_next_placement,
-                true,
             ) or changed;
             right -= layout.nav_w + layout.gap;
 
-            changed = applyChildRect(
-                self.search_bar_prev_hwnd.?,
-                &self.search_bar_prev_placement,
+            changed = self.showSearchBarButton(
+                .prev,
                 childRect(right - layout.nav_w, control_top, layout.nav_w, layout.control_h),
-            ) or changed;
-            changed = applyChildVisibility(
-                self.search_bar_prev_hwnd.?,
-                &self.search_bar_prev_placement,
-                true,
             ) or changed;
             right -= layout.nav_w + layout.section_gap;
         } else {
@@ -39836,74 +40926,114 @@ pub const Surface = struct {
         try self.applyTopmost();
     }
 
+    /// Puts a new top-level window in the state `maximize` and `fullscreen`
+    /// ask for (`WindowStart`), on top of the state it already has: a window
+    /// that is maximized stays so, and one that is fullscreen stays so.
+    ///
+    /// A window that is still hidden is made fullscreen in place: it was
+    /// created framed, and its first show is then at the monitor's rect. The
+    /// host is never created with the popup style (`CW_USEDEFAULT` puts a
+    /// popup at (0,0), which would be the rect leaving fullscreen returns to)
+    /// and a popup is never maximized (that covers only the work area and
+    /// sets `WS_MAXIMIZE` on a fullscreen window). With both, the window
+    /// leaves fullscreen maximized, over the normal rect it has now.
+    ///
+    /// A failure is logged: how a window starts is a preference, and a
+    /// window in its ordinary state is still a usable window.
+    fn applyWindowStart(self: *Surface, start: WindowStart) void {
+        const hwnd = self.windowHwnd() orelse return;
+        if (start.fullscreen and !self.fullscreen) {
+            // A launcher's show command (`start /min`, a shortcut set to Run:
+            // Minimized or Maximized) goes to the first framed top-level
+            // window the process calls ShowWindow on. A popup's show does not
+            // take it, so the next framed window would: Settings, or a window
+            // opened from this one after it left fullscreen, would open
+            // minimized. SW_HIDE takes it while this window is still framed,
+            // and shows nothing.
+            if (sys.IsWindowVisible(hwnd) == 0) _ = sys.ShowWindow(hwnd, c.SW_HIDE);
+            self.enterFullscreen() catch |err| {
+                log.warn("win32 configured fullscreen failed err={}", .{err});
+            };
+        }
+        if (start.maximize) {
+            if (self.fullscreen) {
+                // `leaveFullscreen` maximizes a window whose placement says
+                // it was maximized.
+                self.restore_placement.showCmd = c.SW_MAXIMIZE;
+            } else if (sys.IsZoomed(hwnd) == 0) {
+                _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+            }
+        }
+    }
+
     fn enterFullscreen(self: *Surface) !void {
         const hwnd = self.windowHwnd() orelse return;
+        // A minimized window comes back first. SetWindowPos would move only
+        // its icon, and it would return from the taskbar as a popup at its
+        // normal rect. A restored session's first window is minimized here
+        // under a minimized launch (`applyRestoredWindowPlacement`).
+        if (sys.IsIconic(hwnd) != 0) _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
         // Captured before the style write below, which drops WS_MAXIMIZE:
         // the monitor-sized SetWindowPos after it would otherwise land on a
         // normal window and overwrite its normal rect.
         self.restore_placement.length = @sizeOf(WINDOWPLACEMENT);
         if (sys.GetWindowPlacement(hwnd, &self.restore_placement) == 0 or
             sys.GetWindowRect(hwnd, &self.restore_rect) == 0) return lastError();
-        const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse
-            return lastError();
-        var info: MONITORINFO = .{
-            .cbSize = @sizeOf(MONITORINFO),
-            .rcMonitor = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            .rcWork = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-            .dwFlags = 0,
-        };
-        if (sys.GetMonitorInfoW(monitor, &info) == 0) {
-            return lastError();
-        }
-        self.restore_monitor = .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
+        const monitor = try windowMonitor(hwnd);
+        self.restore_monitor = monitor;
         self.fullscreen = true;
         try self.applyWindowStyle();
 
+        const screen = monitor.info.rcMonitor;
         if (sys.SetWindowPos(
             hwnd,
             if (self.topmost) HWND_TOPMOST else null,
-            info.rcMonitor.left,
-            info.rcMonitor.top,
-            info.rcMonitor.right - info.rcMonitor.left,
-            info.rcMonitor.bottom - info.rcMonitor.top,
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
             c.SWP_FRAMECHANGED | c.SWP_NOACTIVATE,
         ) == 0) {
             return lastError();
         }
     }
 
+    /// The window leaving fullscreen gives back: the one it was when it
+    /// entered fullscreen, moved to the monitor it is on now.
+    const FullscreenReturn = struct {
+        /// Its rect, in screen coordinates.
+        rect: RECT,
+        /// Its placement. `rcNormalPosition` is in the workspace coordinates
+        /// of `monitor`.
+        placement: WINDOWPLACEMENT,
+        /// The monitor it is on now, if entering fullscreen recorded one.
+        monitor: ?MONITORINFO,
+    };
+
+    fn fullscreenReturn(self: *const Surface, hwnd: HWND) !FullscreenReturn {
+        var back: FullscreenReturn = .{ .rect = self.restore_rect, .placement = self.restore_placement, .monitor = null };
+        const source = self.restore_monitor orelse return back;
+        const target = try windowMonitor(hwnd);
+        back.monitor = target.info;
+        if (target.monitor != source.monitor or target.dpi != source.dpi) {
+            back.rect = fullscreenRestoreRect(back.rect, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi);
+            // WINDOWPLACEMENT uses workspace coordinates for a normal
+            // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
+            // before the work-area translation, and back afterwards.
+            const normal = workspaceRectToScreen(back.placement.rcNormalPosition, source.info);
+            back.placement.rcNormalPosition = screenRectToWorkspace(
+                fullscreenRestoreRect(normal, source.info.rcWork, target.info.rcWork, source.dpi, target.dpi),
+                target.info,
+            );
+        }
+        return back;
+    }
+
     fn leaveFullscreen(self: *Surface) !void {
         const hwnd = self.windowHwnd() orelse return;
-        var rect = self.restore_rect;
-        var placement = self.restore_placement;
-        if (self.restore_monitor) |source| {
-            const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
-            var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
-            info.cbSize = @sizeOf(MONITORINFO);
-            if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
-            const dpi = sys.GetDpiForWindow(hwnd);
-            if (monitor != source.monitor or dpi != source.dpi) {
-                rect = fullscreenRestoreRect(rect, source.info.rcWork, info.rcWork, source.dpi, dpi);
-                // WINDOWPLACEMENT uses workspace coordinates for a normal
-                // host (no WS_EX_TOOLWINDOW). Convert to screen coordinates
-                // before the work-area translation, and back afterwards.
-                var normal = placement.rcNormalPosition;
-                const old_dx = source.info.rcWork.left - source.info.rcMonitor.left;
-                const old_dy = source.info.rcWork.top - source.info.rcMonitor.top;
-                normal.left += old_dx;
-                normal.right += old_dx;
-                normal.top += old_dy;
-                normal.bottom += old_dy;
-                normal = fullscreenRestoreRect(normal, source.info.rcWork, info.rcWork, source.dpi, dpi);
-                const new_dx = info.rcWork.left - info.rcMonitor.left;
-                const new_dy = info.rcWork.top - info.rcMonitor.top;
-                normal.left -= new_dx;
-                normal.right -= new_dx;
-                normal.top -= new_dy;
-                normal.bottom -= new_dy;
-                placement.rcNormalPosition = normal;
-            }
-        }
+        const back = try self.fullscreenReturn(hwnd);
+        const rect = back.rect;
+        const placement = back.placement;
         self.fullscreen = false;
         try self.applyWindowStyle();
 
@@ -39936,6 +41066,27 @@ pub const Surface = struct {
     fn maximizeWithPlacement(hwnd: HWND, placement: *const WINDOWPLACEMENT) !void {
         _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
         if (sys.SetWindowPlacement(hwnd, placement) == 0) return lastError();
+    }
+
+    /// The monitor nearest `hwnd`, its info and the window's DPI.
+    fn windowMonitor(hwnd: HWND) !FullscreenMonitor {
+        const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+        var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+        info.cbSize = @sizeOf(MONITORINFO);
+        if (sys.GetMonitorInfoW(monitor, &info) == 0) return lastError();
+        return .{ .monitor = monitor, .info = info, .dpi = sys.GetDpiForWindow(hwnd) };
+    }
+
+    /// The inverse of `workspaceRectToScreen`.
+    fn screenRectToWorkspace(rect: RECT, info: MONITORINFO) RECT {
+        const dx = info.rcWork.left - info.rcMonitor.left;
+        const dy = info.rcWork.top - info.rcMonitor.top;
+        return .{
+            .left = rect.left - dx,
+            .top = rect.top - dy,
+            .right = rect.right - dx,
+            .bottom = rect.bottom - dy,
+        };
     }
 
     fn setDecorationsVisible(self: *Surface, visible: bool) !void {
@@ -40041,9 +41192,13 @@ pub const Surface = struct {
         }
     }
 
-    fn copySharedWindowStateFrom(self: *Surface, source: *const Surface) void {
-        self.decorations_visible = source.decorations_visible;
-        self.decorations_visible_overridden = source.decorations_visible_overridden;
+    /// Takes the window state of `source`, but what `keeps` names stays this
+    /// surface's own.
+    fn copySharedWindowStateFrom(self: *Surface, source: *const Surface, keeps: WindowKeeps) void {
+        if (!keeps.decoration) {
+            self.decorations_visible = source.decorations_visible;
+            self.decorations_visible_overridden = source.decorations_visible_overridden;
+        }
         if (self.host) |host| {
             if (host.activeSurface() == self) {
                 host.cached_decorations_visible = self.decorations_visible;
@@ -40054,10 +41209,12 @@ pub const Surface = struct {
         self.restore_rect = source.restore_rect;
         self.restore_placement = source.restore_placement;
         self.restore_monitor = source.restore_monitor;
-        self.default_client_size = source.default_client_size;
+        if (!keeps.size) self.default_client_size = source.default_client_size;
         self.cell_size_pixels = source.cell_size_pixels;
-        self.background_opacity_default = source.background_opacity_default;
-        self.background_opacity_force_opaque = source.background_opacity_force_opaque;
+        if (!keeps.background_opacity) {
+            self.background_opacity_default = source.background_opacity_default;
+            self.background_opacity_force_opaque = source.background_opacity_force_opaque;
+        }
         self.size_limit = source.size_limit;
     }
 
@@ -40111,8 +41268,39 @@ pub const Surface = struct {
         );
     }
 
-    fn inheritWindowStateFrom(self: *Surface, source: *const Surface) !void {
-        self.copySharedWindowStateFrom(source);
+    /// Gives this surface's window the state of `source`'s, keeping what
+    /// `keeps` names.
+    fn inheritWindowStateFrom(self: *Surface, source: *const Surface, keeps: WindowKeeps) !void {
+        // The size core init gave the window, before it takes the source's
+        // state.
+        var own_size: ?WindowSize = null;
+        if (keeps.size) if (self.windowHwnd()) |hwnd| {
+            var rect: RECT = undefined;
+            if (sys.GetWindowRect(hwnd, &rect) == 0) return lastError();
+            own_size = .{ .width = rect.right - rect.left, .height = rect.bottom - rect.top };
+        };
+        self.copySharedWindowStateFrom(source, keeps);
+        if (own_size) |size| if (self.fullscreen) if (self.windowHwnd()) |hwnd| {
+            // It leaves fullscreen to that size, where the source would, and
+            // inside the work area there, as a window opened from a normal
+            // or maximized source is. The source's return is in the pixels
+            // of the monitor it entered fullscreen on, which leaving scales
+            // from, and `size` is in this window's, on the monitor the
+            // source covers now. So the return is first taken as leaving
+            // fullscreen here gives it, then sized and fitted here, and
+            // leaving does not scale `size` too.
+            const back = try self.fullscreenReturn(hwnd);
+            const here = try windowMonitor(hwnd);
+            const work = here.info.rcWork;
+            self.restore_monitor = here;
+            self.restore_rect = fitRectInWork(back.rect.left, back.rect.top, size.width, size.height, work);
+            self.restore_placement = back.placement;
+            const normal = workspaceRectToScreen(back.placement.rcNormalPosition, here.info);
+            self.restore_placement.rcNormalPosition = screenRectToWorkspace(
+                fitRectInWork(normal.left, normal.top, size.width, size.height, work),
+                here.info,
+            );
+        };
 
         try self.applyWindowStyle();
         try self.applyTopmost();
@@ -40120,8 +41308,8 @@ pub const Surface = struct {
 
         const hwnd = self.windowHwnd() orelse return;
         const source_hwnd = source.windowHwnd() orelse return;
-        const placed = try newWindowPlacement(self.app, source_hwnd, source.fullscreen, hwnd);
-        var flags = newWindowSetPosFlags(&self.app.config, placed) | c.SWP_FRAMECHANGED;
+        const placed = try newWindowPlacement(self.app, source_hwnd, source.fullscreen, hwnd, own_size);
+        var flags = newWindowSetPosFlags(keeps.position, own_size != null, placed) | c.SWP_FRAMECHANGED;
         // Another tab of the source's own window is already where it goes.
         if (hwnd == source_hwnd) flags |= c.SWP_NOMOVE | c.SWP_NOSIZE;
         if (sys.SetWindowPos(
@@ -40370,6 +41558,19 @@ pub const Surface = struct {
         };
     }
 
+    fn setSplitDimmed(self: *Surface, dimmed: bool) void {
+        self.split_dimmed = dimmed;
+        self.flushSplitDimmed();
+    }
+
+    /// Tell the renderer about a change of `split_dimmed`. A surface whose
+    /// core has not started has no renderer yet; `init` flushes once it has.
+    fn flushSplitDimmed(self: *Surface) void {
+        if (!self.core_initialized or self.split_dimmed_sent == self.split_dimmed) return;
+        self.split_dimmed_sent = self.split_dimmed;
+        self.core_surface.renderer_thread.send(.{ .split_dimmed = self.split_dimmed });
+    }
+
     fn focusChanged(self: *Surface, focused: bool) void {
         self.window_focused = focused;
         // The idle benchmark invalidates a sample when focus moves during
@@ -40456,12 +41657,44 @@ pub const Surface = struct {
         );
     }
 
+    /// Input for this terminal's program arrived: a key, a click, the wheel,
+    /// a paste or drop, palette or automation text. While the program still
+    /// runs, that uses the session (`App.restored_session_untouched`). Into
+    /// a program that has already ended it does not: there it only closes
+    /// the pane, and a restore that failed must not count as used for that.
+    fn noteProgramInput(self: *Surface) void {
+        if (self.core_initialized and !self.core_surface.child_exited) self.app.restored_session_untouched = false;
+    }
+
+    /// This terminal's program has ended, by itself or killed.
+    fn programEnded(self: *const Surface) bool {
+        return self.core_initialized and self.core_surface.child_exited;
+    }
+
+    /// Whether a key event is input meant for the program: not a release,
+    /// whose press already counted, and not a modifier on its own (Alt as
+    /// the user Alt+Tabs away, Shift for a screenshot).
+    fn isProgramKeyInput(event: input.KeyEvent) bool {
+        return event.action != .release and !event.key.modifier();
+    }
+
+    test "a key release or a modifier alone is not input for the program" {
+        try std.testing.expect(isProgramKeyInput(.{ .action = .press, .key = .key_a }));
+        try std.testing.expect(isProgramKeyInput(.{ .action = .repeat, .key = .arrow_down }));
+        // An IME or character commit has no physical key.
+        try std.testing.expect(isProgramKeyInput(.{ .action = .press, .key = .unidentified, .utf8 = "x" }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .release, .key = .key_a }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .press, .key = .alt_left }));
+        try std.testing.expect(!isProgramKeyInput(.{ .action = .press, .key = .shift_right }));
+    }
+
     /// What the keyboard and IME dispatch in `win32_input` needs from the
     /// surface.
     const KeyTarget = struct {
         surface: *Surface,
 
         pub fn keyCallback(self: KeyTarget, event: input.KeyEvent) !CoreSurface.InputEffect {
+            if (isProgramKeyInput(event)) self.surface.noteProgramInput();
             return self.surface.core_surface.keyCallback(event);
         }
 
@@ -40572,11 +41805,8 @@ pub const Surface = struct {
             log.warn("win32 drop files format failed err={}", .{err});
             return;
         };
-        if (payload.len == 0) {
-            alloc.free(payload);
-            return;
-        }
         defer alloc.free(payload);
+        if (payload.len == 0) return;
 
         surfaceDropPayloadCallback(self, payload);
     }
@@ -40681,6 +41911,7 @@ pub const Surface = struct {
 
         self.cursor_pos = cursorPosFromLParam(lParam);
         if (state == .press) {
+            self.noteProgramInput();
             // The pointer is driving again; the next chrome control to
             // take focus programmatically should not wear a ring.
             if (self.host) |host| host.noteChromePointerInput();
@@ -40723,6 +41954,7 @@ pub const Surface = struct {
 
         self.cursor_pos = cursorPosFromLParam(lParam);
         if (state == .press) {
+            self.noteProgramInput();
             if (self.hwnd) |h| {
                 _ = sys.SetFocus(h);
                 _ = sys.SetCapture(h);
@@ -40749,6 +41981,7 @@ pub const Surface = struct {
 
     fn handleMouseWheel(self: *Surface, scroll: NormalizedWheelScroll) void {
         if (!self.core_initialized) return;
+        self.noteProgramInput();
         if (self.scrollbarScrollable()) {
             const now_ms = sys.GetTickCount64();
             self.noteScrollbarActivity(now_ms);
@@ -41028,7 +42261,11 @@ pub const Surface = struct {
         };
         const alloc = self.app.core_app.alloc;
         try appendOwnedString(alloc, &self.key_table_name, next_name);
-        self.key_table_copy_mode = if (self.core_initialized) self.core_surface.copy_mode_active else if (next_name) |name| std.mem.eql(u8, name, "copy_mode") else false;
+        self.key_table_copy_mode = copy_mode: {
+            if (self.core_initialized) break :copy_mode self.core_surface.copy_mode_active;
+            const name = next_name orelse break :copy_mode false;
+            break :copy_mode std.mem.eql(u8, name, "copy_mode");
+        };
         if (self.host) |host| try host.refreshModeIndicator();
     }
 
@@ -41419,11 +42656,16 @@ pub const Surface = struct {
         return try lfLineEndings(alloc, try clipboardTextToUtf8(alloc, slice_w));
     }
 
-    fn writeClipboardText(self: *const Surface, text: []const u8) !void {
-        const alloc = self.app.core_app.alloc;
+    /// `text` as CF_UNICODETEXT holds it: UTF-16 with CRLF line endings.
+    fn clipboardTextUtf16(alloc: std.mem.Allocator, text: []const u8) ![:0]u16 {
         const crlf = try crlfLineEndings(alloc, text);
         defer if (crlf) |owned| alloc.free(owned);
-        const text_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
+        return std.unicode.utf8ToUtf16LeAllocZ(alloc, crlf orelse text);
+    }
+
+    fn writeClipboardText(self: *const Surface, text: []const u8) !void {
+        const alloc = self.app.core_app.alloc;
+        const text_w = try clipboardTextUtf16(alloc, text);
         defer alloc.free(text_w);
 
         if (!openClipboard(self.hwnd)) return lastError();
@@ -41486,9 +42728,7 @@ pub const Surface = struct {
         };
         // CRLF for the plain fallback only: CF_HTML's header holds byte
         // offsets into the wrapped fragment.
-        const plain_crlf = try crlfLineEndings(alloc, plain_src);
-        defer if (plain_crlf) |owned| alloc.free(owned);
-        const plain_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, plain_crlf orelse plain_src);
+        const plain_w = try clipboardTextUtf16(alloc, plain_src);
         defer alloc.free(plain_w);
 
         if (!openClipboard(self.hwnd)) return lastError();
@@ -44042,6 +45282,366 @@ test "win32 the banner after the last tab closes offers undo only while undo is 
     try std.testing.expectEqualStrings("Tab closed.", host.banner_text.?);
 }
 
+test "win32 closing the session's last tab saves the session as it goes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var other: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host, .id = 1, .register = true, .active_tab = 1 },
+            .{ .storage = &other, .id = 2, .register = true },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &other, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &other, .surface = &surface_c, .id = 1 },
+        },
+    });
+    defer session.deinit();
+    // (A test has no LOCALAPPDATA, so no save reaches the disk; the flag and
+    // the count of saves are the decision.)
+
+    // Another window still holds the session: closing its only tab, or
+    // one of two tabs here, ends nothing.
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_c.core() }, .this));
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_a.core() }, .this));
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 0), app.test_session_saves_as_it_ends);
+
+    // The session's last tab (#497): saved as it closes, as its window's own
+    // close would be. Before, nothing saved until the empty window's undo
+    // expiry ended the process, and `terminate` then deleted the file.
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    try std.testing.expectEqual(@as(usize, 0), host.tabs.items.len);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+
+    // An undo opens the session again; redoing the close ends it again.
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expectEqual(@as(usize, 1), host.tabs.items.len);
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    _ = try host.applyLatestStructuralRedo();
+    try std.testing.expectEqual(@as(usize, 0), host.tabs.items.len);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 2), app.test_session_saves_as_it_ends);
+
+    // With undo off an idle tab closes without asking, through the same path.
+    _ = try host.applyLatestStructuralUndo();
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    app.config.@"undo-timeout" = .{ .duration = 0 };
+    try std.testing.expect(try app.closeTab(.{ .surface = surface_b.core() }, .this));
+    try std.testing.expectEqual(@as(usize, 0), host.tabs.items.len);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
+}
+
+test "win32 a quick terminal or a window kept empty for undo does not hold the session open" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var quick: Host = undefined;
+    var emptied: Host = undefined;
+    var surface: Surface = undefined;
+    var quick_surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host, .id = 1, .register = true },
+            .{ .storage = &quick, .id = 2, .register = true },
+            .{ .storage = &emptied, .id = 3 },
+        },
+        // No window handles: `requestClose` closes nothing, so the windows
+        // stay for the next step.
+        .surfaces = &.{
+            .{ .storage = &surface, .host = &host, .register = true },
+            .{ .storage = &quick_surface, .host = &quick, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface, .id = 1 },
+            .{ .host = &quick, .surface = &quick_surface, .id = 1 },
+        },
+    });
+    defer session.deinit();
+    quick.quick_terminal = true;
+
+    // The last real window closes while a quick terminal is open. Before,
+    // any second host stopped the save.
+    host.closeConfirmed();
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+    // Then the quick terminal is the last window, and its close saves
+    // nothing over that snapshot. Before, `hosts.len == 1` made it the last
+    // window, and its empty snapshot deleted the file.
+    _ = detachHostReference(&app.hosts, &host);
+    quick.closeConfirmed();
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+
+    // The same with a window kept empty for undo in place of the quick
+    // terminal.
+    app.session_state_saved_before_last_host_close = false;
+    try app.hosts.append(std.testing.allocator, &host);
+    try app.hosts.append(std.testing.allocator, &emptied);
+    _ = detachHostReference(&app.hosts, &quick);
+    host.closeConfirmed();
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 2), app.test_session_saves_as_it_ends);
+    try std.testing.expect(!app.closingEndsSession(&emptied));
+}
+
+test "win32 closing the session's last pane saves the session as it goes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var other: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var surface_c: Surface = undefined;
+    var surface_d: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &host, .id = 1, .register = true },
+            .{ .storage = &other, .id = 2 },
+        },
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+            .{ .storage = &surface_c, .host = &host, .register = true },
+            .{ .storage = &surface_d, .host = &other, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+            .{ .host = &other, .surface = &surface_d, .id = 1 },
+        },
+    });
+    defer session.deinit();
+    // Stand-in windows: destroying one runs none of this runtime's teardown,
+    // so the tab stays and only the decision before `DestroyWindow` shows.
+    // Each close takes a fresh one.
+    const Stand = struct {
+        fn in(surface: *Surface) !void {
+            surface.hwnd = try createTestHostWindow();
+        }
+    };
+    defer for ([_]*Surface{ &surface_a, &surface_b, &surface_c }) |surface| {
+        if (surface.hwnd) |hwnd| _ = sys.DestroyWindow(hwnd);
+    };
+    // (A test has no LOCALAPPDATA, so no save reaches the disk; the flag and
+    // the count of saves are the decision.)
+
+    // A pane in a window with another tab: the session stays open.
+    try Stand.in(&surface_a);
+    try std.testing.expect(surface_a.requestClose());
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    var removed = host.tabs.orderedRemove(0);
+    removed.deinit();
+
+    // One of two panes in the session's last tab: the other stays.
+    const tab = &host.tabs.items[0];
+    {
+        var inserted = try SplitTreeSurface.init(std.testing.allocator, &surface_c);
+        defer inserted.deinit();
+        const next_tree = try tab.tree.split(std.testing.allocator, .root, .right, 0.5, &inserted);
+        tab.tree.deinit();
+        tab.tree = next_tree;
+    }
+    try Stand.in(&surface_c);
+    try std.testing.expect(surface_c.requestClose());
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    // The stand-in's teardown never takes the tree the close prepared.
+    if (surface_c.pending_close_tree) |*tree| tree.deinit();
+    surface_c.pending_close_tree = null;
+    {
+        const single = try SplitTreeSurface.init(std.testing.allocator, &surface_b);
+        tab.tree.deinit();
+        tab.tree = single;
+        tab.focused = .root;
+    }
+
+    // The last pane of a window while another window holds the session.
+    try app.hosts.append(std.testing.allocator, &other);
+    try Stand.in(&surface_b);
+    try std.testing.expect(surface_b.requestClose());
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    _ = detachHostReference(&app.hosts, &other);
+    try std.testing.expectEqual(@as(u32, 0), app.test_session_saves_as_it_ends);
+
+    // The session's last pane (`close_surface`, its shell exiting): saved
+    // as it closes (#497). Before, nothing saved, and `terminate` deleted
+    // the file once the window had gone.
+    try Stand.in(&surface_b);
+    try std.testing.expect(surface_b.requestClose());
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 1), app.test_session_saves_as_it_ends);
+
+    // Its window's own close saves the window and then closes its panes one
+    // by one; the last of them saves nothing over that snapshot.
+    app.session_state_saved_before_last_host_close = false;
+    try Stand.in(&surface_b);
+    host.closeConfirmed();
+    try std.testing.expect(sys.IsWindow(surface_b.hwnd.?) == 0);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 2), app.test_session_saves_as_it_ends);
+
+    // A close whose window cannot be destroyed leaves the session open (its
+    // snapshot was taken while it was whole, before the attempt).
+    app.session_state_saved_before_last_host_close = false;
+    try std.testing.expect(!surface_b.requestClose());
+    try std.testing.expect(!app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
+
+    // The startup restore brought this pane back, and its program ended
+    // before anything used the session: that restore failed, and saving it
+    // back would open and close it again at every launch. Nothing saves it;
+    // the saved session is moved aside instead (`setAsideSessionStateAt`).
+    app.restored_session_untouched = true;
+    surface_b.core_surface.child_exited = true;
+    try Stand.in(&surface_b);
+    surface_b.core_initialized = true;
+    const closed_untouched = surface_b.requestClose();
+    surface_b.core_initialized = false;
+    try std.testing.expect(closed_untouched);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+    // Not at a sign-out, which ends the programs itself: its snapshot stands.
+    app.session_state_saved_before_last_host_close = false;
+    app.session_ending = true;
+    try Stand.in(&surface_b);
+    surface_b.core_initialized = true;
+    const closed_signing_out = surface_b.requestClose();
+    surface_b.core_initialized = false;
+    app.session_ending = false;
+    try std.testing.expect(closed_signing_out);
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+    try std.testing.expectEqual(@as(u32, 3), app.test_session_saves_as_it_ends);
+    // Not while the session holds a program still running.
+    surface_b.core_initialized = true;
+    try app.hosts.append(std.testing.allocator, &other);
+    const with_other = app.sessionIsFailedRestore();
+    _ = detachHostReference(&app.hosts, &other);
+    const alone = app.sessionIsFailedRestore();
+    // A key into a pane whose program has ended only closes the pane: it
+    // does not use the session, or the restore that failed would be saved
+    // back by the very key that closes it.
+    surface_b.noteProgramInput();
+    const after_key_into_ended = app.sessionIsFailedRestore();
+    surface_b.core_initialized = false;
+    try std.testing.expect(!with_other);
+    try std.testing.expect(alone);
+    try std.testing.expect(after_key_into_ended);
+
+    // Used once while its program ran, it is a session like any other.
+    app.session_state_saved_before_last_host_close = false;
+    surface_b.core_surface.child_exited = false;
+    surface_b.core_initialized = true;
+    surface_b.noteProgramInput();
+    surface_b.core_surface.child_exited = true;
+    try Stand.in(&surface_b);
+    const closed_used = surface_b.requestClose();
+    surface_b.core_initialized = false;
+    try std.testing.expect(!app.restored_session_untouched);
+    try std.testing.expect(closed_used);
+    try std.testing.expect(app.session_state_saved_before_last_host_close);
+    try std.testing.expectEqual(@as(u32, 4), app.test_session_saves_as_it_ends);
+    try std.testing.expectEqual(@as(u32, 1), app.test_failed_restores_set_aside);
+}
+
+test "win32 a restored session is used once any pane takes input, whichever pane goes last" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const saved = "{\"schema_version\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
+    defer std.testing.allocator.free(path);
+
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var host: Host = undefined;
+    var surface_a: Surface = undefined;
+    var surface_b: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{.{ .storage = &host, .id = 1, .register = true }},
+        .surfaces = &.{
+            .{ .storage = &surface_a, .host = &host, .register = true },
+            .{ .storage = &surface_b, .host = &host, .register = true },
+        },
+        .tabs = &.{
+            .{ .host = &host, .surface = &surface_a, .id = 1 },
+            .{ .host = &host, .surface = &surface_b, .id = 2 },
+        },
+    });
+    defer session.deinit();
+    // Two restored tabs whose programs have both ended by themselves.
+    app.restored_session_untouched = true;
+    surface_a.core_surface.child_exited = true;
+    surface_b.core_surface.child_exited = true;
+    surface_a.core_initialized = true;
+    surface_b.core_initialized = true;
+    const failed = app.sessionIsFailedRestore();
+    // A checkpoint (an undo of the last tab's close arms one) writes nothing
+    // for it: the file keeps the session as it was restored, and the next
+    // close finds nothing more to move aside.
+    const written_failed = app.writeSessionStateAt(path);
+    surface_a.core_initialized = false;
+    surface_b.core_initialized = false;
+    try std.testing.expect(failed);
+    try std.testing.expect(!written_failed);
+    {
+        const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 4096);
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings(saved, kept);
+    }
+
+    // Used in A while A's program ran: the whole session is used, even once
+    // A's tab has gone and only B, never touched, is left.
+    surface_a.core_surface.child_exited = false;
+    surface_a.core_initialized = true;
+    surface_a.noteProgramInput();
+    surface_a.core_initialized = false;
+    var removed = host.tabs.orderedRemove(0);
+    removed.deinit();
+    surface_b.core_initialized = true;
+    const used = app.sessionIsFailedRestore();
+    const written_used = app.writeSessionStateAt(path);
+    surface_b.core_initialized = false;
+    try std.testing.expect(!used);
+    try std.testing.expect(written_used);
+    const rewritten = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 64 * 1024);
+    defer std.testing.allocator.free(rewritten);
+    try std.testing.expect(!std.mem.eql(u8, saved, rewritten));
+}
+
 test "win32 close_tab this asks first once undo is off" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
@@ -45429,59 +47029,28 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
     defer session.deinit();
 
     // [A | (B / C)], natively and in the shell model.
-    const Split = struct {
-        fn native(tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
-            var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
-            defer inserted.deinit();
-            const next = try tab.tree.split(std.testing.allocator, tab.findHandle(at).?, direction, 0.5, &inserted);
-            tab.tree.deinit();
-            tab.tree = next;
-        }
-        fn shell(target: *App, at: *Surface, direction: win32_shell.model.Direction, view: *Surface) !void {
-            var prepared = try target.shell_runtime.prepare(.{ .split_pane = .{ .pane = at.shell_id.?, .direction = direction } });
-            defer prepared.deinit();
-            try prepared.commit(&target.shell_runtime);
-            view.shell_id = prepared.created.pane;
-            view.shell_committed = true;
-        }
-        /// What `Surface.requestClose` prepares before it destroys the pane.
-        fn close(target: *App, tab: *Tab, view: *Surface) !void {
-            view.pending_close_tree = try tab.tree.remove(std.testing.allocator, tab.findHandle(view).?);
-            view.pending_shell_close = try target.shell_runtime.prepare(.{ .close_pane = view.shell_id.? });
-            target.windowDestroyed(view);
-        }
-    };
-    var window = try app.shell_runtime.prepare(.create_window);
+    const Step = ShellProjectionSteps;
+    var window = try Step.openWindow(&app, &host, &.{&surface_a});
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, tab);
     const native_tab = &host.tabs.items[0];
-    try Split.native(native_tab, &surface_a, .right, &surface_b);
-    try Split.shell(&app, &surface_a, .right, &surface_b);
-    try Split.native(native_tab, &surface_b, .down, &surface_c);
-    try Split.shell(&app, &surface_b, .down, &surface_c);
+    try Step.split(&app, native_tab, &surface_a, .right, &surface_b);
+    try Step.split(&app, native_tab, &surface_b, .down, &surface_c);
     // The user is in B; C exits in the background. Focus stays on B, not on
     // the tree's first pane, A.
     native_tab.focused = native_tab.findHandle(&surface_b).?;
     _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
     try app.validateShellNativeMapping();
-    try Split.close(&app, native_tab, &surface_c);
+    try Step.closePane(&app, native_tab, &surface_c);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
     try app.validateShellNativeMapping();
 
     // Split B again and close the focused new pane: focus goes to its
     // sibling B, as the shell model chooses, not to A.
-    try Split.native(native_tab, &surface_b, .down, &surface_c);
-    try Split.shell(&app, &surface_b, .down, &surface_c);
+    try Step.split(&app, native_tab, &surface_b, .down, &surface_c);
     native_tab.focused = native_tab.findHandle(&surface_c).?;
     _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
     try app.validateShellNativeMapping();
-    try Split.close(&app, native_tab, &surface_c);
+    try Step.closePane(&app, native_tab, &surface_c);
     try std.testing.expectEqual(@as(?*Surface, &surface_b), native_tab.focusedSurface());
     try app.validateShellNativeMapping();
 }
@@ -45489,6 +47058,27 @@ test "win32 closing a split keeps focus, or gives it to the closed pane's siblin
 /// Native and shell-model halves of the structural steps the projection
 /// tests drive: each mirrors what the runtime does on both sides.
 const ShellProjectionSteps = struct {
+    /// A window holding one tab per view, in order, with tab ids 1, 2, ...:
+    /// the first view's tab is the one the window is created with. The caller
+    /// deinits the returned committed window transaction.
+    fn openWindow(app: *App, host: *Host, views: []const *Surface) !win32_shell.runtime.Prepared {
+        var window = try app.shell_runtime.prepare(.create_window);
+        errdefer window.deinit();
+        try window.commit(&app.shell_runtime);
+        host.shell_id = window.created.window;
+        for (views, 0..) |view, index| {
+            var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
+            defer if (created) |*prepared| prepared.deinit();
+            if (created) |*prepared| try prepared.commit(&app.shell_runtime);
+            view.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
+            view.shell_committed = true;
+            var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), view);
+            tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
+            try host.tabs.append(std.testing.allocator, tab);
+        }
+        return window;
+    }
+
     fn split(app: *App, tab: *Tab, at: *Surface, direction: SplitTreeSurface.Split.Direction, view: *Surface) !void {
         var inserted = try SplitTreeSurface.init(std.testing.allocator, view);
         defer inserted.deinit();
@@ -45581,16 +47171,8 @@ test "win32 shell and native projections agree over split, move, close and resto
     });
     defer session.deinit();
     const Step = ShellProjectionSteps;
-
-    var window = try app.shell_runtime.prepare(.create_window);
+    var window = try Step.openWindow(&app, &host, &.{&surface_a});
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    first_tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, first_tab);
 
     // Split: [A | (B / C)], the user in B. A second tab, [D], in front.
     try Step.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
@@ -45705,16 +47287,8 @@ test "win32 a restored tab has the saved shape in the shell model, so closing a 
     const host_hwnd = try createTestHostWindow();
     defer _ = sys.DestroyWindow(host_hwnd);
     host.hwnd = host_hwnd;
-
-    var window = try app.shell_runtime.prepare(.create_window);
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_x});
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_x.shell_id = window.created.pane;
-    surface_x.shell_committed = true;
-    var first_tab = try Tab.init(std.testing.allocator, 1, &surface_x);
-    first_tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, first_tab);
 
     // What `Surface.init` does for each restored pane, natively and in the
     // shell model: a new tab, or a split at the pane it is cloned from.
@@ -45809,15 +47383,8 @@ test "win32 the shell/native cross-check compares split topology" {
     });
     defer session.deinit();
 
-    var window = try app.shell_runtime.prepare(.create_window);
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{&surface_a});
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    surface_a.shell_id = window.created.pane;
-    surface_a.shell_committed = true;
-    var tab = try Tab.init(std.testing.allocator, 1, &surface_a);
-    tab.shell_id = window.created.tab;
-    try host.tabs.append(std.testing.allocator, tab);
     try ShellProjectionSteps.split(&app, &host.tabs.items[0], &surface_a, .right, &surface_b);
     try app.validateShellNativeMapping();
 
@@ -45861,21 +47428,8 @@ test "win32 a background tab's exit keeps the active tab" {
     defer session.deinit();
 
     // Tabs [A, B, C] with B active, natively and in the shell model.
-    var window = try app.shell_runtime.prepare(.create_window);
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c });
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c };
-    for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
-        defer if (created) |*prepared| prepared.deinit();
-        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
-        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
-        surface.shell_committed = true;
-        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
-        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
-        try host.tabs.append(std.testing.allocator, tab);
-    }
     host.active_tab = 1;
     _ = try app.shell_runtime.focusPane(surface_b.shell_id.?);
     try app.validateShellNativeMapping();
@@ -45914,21 +47468,8 @@ test "win32 undoing then redoing an in-place tab close leaves the same tab in fr
     defer session.deinit();
 
     // Tabs [A, B, C, D] with C active, natively and in the shell model.
-    var window = try app.shell_runtime.prepare(.create_window);
+    var window = try ShellProjectionSteps.openWindow(&app, &host, &.{ &surface_a, &surface_b, &surface_c, &surface_d });
     defer window.deinit();
-    try window.commit(&app.shell_runtime);
-    host.shell_id = window.created.window;
-    const surfaces = [_]*Surface{ &surface_a, &surface_b, &surface_c, &surface_d };
-    for (surfaces, 0..) |surface, index| {
-        var created = if (index == 0) null else try app.shell_runtime.prepare(.{ .create_tab = .{ .window = window.created.window.? } });
-        defer if (created) |*prepared| prepared.deinit();
-        if (created) |*prepared| try prepared.commit(&app.shell_runtime);
-        surface.shell_id = if (created) |prepared| prepared.created.pane else window.created.pane;
-        surface.shell_committed = true;
-        var tab = try Tab.init(std.testing.allocator, @intCast(index + 1), surface);
-        tab.shell_id = if (created) |prepared| prepared.created.tab else window.created.tab;
-        try host.tabs.append(std.testing.allocator, tab);
-    }
     host.active_tab = 2;
     _ = try app.shell_runtime.focusPane(surface_c.shell_id.?);
     try app.validateShellNativeMapping();
@@ -46305,6 +47846,202 @@ test "win32 runtime can initialize config" {
     defer app.terminate();
 
     try std.testing.expect(@intFromPtr(app.hinstance) != 0);
+}
+
+/// Load `argv` into `app`'s config as `Config.load` does a command line:
+/// each argument sets its field and is kept as a replay step.
+fn testLoadStartupArgv(app: *App, argv: []const []const u8) !void {
+    var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(argv) };
+    try app.config.loadIter(std.testing.allocator, &args);
+    try app.config.finalize();
+}
+
+/// `config` cannot open a layout: not by its field, and not by replaying its
+/// history, as a theme load, a conditional-state change or a window's clone
+/// of it does.
+fn testExpectNoLaunchLayout(config: *const configpkg.Config) !void {
+    try std.testing.expect(config.@"launch-layout" == null);
+    var source = try config.clone(std.testing.allocator);
+    defer source.deinit();
+    source._conditional_set.insert(.theme);
+    var state = source._conditional_state;
+    state.theme = if (state.theme == .light) .dark else .light;
+    var replayed = (try source.changeConditionalState(state)).?;
+    defer replayed.deinit();
+    try std.testing.expect(replayed.@"launch-layout" == null);
+}
+
+test "win32 a command-line launch-layout outlasts the color-scheme sync that ends init" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Case = struct { conditional: bool, scheme_changes: bool };
+    // When the scheme changes, the sync's soft reload installs the app config
+    // itself, or, when the config uses a conditional key, the replay of its
+    // history. When it does not, no config change runs, and the claim alone
+    // keeps the layout out of the app config.
+    for ([_]Case{
+        .{ .conditional = false, .scheme_changes = true },
+        .{ .conditional = true, .scheme_changes = true },
+        .{ .conditional = false, .scheme_changes = false },
+    }) |case| {
+        var core_app: CoreApp = undefined;
+        var app: App = undefined;
+        var session: TestSession = .{};
+        try session.init(.{ .core_app = &core_app, .app = &app });
+        defer session.deinit();
+        defer testFreeConfigProblems(&app, alloc);
+        defer app.releaseStartupLaunchLayout();
+
+        try testLoadStartupArgv(&app, &.{"--launch-layout=shot"});
+        if (case.conditional) app.config._conditional_set.insert(.theme);
+
+        // Conditional state starts light and Windows was dark in the report.
+        // Start from the scheme the system is not in, so the sync is a change
+        // on any machine, or from the one it is in, so it is none.
+        const system: configpkg.ConditionalState.Theme = if (isSystemDarkMode()) .dark else .light;
+        const other: configpkg.ConditionalState.Theme = if (system == .dark) .light else .dark;
+        const start = if (case.scheme_changes) other else system;
+        core_app.config_conditional_state.theme = start;
+        app.config._conditional_state.theme = start;
+        const revision = app.config_revision;
+        // What `init` ends with.
+        app.syncStartupConfig();
+        // When it changed, it reloaded, and the `.app` config change installed
+        // a new config: the replay's, which carries the new state, when it
+        // was conditional.
+        try std.testing.expectEqual(case.scheme_changes, app.config_revision != revision);
+        try std.testing.expectEqual(
+            case.conditional and case.scheme_changes,
+            app.config._conditional_state.theme != start,
+        );
+
+        // `run` still has the layout to open (before the fix it read the
+        // app config, which had lost it here), and the config has nothing
+        // of it for a reload or a window to bring back.
+        switch (app.startup_launch_layout) {
+            .name => |claimed| try std.testing.expectEqualStrings("shot", claimed),
+            .none, .lost => return error.TestUnexpectedResult,
+        }
+        try testExpectNoLaunchLayout(&app.config);
+    }
+}
+
+test "win32 a palette theme preview drops the startup launch-layout it parses again" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "preview-theme", .data = "background = #102030\n" });
+    const theme = try tmp.dir.realpathAlloc(alloc, "preview-theme");
+    defer alloc.free(theme);
+
+    // What `loadPaletteThemeConfig` has before it finishes: the command line,
+    // parsed again, with the startup `--launch-layout` in it.
+    var preview = try configpkg.Config.default(alloc);
+    defer preview.deinit();
+    var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{
+        .iterator = cli_args.sliceIterator(&.{"--launch-layout=shot"}),
+    };
+    try preview.loadIter(alloc, &args);
+    try Host.finishPaletteThemeConfig(&preview, .{}, theme);
+    // The theme loaded, so `finalize` replayed the command line over it.
+    try std.testing.expectEqual(@as(u8, 0x10), preview.background.r);
+    // `swapRuntimeConfigFromPalette` installs this as the app config, which
+    // a `new_window` clones while the preview is live.
+    try testExpectNoLaunchLayout(&preview);
+}
+
+test "win32 a reload after run took the startup launch-layout does not bring it back" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var session: TestSession = .{};
+    try session.init(.{ .core_app = &core_app, .app = &app });
+    defer session.deinit();
+    defer testFreeConfigProblems(&app, alloc);
+    defer app.releaseStartupLaunchLayout();
+
+    const argv: []const []const u8 = &.{"--launch-layout=Project Alpha"};
+    try testLoadStartupArgv(&app, argv);
+    app.claimStartupLaunchLayout();
+    try std.testing.expect(app.startup_launch_layout == .name);
+    // As `run` does once it has tried the layout.
+    app.releaseStartupLaunchLayout();
+
+    // A hard reload or a Settings save parses the same command line again.
+    var reloaded = try configpkg.Config.default(alloc);
+    defer reloaded.deinit();
+    var args: cli_args.ArgsIterator(cli_args.SliceIterator) = .{ .iterator = cli_args.sliceIterator(argv) };
+    try reloaded.loadIter(alloc, &args);
+    try reloaded.finalize();
+    try std.testing.expectEqualStrings("Project Alpha", reloaded.@"launch-layout".?);
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &reloaded }));
+    try std.testing.expect(app.startup_launch_layout == .none);
+    try testExpectNoLaunchLayout(&app.config);
+
+    // A theme change after it replays the installed config.
+    app.config._conditional_set.insert(.theme);
+    const scheme: apprt.ColorScheme = if (core_app.config_conditional_state.theme == .light) .dark else .light;
+    try core_app.colorSchemeEvent(&app, scheme);
+    try std.testing.expect(app.startup_launch_layout == .none);
+    try testExpectNoLaunchLayout(&app.config);
+
+    // A new window's config is a clone of the app config.
+    var window = try apprt.surface.newConfig(&core_app, &app.config, .window);
+    defer window.deinit();
+    try testExpectNoLaunchLayout(&window);
+}
+
+test "win32 a startup launch-layout whose name could not be kept still opens as a failed layout" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            defer app.releaseStartupLaunchLayout();
+            // `run` opens the layout in place of session restore and of
+            // `initial-window`, so neither may decide this launch.
+            app.config.@"initial-window" = false;
+
+            // Nothing asked for: `run` goes on to session restore or, as
+            // here, waits without a window.
+            try std.testing.expect(!try app.openStartupLaunchLayout());
+            try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+
+            // Copying the name fails. The app config still forgets the
+            // request, which `init`'s color-scheme sync would drop anyway.
+            try testLoadStartupArgv(app, &.{"--launch-layout=shot"});
+            const alloc = fixture.core_app.alloc;
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            fixture.core_app.alloc = failing.allocator();
+            app.claimStartupLaunchLayout();
+            fixture.core_app.alloc = alloc;
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(app.startup_launch_layout == .lost);
+            try testExpectNoLaunchLayout(&app.config);
+            try expectFailedLayoutWindow(&fixture);
+
+            // It ends as a name that opens no layout does. That name is
+            // freed (the testing allocator reports a leak otherwise).
+            app.startup_launch_layout = .{ .name = try alloc.dupe(u8, "CON") };
+            try expectFailedLayoutWindow(&fixture);
+        }
+
+        /// `run`'s first window for a layout it could not open: one ordinary
+        /// window that says so, and no request left to open later.
+        fn expectFailedLayoutWindow(fixture: *WindowStartTestApp) !void {
+            const app = &fixture.app;
+            try std.testing.expect(try app.openStartupLaunchLayout());
+            try std.testing.expect(app.startup_launch_layout == .none);
+            try std.testing.expectEqual(@as(usize, 1), app.windows.items.len);
+            const host = app.primarySurface().?.host.?;
+            try std.testing.expectEqualStrings("Layout could not be opened.", host.banner_text.?);
+            fixture.closeWindows();
+        }
+    }.body);
 }
 
 test "win32 an OpenGL retry on a window reuses the pixel format it set" {
@@ -47160,6 +48897,15 @@ test "win32 initialDecorationsVisible follows startup source" {
         },
     ));
 
+    // A forwarded `--window-decoration` (already applied to `config`) wins
+    // over the source's.
+    config.@"window-decoration" = .none;
+    try std.testing.expect(!Surface.initialDecorationsVisible(
+        &config,
+        .{ .clone_state_from = &source, .forwarded_arguments = &.{"--window-decoration=none"} },
+    ));
+    try std.testing.expect(Surface.initialDecorationsVisible(&config, .{ .clone_state_from = &source }));
+
     config.@"window-decoration" = .none;
     try std.testing.expect(!Surface.initialDecorationsVisible(
         &config,
@@ -47293,7 +49039,7 @@ test "win32 copySharedWindowStateFrom clones host-scoped window fields" {
     var dest: Surface = undefined;
     dest.host = null;
 
-    dest.copySharedWindowStateFrom(&source);
+    dest.copySharedWindowStateFrom(&source, .{});
 
     try std.testing.expectEqual(source.decorations_visible, dest.decorations_visible);
     try std.testing.expectEqual(source.decorations_visible_overridden, dest.decorations_visible_overridden);
@@ -47307,32 +49053,32 @@ test "win32 copySharedWindowStateFrom clones host-scoped window fields" {
     try std.testing.expectEqual(source.background_opacity_default, dest.background_opacity_default);
     try std.testing.expectEqual(source.background_opacity_force_opaque, dest.background_opacity_force_opaque);
     try std.testing.expect(sizeLimitEquals(source.size_limit, dest.size_limit));
+
+    // What a forwarded launch set stays the window's own; the state and the
+    // rest are still the source's.
+    var own: Surface = undefined;
+    own.host = null;
+    own.decorations_visible = true;
+    own.decorations_visible_overridden = false;
+    own.default_client_size = .{ .width = 7, .height = 8 };
+    own.background_opacity_default = 0.5;
+    own.background_opacity_force_opaque = false;
+    own.copySharedWindowStateFrom(&source, .{ .position = true, .size = true, .decoration = true, .background_opacity = true });
+    try std.testing.expect(own.decorations_visible and !own.decorations_visible_overridden);
+    try std.testing.expectEqualDeep(@as(?apprt.SurfaceSize, .{ .width = 7, .height = 8 }), own.default_client_size);
+    try std.testing.expectEqual(@as(f64, 0.5), own.background_opacity_default);
+    try std.testing.expect(!own.background_opacity_force_opaque);
+    try std.testing.expectEqual(source.fullscreen, own.fullscreen);
+    try std.testing.expectEqualDeep(source.restore_placement, own.restore_placement);
+    try std.testing.expect(sizeLimitEquals(source.size_limit, own.size_limit));
 }
 
 test "win32 leaveFullscreen and new_window keep the normal rect of a maximized window" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const Desktop = struct {
-        extern "user32" fn CreateDesktopW(
-            name: [*:0]const u16,
-            device: ?*anyopaque,
-            mode: ?*anyopaque,
-            flags: u32,
-            access: u32,
-            attributes: ?*anyopaque,
-        ) callconv(.winapi) ?*anyopaque;
-        extern "user32" fn SetThreadDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-        extern "user32" fn CloseDesktop(desktop: *anyopaque) callconv(.winapi) BOOL;
-
-        fn run(desktop: *anyopaque, result: *anyerror!void) void {
-            body(desktop) catch |err| {
-                // The test fails at `try result` on the runner's thread;
-                // the trace shows which check failed.
-                if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
-                result.* = err;
-            };
-        }
-
+    // Maximizing shows a window, so these live on a desktop of their own and
+    // never reach the user's.
+    try runOnHiddenDesktop(struct {
         fn window(app: *App, origin: i32) !Surface {
             var surface: Surface = undefined;
             surface.app = app;
@@ -47379,15 +49125,9 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             }
         };
 
-        // Maximizing shows a window, so these live on a desktop of their
-        // own and never reach the user's.
-        fn body(desktop: *anyopaque) !void {
-            if (SetThreadDesktop(desktop) == 0) return lastError();
+        fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var surface = try window(&app, 100);
             const hwnd = surface.hwnd.?;
             defer _ = sys.DestroyWindow(hwnd);
@@ -47420,7 +49160,7 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
             var clone = try window(&app, 200);
             defer _ = sys.DestroyWindow(clone.hwnd.?);
             _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
-            try clone.inheritWindowStateFrom(&surface);
+            try clone.inheritWindowStateFrom(&surface, .{});
             try std.testing.expect(sys.IsZoomed(clone.hwnd.?) != 0);
             try std.testing.expectEqualDeep(normal, try normalRect(clone.hwnd.?));
 
@@ -47471,22 +49211,17 @@ test "win32 leaveFullscreen and new_window keep the normal rect of a maximized w
                 }
             }
         }
-    };
+    }.body);
+}
 
-    const desktop = Desktop.CreateDesktopW(
-        std.unicode.utf8ToUtf16LeStringLiteral("noctty-test-fullscreen"),
-        null,
-        null,
-        0,
-        0x10000000, // GENERIC_ALL
-        null,
-    ) orelse return error.SkipZigTest;
-    defer _ = Desktop.CloseDesktop(desktop);
-    // SetThreadDesktop fails on a thread that already owns a window.
-    var result: anyerror!void = {};
-    const thread = try std.Thread.spawn(.{}, Desktop.run, .{ desktop, &result });
-    thread.join();
-    try result;
+/// The hostless app the placement tests' surfaces point at, with only the
+/// fields window placement reads set.
+fn placementTestApp() App {
+    var app: App = undefined;
+    app.os_build = c.OS_BUILD_WIN11_21H2;
+    app.config = .{};
+    app.hosts = .empty;
+    return app;
 }
 
 /// A hostless surface whose top-level window sits at (`left`, `top`) and is
@@ -47529,10 +49264,7 @@ test "win32 a window opened from a minimized one starts on screen at its restore
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47544,7 +49276,7 @@ test "win32 a window opened from a minimized one starts on screen at its restore
             _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
             try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
 
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
 
             // The iconic rect is near (-32000, -32000); what the source
             // restores to is its normal rect.
@@ -47568,10 +49300,7 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47584,7 +49313,7 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
             const step = sys.MulDiv(32, @intCast(sys.GetDpiForWindow(source_hwnd)), 96);
 
             // A normal source: one step down and right, same size.
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
             var rect: RECT = undefined;
             try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
             try std.testing.expectEqual(restored.left + step, rect.left);
@@ -47597,27 +49326,23 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
             const monitor = sys.MonitorFromWindow(source_hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
             const info = monitorInfo(monitor) orelse return lastError();
             try std.testing.expect(sys.SetWindowPos(source_hwnd, null, info.work_area.right - 640, info.work_area.bottom - 480, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
             try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
             try std.testing.expect(rect.left >= info.work_area.left and rect.right <= info.work_area.right);
             try std.testing.expect(rect.top >= info.work_area.top and rect.bottom <= info.work_area.bottom);
             try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
             try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
 
-            // `window-position-x/y` still says where it goes; only the size
-            // comes from the source.
+            // `window-position-x/y` still says where it goes (`createHost`
+            // put it there); only the size comes from the source.
             try std.testing.expect(sys.SetWindowPos(source_hwnd, null, 80, 90, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
             try std.testing.expect(sys.SetWindowPos(clone_hwnd, null, 300, 310, 400, 300, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
-            app.config.@"window-position-x" = 300;
-            app.config.@"window-position-y" = 310;
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{ .position = true });
             try std.testing.expect(sys.GetWindowRect(clone_hwnd, &rect) != 0);
             try std.testing.expectEqual(@as(i32, 300), rect.left);
             try std.testing.expectEqual(@as(i32, 310), rect.top);
             try std.testing.expectEqual(@as(i32, 640), rect.right - rect.left);
             try std.testing.expectEqual(@as(i32, 480), rect.bottom - rect.top);
-            app.config.@"window-position-x" = null;
-            app.config.@"window-position-y" = null;
 
             // A source minimized from maximized restores to maximized, so
             // the new window is maximized, with the source's normal rect.
@@ -47627,7 +49352,7 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
             _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
             _ = sys.ShowWindow(source_hwnd, c.SW_SHOWMINNOACTIVE);
             try std.testing.expect(sys.IsIconic(source_hwnd) != 0);
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
             try std.testing.expect(sys.IsIconic(clone_hwnd) == 0);
             try std.testing.expect(sys.IsZoomed(clone_hwnd) != 0);
             var clone_placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
@@ -47638,24 +49363,43 @@ test "win32 a new window cascades from its source, stays on its monitor and foll
     }.body);
 }
 
+/// A started app for tests that create real hosts with `createHost`. Safe
+/// mode starts from the default config rather than the developer's own,
+/// whose tab bar or decoration settings could turn the integrated titlebar
+/// off.
+const SafeModeAppFixture = struct {
+    core: *CoreApp = undefined,
+    app: App = undefined,
+
+    fn init(self: *SafeModeAppFixture) !void {
+        self.core = try CoreApp.create(std.testing.allocator);
+        errdefer self.core.destroy();
+        try self.app.init(self.core, .{ .safe_mode = true });
+    }
+
+    fn deinit(self: *SafeModeAppFixture) void {
+        const hinstance = self.app.hinstance;
+        self.app.terminate();
+        // `createHost` registers these and nothing unregisters them, so a
+        // later test could not create a host of its own.
+        _ = sys.UnregisterClassW(host_class_name, hinstance);
+        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
+        self.core.destroy();
+    }
+};
+
 test "win32 a host opened from a minimized host starts on screen" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            const core = try CoreApp.create(std.testing.allocator);
-            defer core.destroy();
-            var app: App = undefined;
-            try app.init(core, .{ .safe_mode = true });
-            const hinstance = app.hinstance;
-            defer {
-                app.terminate();
-                _ = sys.UnregisterClassW(host_class_name, hinstance);
-                _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-                _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-            }
+            var fixture: SafeModeAppFixture = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
             const title = std.unicode.utf8ToUtf16LeStringLiteral("");
-            const source = try app.createHost(title, null, false);
+            const source = try app.createHost(title, &app.config, .{});
             const hwnd = source.hwnd.?;
             try std.testing.expect(sys.SetWindowPos(hwnd, null, 60, 70, 700, 500, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
             _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
@@ -47666,8 +49410,8 @@ test "win32 a host opened from a minimized host starts on screen" {
 
             // `createHost` gives the new host the source's place before
             // anything is shown.
-            const clone = try app.createHost(title, null, false);
-            try app.inheritHostWindowState(clone, source);
+            const clone = try app.createHost(title, &app.config, .{});
+            try app.inheritHostWindowState(clone, source, false);
             var rect: RECT = undefined;
             try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
             try std.testing.expectEqual(restored.right - restored.left, rect.right - rect.left);
@@ -47748,10 +49492,7 @@ test "win32 a new window is not maximized by a restore-to-maximized flag left on
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47769,13 +49510,13 @@ test "win32 a new window is not maximized by a restore-to-maximized flag left on
             _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
             try std.testing.expect(sys.IsZoomed(hwnd) == 0 and sys.IsIconic(hwnd) == 0);
 
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
             try std.testing.expect(sys.IsZoomed(clone.hwnd.?) == 0);
 
             // Another tab of the same window syncing its state does not
             // maximize the window either.
             var twin = source;
-            try twin.inheritWindowStateFrom(&source);
+            try twin.inheritWindowStateFrom(&source, .{});
             try std.testing.expect(sys.IsZoomed(hwnd) == 0);
         }
     }.body);
@@ -47786,10 +49527,7 @@ test "win32 a new window from a fullscreen window covers the same monitor" {
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
             var clone = try placementTestSurface(&app, 700, 300);
@@ -47804,12 +49542,8 @@ test "win32 a new window from a fullscreen window covers the same monitor" {
             // the taskbar under a window that is meant to be fullscreen, and
             // not moved by `window-position-x/y`.
             for ([_]bool{ false, true }) |configured| {
-                if (configured) {
-                    app.config.@"window-position-x" = 300;
-                    app.config.@"window-position-y" = 310;
-                }
                 try std.testing.expect(sys.SetWindowPos(clone.hwnd.?, null, 700, 300, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) != 0);
-                try clone.inheritWindowStateFrom(&source);
+                try clone.inheritWindowStateFrom(&source, .{ .position = configured });
                 try std.testing.expect(clone.fullscreen);
                 var rect: RECT = undefined;
                 try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
@@ -47820,7 +49554,7 @@ test "win32 a new window from a fullscreen window covers the same monitor" {
             // taskbar; the monitor is still where it is fullscreen.
             _ = sys.ShowWindow(source.hwnd.?, c.SW_SHOWMINNOACTIVE);
             try std.testing.expect(sys.IsIconic(source.hwnd.?) != 0);
-            try clone.inheritWindowStateFrom(&source);
+            try clone.inheritWindowStateFrom(&source, .{});
             var rect: RECT = undefined;
             try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
             try std.testing.expectEqualDeep(RECT{ .left = full.left, .top = full.top, .right = full.right, .bottom = full.bottom }, rect);
@@ -47833,10 +49567,7 @@ test "win32 new windows from one source step past the windows already there" {
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             defer app.hosts.deinit(std.testing.allocator);
             var source = try placementTestSurface(&app, 50, 50);
             defer _ = sys.DestroyWindow(source.hwnd.?);
@@ -47851,7 +49582,7 @@ test "win32 new windows from one source step past the windows already there" {
             // The next one goes where the last one is not.
             var rect: RECT = undefined;
             for ([_]i32{ 1, 2, 3 }) |n| {
-                try clone.inheritWindowStateFrom(&source);
+                try clone.inheritWindowStateFrom(&source, .{});
                 try std.testing.expect(sys.GetWindowRect(clone.hwnd.?, &rect) != 0);
                 try std.testing.expectEqual(origin.left + n * step, rect.left);
                 try std.testing.expectEqual(origin.top + n * step, rect.top);
@@ -47869,6 +49600,927 @@ test "win32 new windows from one source step past the windows already there" {
                 std.testing.allocator.destroy(host);
             }
             app.hosts.clearRetainingCapacity();
+        }
+    }.body);
+}
+
+/// An app whose windows run the real `Surface.init`, with stand-ins for the
+/// GL context and the core (`App.test_surface_init_stage`), for the tests of
+/// the state a new window starts in (#496). Its windows show, so a test that
+/// uses it runs on a desktop of its own (`runOnHiddenDesktop`).
+const WindowStartTestApp = struct {
+    core_app: CoreApp = undefined,
+    app: App = undefined,
+    session: TestSession = .{},
+
+    /// The newest host window, its rect while it was still hidden, and how
+    /// it first appeared: at the first `WM_WINDOWPOSCHANGED` that showed it.
+    var watched: ?HWND = null;
+    var hidden_rect: RECT = undefined;
+    var first_show: ?FirstShow = null;
+    var previous_proc: ?*const anyopaque = null;
+    /// Minimizes the watched window as it first shows, as Windows does to a
+    /// process's first show when its launcher asked for a minimized window
+    /// (`STARTUPINFO` `SW_SHOWMINNOACTIVE`: `start /min`, a shortcut set to
+    /// Run: Minimized).
+    var minimize_first_show = false;
+    /// The client size core init asks a new window for, as it does for a
+    /// config with both `window-width` and `window-height`: an `initial_size`
+    /// action, which keeps the window where it is. Null leaves a clone where
+    /// `createHost` put it and a first window at the fixed rect below.
+    var initial_size: ?apprt.action.InitialSize = null;
+
+    const FirstShow = struct { rect: RECT, zoomed: bool, style: u32 };
+    const swp_showwindow: UINT = 0x0040;
+
+    fn init(self: *WindowStartTestApp) !void {
+        try self.session.init(.{ .core_app = &self.core_app, .app = &self.app });
+        errdefer self.session.deinit();
+        // The apartment the app's UI thread has, on this thread. Without it
+        // the full suite (not a filtered run, where the register fails)
+        // leaked every pane's drop target: its `RevokeDragDrop` failed with
+        // RPC_E_WRONG_THREAD.
+        self.app.initComApartment();
+        errdefer if (self.app.com_initialized) sys.OleUninitialize();
+        try self.app.ensureWindowClass();
+        self.app.test_surface_init_stage = &stage;
+        watched = null;
+        first_show = null;
+        minimize_first_show = false;
+        initial_size = null;
+    }
+
+    fn deinit(self: *WindowStartTestApp) void {
+        self.closeWindows();
+        if (self.app.com_initialized) sys.OleUninitialize();
+        const instance = self.app.hinstance;
+        self.session.deinit();
+        // `createHost` registers these and nothing unregisters them.
+        _ = sys.UnregisterClassW(class_name, instance);
+        _ = sys.UnregisterClassW(host_class_name, instance);
+        _ = sys.UnregisterClassW(palette_list_class_name, instance);
+        _ = sys.UnregisterClassW(scrollbar_class_name, instance);
+    }
+
+    fn newest(self: *WindowStartTestApp) *Surface {
+        return self.app.windows.items[self.app.windows.items.len - 1];
+    }
+
+    /// Closes the window `surface` is in, a pane at a time as closing its
+    /// panes does: the last one's teardown destroys and removes the host.
+    /// `destroy` unregisters only a surface whose core it stopped.
+    fn closeWindow(self: *WindowStartTestApp, surface: *Surface) void {
+        const host = surface.host.?;
+        var left: usize = 16;
+        while (left > 0) : (left -= 1) {
+            const pane = for (self.app.windows.items) |other| {
+                if (other.host == host) break other;
+            } else break;
+            self.core_app.deleteSurface(pane);
+            _ = sys.DestroyWindow(pane.hwnd.?);
+        }
+    }
+
+    fn closeWindows(self: *WindowStartTestApp) void {
+        var left: usize = 16;
+        while (self.app.windows.items.len > 0 and left > 0) : (left -= 1) self.closeWindow(self.newest());
+    }
+
+    fn stage(surface: *Surface, at: Surface.InitStage) anyerror!void {
+        const host = surface.host.?;
+        const hwnd = host.hwnd.?;
+        switch (at) {
+            // The test executable has no manifest for the layered tab strip.
+            .gl_context => if (host.tab_container_hwnd == null) {
+                host.tab_container_hwnd = try createTestChromeChild(hwnd, prompt_label_class);
+            },
+            .core_surface => {
+                // A tab of a window that is already open.
+                if (sys.IsWindowVisible(hwnd) != 0) return;
+                // What core init does with `window-width`/`window-height`:
+                // `initial_size` when the test sets one, or else, for a first
+                // window, a fixed rect inside the work area, where a small CI
+                // screen cannot cap it. A clone is otherwise where
+                // `createHost` cascaded it.
+                if (initial_size) |size| {
+                    try surface.setInitialSize(size);
+                } else if (surface.app.hosts.items.len == 1) {
+                    const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+                    const work = (monitorInfo(monitor) orelse return lastError()).work_area;
+                    if (sys.SetWindowPos(hwnd, null, work.left + 48, work.top + 40, 640, 480, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+                }
+                if (sys.GetWindowRect(hwnd, &hidden_rect) == 0) return lastError();
+                watched = hwnd;
+                first_show = null;
+                previous_proc = @ptrFromInt(@as(usize, @bitCast(sys.SetWindowLongPtrW(
+                    hwnd,
+                    c.GWLP_WNDPROC,
+                    @bitCast(@intFromPtr(&proc)),
+                ))));
+            },
+        }
+    }
+
+    fn proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+        var shown = false;
+        if (msg == c.WM_WINDOWPOSCHANGED and hwnd == watched and first_show == null) {
+            const pos: *const WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lp)));
+            if (pos.flags & swp_showwindow != 0) {
+                var rect: RECT = undefined;
+                _ = sys.GetWindowRect(hwnd, &rect);
+                first_show = .{
+                    .rect = rect,
+                    .zoomed = sys.IsZoomed(hwnd) != 0,
+                    .style = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE)))),
+                };
+                shown = true;
+            }
+        }
+        const result = sys.CallWindowProcW(previous_proc, hwnd, msg, wp, lp);
+        if (shown and minimize_first_show) _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+        return result;
+    }
+
+    fn screenRect(hwnd: HWND) !RECT {
+        var rect: RECT = undefined;
+        if (sys.GetWindowRect(hwnd, &rect) == 0) return lastError();
+        return rect;
+    }
+
+    /// The rect the window returns to when it is not maximized, in screen
+    /// coordinates.
+    fn normalRect(hwnd: HWND) !RECT {
+        var placement: WINDOWPLACEMENT = std.mem.zeroes(WINDOWPLACEMENT);
+        placement.length = @sizeOf(WINDOWPLACEMENT);
+        if (sys.GetWindowPlacement(hwnd, &placement) == 0) return lastError();
+        return workspaceRectToScreen(placement.rcNormalPosition, (try Surface.windowMonitor(hwnd)).info);
+    }
+
+    fn monitorRect(hwnd: HWND) !RECT {
+        return (try Surface.windowMonitor(hwnd)).info.rcMonitor;
+    }
+
+    fn framed(hwnd: HWND) bool {
+        const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, c.GWL_STYLE))));
+        return style & c.WS_CAPTION == c.WS_CAPTION and style & c.WS_POPUP == 0;
+    }
+};
+
+test "win32 maximize and fullscreen start a new window in that state at its first show" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |case| {
+                const maximize, const fullscreen = case;
+                app.config.maximize = maximize;
+                app.config.fullscreen = if (fullscreen) .true else .false;
+                try app.createWindow(default_title);
+                const surface = fixture.newest();
+                const hwnd = surface.windowHwnd().?;
+                const created = Fixture.hidden_rect;
+                const shown = Fixture.first_show orelse return error.TestWindowNeverShown;
+                const screen = try Fixture.monitorRect(hwnd);
+
+                try std.testing.expectEqual(fullscreen, surface.fullscreen);
+                if (fullscreen) {
+                    // Shown at the monitor's rect, without a frame: no
+                    // framed window first. And never a maximized popup,
+                    // which covers only the work area.
+                    try std.testing.expectEqualDeep(screen, shown.rect);
+                    try std.testing.expect(shown.style & c.WS_POPUP != 0 and shown.style & c.WS_CAPTION == 0);
+                    try std.testing.expect(!shown.zoomed);
+                    try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+                    try std.testing.expectEqualDeep(screen, try Fixture.screenRect(hwnd));
+                    // Leaving it gives back the window it was created as,
+                    // maximized with both.
+                    try surface.toggleFullscreen(.native);
+                    try std.testing.expect(!surface.fullscreen);
+                    try std.testing.expect(Fixture.framed(hwnd));
+                    try std.testing.expectEqual(maximize, sys.IsZoomed(hwnd) != 0);
+                    try std.testing.expectEqualDeep(created, try Fixture.normalRect(hwnd));
+                    if (!maximize) try std.testing.expectEqualDeep(created, try Fixture.screenRect(hwnd));
+                } else {
+                    // Already maximized when it first appeared: no normal
+                    // window first.
+                    try std.testing.expectEqual(maximize, shown.zoomed);
+                    try std.testing.expectEqual(maximize, sys.IsZoomed(hwnd) != 0);
+                    try std.testing.expectEqualDeep(created, try Fixture.normalRect(hwnd));
+                    if (!maximize) try std.testing.expectEqualDeep(created, shown.rect);
+                }
+
+                if (maximize and !fullscreen) {
+                    // The state is the window's start, not a rule: a tab
+                    // opened in a window the user restored leaves it so.
+                    _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+                    try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+                    _ = try app.createWindowSurface(&app.config, default_title, .{ .host_id = surface.host_id });
+                    try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+                    try std.testing.expectEqualDeep(created, try Fixture.screenRect(hwnd));
+                }
+                fixture.closeWindows();
+            }
+        }
+    }.body);
+}
+
+test "win32 a new window from a normal one takes maximize, and a forwarded --maximize or --fullscreen=true" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            try app.createWindow(default_title);
+            const source = fixture.newest();
+            const source_hwnd = source.windowHwnd().?;
+            const source_rect = try Fixture.screenRect(source_hwnd);
+            const step = cascadeStep(sys.GetDpiForWindow(source_hwnd));
+            const cascaded: RECT = .{
+                .left = source_rect.left + step,
+                .top = source_rect.top + step,
+                .right = source_rect.right + step,
+                .bottom = source_rect.bottom + step,
+            };
+            const screen = try Fixture.monitorRect(source_hwnd);
+
+            const Case = struct {
+                config_maximize: bool = false,
+                arguments: ?[]const [:0]const u8 = null,
+                maximized: bool = false,
+                fullscreen: bool = false,
+            };
+            for ([_]Case{
+                // Neither: a normal window, cascaded from the source.
+                .{},
+                .{ .config_maximize = true, .maximized = true },
+                .{ .arguments = &.{"--maximize"}, .maximized = true },
+                .{ .arguments = &.{"--fullscreen=true"}, .fullscreen = true },
+                .{ .arguments = &.{ "--maximize", "--fullscreen=true" }, .maximized = true, .fullscreen = true },
+            }) |case| {
+                app.config.maximize = case.config_maximize;
+                try std.testing.expect(try app.performAction(.app, .new_window, .{ .arguments = case.arguments }));
+                const clone = fixture.newest();
+                try std.testing.expect(clone != source);
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expectEqual(case.fullscreen, clone.fullscreen);
+                if (case.fullscreen) {
+                    // On the source's monitor, and back to the cascaded
+                    // window when it leaves, maximized with both.
+                    try std.testing.expectEqualDeep(screen, try Fixture.screenRect(hwnd));
+                    try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+                    try clone.toggleFullscreen(.native);
+                }
+                // Before the fix every one of these ended in the source's
+                // SW_RESTORE.
+                try std.testing.expectEqual(case.maximized, sys.IsZoomed(hwnd) != 0);
+                try std.testing.expectEqualDeep(cascaded, try Fixture.normalRect(hwnd));
+                // The source is left as it was.
+                try std.testing.expect(sys.IsZoomed(source_hwnd) == 0 and !source.fullscreen);
+                try std.testing.expectEqualDeep(source_rect, try Fixture.screenRect(source_hwnd));
+                fixture.closeWindow(clone);
+            }
+        }
+    }.body);
+}
+
+/// A running app with one normal window, for the tests of what a new window
+/// opened from it keeps of the keys a forwarded launch gives it (#496): a
+/// second `noctty` or `noctty +new-window` while one runs.
+const ForwardedKeysTest = struct {
+    fixture: WindowStartTestApp = .{},
+    source: *Surface = undefined,
+    /// The source window's rect, and that rect one cascade step off it.
+    source_rect: RECT = undefined,
+    cascaded: RECT = undefined,
+    work: win32_quick_terminal.Rect = undefined,
+
+    const Fixture = WindowStartTestApp;
+    /// What core init asks for when the window's config has both
+    /// `window-width` and `window-height`, as `sized` gives it.
+    const own: apprt.action.InitialSize = .{ .width = 400, .height = 300 };
+    const sized: []const [:0]const u8 = &.{ "--window-width=50", "--window-height=15" };
+
+    fn init(self: *ForwardedKeysTest) !void {
+        _ = sys.SetThreadDpiAwarenessContext(-4);
+        try self.fixture.init();
+        errdefer self.fixture.deinit();
+        try self.fixture.app.createWindow(default_title);
+        self.source = self.fixture.newest();
+        const hwnd = self.source.windowHwnd().?;
+        self.source_rect = try Fixture.screenRect(hwnd);
+        const step = cascadeStep(sys.GetDpiForWindow(hwnd));
+        self.cascaded = at(self.source_rect, self.source_rect.left + step, self.source_rect.top + step);
+        const monitor = sys.MonitorFromWindow(hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return lastError();
+        self.work = (monitorInfo(monitor) orelse return lastError()).work_area;
+    }
+
+    fn deinit(self: *ForwardedKeysTest) void {
+        self.fixture.deinit();
+    }
+
+    /// A `new_window` with `arguments` as its forwarded argv. With `size`,
+    /// core init asks for that client size, as it does when the window's
+    /// config has `window-width` and `window-height`.
+    fn forward(self: *ForwardedKeysTest, arguments: ?[]const [:0]const u8, size: ?apprt.action.InitialSize) !*Surface {
+        const count = self.fixture.app.windows.items.len;
+        Fixture.initial_size = size;
+        defer Fixture.initial_size = null;
+        try std.testing.expect(try self.fixture.app.performAction(.app, .new_window, .{ .arguments = arguments }));
+        try std.testing.expectEqual(count + 1, self.fixture.app.windows.items.len);
+        return self.fixture.newest();
+    }
+
+    /// `--window-position-x/y` at (`x`, `y`), formatted into `buf`.
+    fn placedAt(buf: *[2][32]u8, x: i32, y: i32) ![2][:0]const u8 {
+        return .{
+            try std.fmt.bufPrintZ(&buf[0], "--window-position-x={d}", .{x}),
+            try std.fmt.bufPrintZ(&buf[1], "--window-position-y={d}", .{y}),
+        };
+    }
+
+    fn at(rect: RECT, left: i32, top: i32) RECT {
+        return .{ .left = left, .top = top, .right = left + rect.right - rect.left, .bottom = top + rect.bottom - rect.top };
+    }
+
+    fn clientSize(hwnd: HWND) !apprt.SurfaceSize {
+        var rect: RECT = undefined;
+        if (sys.GetClientRect(hwnd, &rect) == 0) return lastError();
+        return .{ .width = @intCast(rect.right - rect.left), .height = @intCast(rect.bottom - rect.top) };
+    }
+
+    /// The client size `own` gives a window at its DPI.
+    fn ownClient(surface: *const Surface) apprt.SurfaceSize {
+        return scaleInitialClientSize(.{ .width = own.width, .height = own.height }, surface.content_scale);
+    }
+
+    fn style(hwnd: HWND) u32 {
+        return testWindowStyle(hwnd) & ~@as(u32, c.WS_VISIBLE | c.WS_CLIPSIBLINGS);
+    }
+
+    fn undecoratedStyle(surface: *const Surface) u32 {
+        return effectiveHostWindowStyle(surface.keepsFrameUndecorated(), false, true) & ~@as(u32, c.WS_VISIBLE);
+    }
+
+    /// The monitors of the desktop, at most `buf.len`. A CI runner has one,
+    /// so the legs that need two run only on a machine with more.
+    fn monitors(buf: *[8]MONITORINFO) ![]const MONITORINFO {
+        const Collect = struct {
+            infos: *[8]MONITORINFO,
+            count: usize = 0,
+            failed: bool = false,
+
+            fn add(monitor: sys.HMONITOR, _: HDC, _: *RECT, data: LPARAM) callconv(.winapi) BOOL {
+                const self: *@This() = @ptrFromInt(@as(usize, @bitCast(data)));
+                if (self.count == self.infos.len) return 0;
+                var info: MONITORINFO = std.mem.zeroes(MONITORINFO);
+                info.cbSize = @sizeOf(MONITORINFO);
+                if (sys.GetMonitorInfoW(monitor, &info) == 0) {
+                    self.failed = true;
+                    return 0;
+                }
+                self.infos[self.count] = info;
+                self.count += 1;
+                return 1;
+            }
+        };
+        var collect: Collect = .{ .infos = buf };
+        _ = sys.EnumDisplayMonitors(null, null, Collect.add, @bitCast(@intFromPtr(&collect)));
+        if (collect.failed) return lastError();
+        return buf[0..collect.count];
+    }
+
+    /// Moves the source, a normal window, to (100, 100) in `work`, asking
+    /// for 800x600 (onto a monitor of another DPI it takes the size its DPI
+    /// change scales that to), and returns its DPI there.
+    fn moveSource(self: *ForwardedKeysTest, work: RECT) !u32 {
+        const hwnd = self.source.windowHwnd().?;
+        if (sys.SetWindowPos(hwnd, null, work.left + 100, work.top + 100, 800, 600, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+        return sys.GetDpiForWindow(hwnd);
+    }
+};
+
+test "win32 a forwarded window position places a new window" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const app = &t.fixture.app;
+
+            // Controls, as before the fix: with nothing forwarded a new window
+            // is one cascade step off the source at its size, and
+            // `window-position-x/y` in the config place it at that size.
+            {
+                const clone = try t.forward(null, null);
+                try std.testing.expectEqualDeep(t.cascaded, try ForwardedKeysTest.Fixture.screenRect(clone.windowHwnd().?));
+                t.fixture.closeWindow(clone);
+            }
+            app.config.@"window-position-x" = @intCast(t.work.left + 200);
+            app.config.@"window-position-y" = @intCast(t.work.top + 100);
+            {
+                const clone = try t.forward(null, null);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.at(t.source_rect, t.work.left + 200, t.work.top + 100), try ForwardedKeysTest.Fixture.screenRect(clone.windowHwnd().?));
+                t.fixture.closeWindow(clone);
+            }
+
+            // A forwarded position places it, at the source's size, over the
+            // config's as well. Before the fix it went where the config said,
+            // or one cascade step off the source. The first pass runs with the
+            // config's position still set.
+            for ([_]bool{ true, false }) |configured| {
+                if (!configured) {
+                    app.config.@"window-position-x" = null;
+                    app.config.@"window-position-y" = null;
+                }
+                var buf: [2][32]u8 = undefined;
+                const x = t.work.left + 300;
+                const y = t.work.top + 200;
+                const placed = try ForwardedKeysTest.placedAt(&buf, x, y);
+                const clone = try t.forward(&placed, null);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.at(t.source_rect, x, y), try ForwardedKeysTest.Fixture.screenRect(clone.windowHwnd().?));
+                t.fixture.closeWindow(clone);
+            }
+        }
+    }.body);
+}
+
+test "win32 a forwarded window size sizes a new window, also one opened from a maximized or fullscreen window" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const Fixture = ForwardedKeysTest.Fixture;
+            const source_hwnd = t.source.windowHwnd().?;
+
+            // The client core init asked for, one cascade step off the source.
+            // Before the fix it took the source's size.
+            {
+                const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+                const rect = try Fixture.screenRect(hwnd);
+                try std.testing.expectEqual(t.cascaded.left, rect.left);
+                try std.testing.expectEqual(t.cascaded.top, rect.top);
+                // And what `reset_window_size` returns to.
+                try std.testing.expectEqualDeep(@as(?apprt.SurfaceSize, .{ .width = ForwardedKeysTest.own.width, .height = ForwardedKeysTest.own.height }), clone.default_client_size);
+                t.fixture.closeWindow(clone);
+            }
+
+            // From a maximized source: the normal rect the maximized new
+            // window returns to, where the source's is.
+            _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+            const source_normal = try Fixture.normalRect(source_hwnd);
+            {
+                const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expect(sys.IsZoomed(hwnd) != 0);
+                const normal = try Fixture.normalRect(hwnd);
+                try std.testing.expectEqual(source_normal.left, normal.left);
+                try std.testing.expectEqual(source_normal.top, normal.top);
+                _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+                t.fixture.closeWindow(clone);
+            }
+            _ = sys.ShowWindow(source_hwnd, c.SW_RESTORE);
+            try std.testing.expectEqualDeep(t.source_rect, try Fixture.screenRect(source_hwnd));
+
+            // From a fullscreen source: the window the fullscreen new window
+            // leaves fullscreen to, where the source's is.
+            try t.source.toggleFullscreen(.native);
+            {
+                const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expect(clone.fullscreen);
+                try std.testing.expectEqualDeep(try Fixture.monitorRect(hwnd), try Fixture.screenRect(hwnd));
+                try clone.toggleFullscreen(.native);
+                try std.testing.expect(!clone.fullscreen and sys.IsZoomed(hwnd) == 0);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+                const rect = try Fixture.screenRect(hwnd);
+                try std.testing.expectEqual(t.source_rect.left, rect.left);
+                try std.testing.expectEqual(t.source_rect.top, rect.top);
+                t.fixture.closeWindow(clone);
+            }
+            try t.source.toggleFullscreen(.native);
+        }
+    }.body);
+}
+
+test "win32 a forwarded size from a fullscreen window is in the pixels of the monitor the new window is on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        /// Moves the source, a normal window, near the far corner of `work`,
+        /// where its rect fits and a new window of the forwarded size does
+        /// not, also on a 1024x768 runner at 96 DPI.
+        fn toCorner(hwnd: HWND, work: RECT) !void {
+            if (sys.SetWindowPos(hwnd, null, work.right - 300, work.bottom - 200, 280, 180, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+        }
+
+        /// The new window leaves fullscreen, maximized if the source was
+        /// before it went fullscreen, and is then restored: it has the client
+        /// its forwarded size gives it, inside `work`. Returns its rect.
+        fn leaveInside(clone: *Surface, maximized: bool, work: RECT) !RECT {
+            const hwnd = clone.windowHwnd().?;
+            try std.testing.expect(clone.fullscreen);
+            try clone.toggleFullscreen(.native);
+            try std.testing.expect(!clone.fullscreen);
+            try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+            if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+            try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+            const rect = try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expect(rect.left >= work.left and rect.top >= work.top);
+            try std.testing.expect(rect.right <= work.right and rect.bottom <= work.bottom);
+            return rect;
+        }
+
+        /// The source leaves fullscreen too. `rect`, the new window's, is
+        /// where the source comes back to, moved only as far as its own
+        /// size needs to stay inside `work`.
+        fn expectAtSource(t: *ForwardedKeysTest, maximized: bool, rect: RECT, work: RECT) !void {
+            const hwnd = t.source.windowHwnd().?;
+            try t.source.toggleFullscreen(.native);
+            const back = if (maximized) try ForwardedKeysTest.Fixture.normalRect(hwnd) else try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expectEqualDeep(fitRectInWork(back.left, back.top, rect.right - rect.left, rect.bottom - rect.top, work), rect);
+            if (maximized) _ = sys.ShowWindow(hwnd, c.SW_RESTORE);
+        }
+
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const Fixture = ForwardedKeysTest.Fixture;
+            const source_hwnd = t.source.windowHwnd().?;
+
+            // The source entered fullscreen while its monitor's scale was
+            // twice what it is now, so leaving gives it its rect at half the
+            // size. The new window's forwarded size is its own, in pixels of
+            // the scale it has now. Before the fix it was halved too.
+            try t.source.toggleFullscreen(.native);
+            const dpi = t.source.restore_monitor.?.dpi;
+            t.source.restore_monitor.?.dpi = dpi * 2;
+            {
+                const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                t.source.restore_monitor.?.dpi = dpi;
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expect(clone.fullscreen);
+                try clone.toggleFullscreen(.native);
+                try std.testing.expect(!clone.fullscreen and sys.IsZoomed(hwnd) == 0);
+                try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+                const rect = try Fixture.screenRect(hwnd);
+                try std.testing.expectEqual(t.source_rect.left, rect.left);
+                try std.testing.expectEqual(t.source_rect.top, rect.top);
+                t.fixture.closeWindow(clone);
+            }
+            try t.source.toggleFullscreen(.native);
+
+            // Near the far corner of the work area the source fits and the
+            // new window does not, so it comes back moved inside, as one
+            // opened from a normal or maximized source is. Also from a source
+            // maximized before it went fullscreen, which leaves to its
+            // placement, and at the doubled scale above. Before the fix it
+            // reached past the work area at either scale, and from the
+            // maximized source at the doubled scale its client was halved.
+            const work = (try Surface.windowMonitor(source_hwnd)).info.rcWork;
+            for ([_]bool{ false, true }) |maximized| {
+                for ([_]u32{ 1, 2 }) |scale| {
+                    try toCorner(source_hwnd, work);
+                    if (maximized) _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+                    try t.source.toggleFullscreen(.native);
+                    t.source.restore_monitor.?.dpi = dpi * scale;
+                    const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                    t.source.restore_monitor.?.dpi = dpi;
+                    const rect = try leaveInside(clone, maximized, work);
+                    t.fixture.closeWindow(clone);
+                    try expectAtSource(&t, maximized, rect, work);
+                }
+            }
+
+            // The same with real monitors: the source entered fullscreen on
+            // one and was moved to another while fullscreen. Measured on
+            // main with a 144 DPI and two 96 DPI monitors: the new window
+            // left fullscreen with a 261x187 client on a 96 DPI monitor and
+            // 911x703 on the 144 DPI one, where 400x300 and 600x450 were
+            // asked for. Monitors of the same DPI were right before the fix.
+            // The maximized source pins the placement's half of the fix.
+            var buf: [8]MONITORINFO = undefined;
+            const monitors = try ForwardedKeysTest.monitors(&buf);
+            for (monitors) |entered| {
+                for (monitors) |now| {
+                    if (std.meta.eql(entered.rcMonitor, now.rcMonitor)) continue;
+                    for ([_]bool{ false, true }) |maximized| {
+                        _ = try t.moveSource(entered.rcWork);
+                        try toCorner(source_hwnd, entered.rcWork);
+                        if (maximized) _ = sys.ShowWindow(source_hwnd, c.SW_MAXIMIZE);
+                        try t.source.toggleFullscreen(.native);
+                        const screen = now.rcMonitor;
+                        if (sys.SetWindowPos(source_hwnd, null, screen.left, screen.top, screen.right - screen.left, screen.bottom - screen.top, c.SWP_NOZORDER | c.SWP_NOACTIVATE) == 0) return lastError();
+                        const now_dpi = sys.GetDpiForWindow(source_hwnd);
+                        const clone = try t.forward(ForwardedKeysTest.sized, ForwardedKeysTest.own);
+                        const hwnd = clone.windowHwnd().?;
+                        try std.testing.expectEqualDeep(screen, try Fixture.screenRect(hwnd));
+                        const rect = try leaveInside(clone, maximized, now.rcWork);
+                        try std.testing.expectEqualDeep(screen, try Fixture.monitorRect(hwnd));
+                        try std.testing.expectEqual(now_dpi, sys.GetDpiForWindow(hwnd));
+                        t.fixture.closeWindow(clone);
+                        try expectAtSource(&t, maximized, rect, now.rcWork);
+                    }
+                }
+            }
+        }
+    }.body);
+}
+
+test "win32 a new window placed and sized by forwarded arguments keeps that size on any monitor" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn forwardAt(t: *ForwardedKeysTest, x: i32, y: i32, size: apprt.action.InitialSize) !void {
+            var buf: [2][32]u8 = undefined;
+            const placed = try ForwardedKeysTest.placedAt(&buf, x, y);
+            const clone = try t.forward(&.{ placed[0], placed[1], ForwardedKeysTest.sized[0], ForwardedKeysTest.sized[1] }, size);
+            const hwnd = clone.windowHwnd().?;
+            const rect = try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expectEqual(x, rect.left);
+            try std.testing.expectEqual(y, rect.top);
+            try std.testing.expectEqualDeep(
+                scaleInitialClientSize(.{ .width = size.width, .height = size.height }, clone.content_scale),
+                try ForwardedKeysTest.clientSize(hwnd),
+            );
+            t.fixture.closeWindow(clone);
+        }
+
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const source_hwnd = t.source.windowHwnd().?;
+
+            // Placed where the arguments say, a window keeps the size they
+            // give it, as a first window would, even where it does not fit
+            // the source's work area: the cascade that fits a new window to
+            // that area does not place this one. Before the fix it was cut
+            // to that area. On the source's monitor, that is a window taller
+            // than the work area, up to the tallest a window can be.
+            {
+                const monitor = try Surface.windowMonitor(source_hwnd);
+                const work = monitor.info.rcWork;
+                const scale: apprt.ContentScale = .{
+                    .x = @as(f32, @floatFromInt(monitor.dpi)) / 96.0,
+                    .y = @as(f32, @floatFromInt(monitor.dpi)) / 96.0,
+                };
+                const frame_height = (t.source_rect.bottom - t.source_rect.top) -
+                    @as(i32, @intCast((try ForwardedKeysTest.clientSize(source_hwnd)).height));
+                const height: u32 = @intFromFloat(@ceil(@as(f32, @floatFromInt(work.bottom - work.top - frame_height + 1)) / scale.y));
+                const client = scaleInitialClientSize(.{ .width = ForwardedKeysTest.own.width, .height = height }, scale);
+                // SM_CYMAXTRACK.
+                const tallest = sys.GetSystemMetricsForDpi(60, monitor.dpi);
+                if (@as(i32, @intCast(client.height)) + frame_height <= tallest) {
+                    try forwardAt(&t, work.left + 40, work.top, .{ .width = ForwardedKeysTest.own.width, .height = height });
+                }
+            }
+
+            // Placed on another monitor, larger than the source's work area
+            // and inside its own. Measured on main with 3840x2088,
+            // 1920x1032 and 1080x1872 work areas: every window larger than
+            // the source's work area was cut to it, at the right place.
+            var buf: [8]MONITORINFO = undefined;
+            const monitors = try ForwardedKeysTest.monitors(&buf);
+            for (monitors) |source| {
+                for (monitors) |target| {
+                    if (std.meta.eql(source.rcMonitor, target.rcMonitor)) continue;
+                    const target_dpi: i32 = @intCast(try t.moveSource(target.rcWork));
+                    _ = try t.moveSource(source.rcWork);
+                    const width = @min(target.rcWork.right - target.rcWork.left - 120, @max(source.rcWork.right - source.rcWork.left + 60, 600));
+                    const height = @min(target.rcWork.bottom - target.rcWork.top - 120, @max(source.rcWork.bottom - source.rcWork.top + 40, 400));
+                    try forwardAt(&t, target.rcWork.left + 40, target.rcWork.top + 30, .{
+                        .width = @intCast(@divTrunc(width * 96, target_dpi)),
+                        .height = @intCast(@divTrunc(height * 96, target_dpi)),
+                    });
+                }
+            }
+        }
+    }.body);
+}
+
+test "win32 forwarded window decorations win over the ones a new window copies" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+            const style = ForwardedKeysTest.style;
+            const undecorated = ForwardedKeysTest.undecoratedStyle;
+            const framed = effectiveHostWindowStyle(true, false, true) & ~@as(u32, c.WS_VISIBLE);
+
+            // Windows 10's frameless undecorated window, and Windows 11's,
+            // which keeps the frame (`undecoratedKeepsFrame`), so there only
+            // the decoration state tells the two apart: a style check passes
+            // either way.
+            for ([_]u32{ 19045, c.OS_BUILD_WIN11_21H2 }) |os_build| {
+                t.fixture.app.os_build = os_build;
+                // Before the fix a new window always took the source's.
+                {
+                    const clone = try t.forward(&.{"--window-decoration=none"}, null);
+                    try std.testing.expect(!clone.decorations_visible and !clone.host.?.cached_decorations_visible);
+                    try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
+                    try std.testing.expectEqual(clone.keepsFrameUndecorated(), undecorated(clone) == framed);
+                    t.fixture.closeWindow(clone);
+                }
+                try t.source.toggleDecorations();
+                // The control: without them it copies the source's.
+                {
+                    const clone = try t.forward(null, null);
+                    try std.testing.expect(!clone.decorations_visible);
+                    try std.testing.expectEqual(undecorated(clone), style(clone.windowHwnd().?));
+                    t.fixture.closeWindow(clone);
+                }
+                {
+                    const clone = try t.forward(&.{"--window-decoration=auto"}, null);
+                    try std.testing.expect(clone.decorations_visible and clone.host.?.cached_decorations_visible);
+                    try std.testing.expectEqual(framed, style(clone.windowHwnd().?));
+                    // A config reload gives it the config's decorations
+                    // again, as it does a window that took them from the
+                    // config.
+                    try std.testing.expect(!clone.decorations_visible_overridden);
+                    t.fixture.closeWindow(clone);
+                }
+                try t.source.toggleDecorations();
+            }
+        }
+    }.body);
+}
+
+test "win32 a forwarded window background opacity wins over the one a new window copies" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+
+            // The control: an opaque source, an opaque copy.
+            {
+                const clone = try t.forward(null, null);
+                try std.testing.expect(!testHostIsLayered(clone.windowHwnd().?));
+                t.fixture.closeWindow(clone);
+            }
+            // Before the fix the copy stayed opaque.
+            {
+                const clone = try t.forward(&.{"--background-opacity=0.5"}, null);
+                const hwnd = clone.windowHwnd().?;
+                try std.testing.expectEqual(@as(f64, 0.5), clone.background_opacity_default);
+                try std.testing.expect(testHostIsLayered(hwnd));
+                try std.testing.expect((testLayeredAlpha(hwnd) orelse 255) < 255);
+                t.fixture.closeWindow(clone);
+            }
+        }
+    }.body);
+}
+
+test "win32 forwarded window keys apply to a new window when no window is open" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var t: ForwardedKeysTest = .{};
+            try t.init();
+            defer t.deinit();
+
+            // Nothing to copy: before the fix the window took the app
+            // config's position and decorations instead.
+            t.fixture.closeWindows();
+            var buf: [2][32]u8 = undefined;
+            const x = t.work.left + 300;
+            const y = t.work.top + 200;
+            const placed = try ForwardedKeysTest.placedAt(&buf, x, y);
+            const clone = try t.forward(&.{ placed[0], placed[1], ForwardedKeysTest.sized[0], ForwardedKeysTest.sized[1], "--window-decoration=none" }, ForwardedKeysTest.own);
+            const hwnd = clone.windowHwnd().?;
+            const rect = try ForwardedKeysTest.Fixture.screenRect(hwnd);
+            try std.testing.expectEqual(x, rect.left);
+            try std.testing.expectEqual(y, rect.top);
+            try std.testing.expectEqualDeep(ForwardedKeysTest.ownClient(clone), try ForwardedKeysTest.clientSize(hwnd));
+            try std.testing.expect(!clone.decorations_visible and !clone.host.?.cached_decorations_visible);
+            try std.testing.expectEqual(ForwardedKeysTest.undecoratedStyle(clone), ForwardedKeysTest.style(hwnd));
+        }
+    }.body);
+}
+
+test "win32 a config reload of maximize and fullscreen leaves the windows already open alone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            try app.createWindow(default_title);
+            const plain = fixture.newest();
+            const plain_hwnd = plain.windowHwnd().?;
+            const plain_rect = try Fixture.screenRect(plain_hwnd);
+
+            // Turned on: the window that is open stays as it is.
+            var both = try app.config.clone(std.testing.allocator);
+            defer both.deinit();
+            both.maximize = true;
+            both.fullscreen = .true;
+            try reload(app, &both);
+            try std.testing.expect(app.config.maximize and app.config.fullscreen == .true);
+            try std.testing.expect(sys.IsZoomed(plain_hwnd) == 0 and !plain.fullscreen);
+            try std.testing.expectEqualDeep(plain_rect, try Fixture.screenRect(plain_hwnd));
+
+            // A window opened after the reload takes them.
+            try app.createWindow(default_title);
+            const started = fixture.newest();
+            const started_hwnd = started.windowHwnd().?;
+            try std.testing.expect(started.fullscreen);
+            const started_rect = try Fixture.screenRect(started_hwnd);
+
+            // Turned off: neither window changes, and the second still
+            // leaves fullscreen to a maximized window, as it started.
+            var neither = try app.config.clone(std.testing.allocator);
+            defer neither.deinit();
+            neither.maximize = false;
+            neither.fullscreen = .false;
+            try reload(app, &neither);
+            try std.testing.expect(started.fullscreen and sys.IsZoomed(started_hwnd) == 0);
+            try std.testing.expectEqualDeep(started_rect, try Fixture.screenRect(started_hwnd));
+            try std.testing.expect(sys.IsZoomed(plain_hwnd) == 0 and !plain.fullscreen);
+            try std.testing.expectEqualDeep(plain_rect, try Fixture.screenRect(plain_hwnd));
+            try started.toggleFullscreen(.native);
+            try std.testing.expect(sys.IsZoomed(started_hwnd) != 0);
+        }
+
+        /// What a reload does once the file is read (`CoreApp.updateConfig`):
+        /// each pane's config change, then the app's.
+        fn reload(app: *App, config: *const configpkg.Config) !void {
+            for (app.windows.items) |surface| {
+                try std.testing.expect(try app.performAction(.{ .surface = surface.core() }, .config_change, .{ .config = config }));
+            }
+            try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = config }));
+        }
+    }.body);
+}
+
+test "win32 a quit tears down every pane of every tab, hidden tabs and splits too, and ends the app" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+
+            // A window whose second and third tabs, the third split in two,
+            // are behind its first, and a window with two tabs. Each new tab
+            // is brought to the front as `new_tab` does, so its button is
+            // made right after its pane, as in the app. Before the fix,
+            // destroying a host stopped at the first tab's button, which
+            // that tab's teardown destroys: the quit left 4 of these 6 panes
+            // and posted no WM_QUIT.
+            try app.createWindow(default_title);
+            const front = fixture.newest();
+            const host = front.host.?;
+            const behind = try app.createWindowSurface(&app.config, default_title, .{ .host_id = front.host_id });
+            try std.testing.expect(host.activateTabIndex(1));
+            const split = try app.createWindowSurface(&app.config, default_title, .{ .host_id = front.host_id });
+            try std.testing.expect(host.activateTabIndex(2));
+            _ = try app.createWindowSurface(&app.config, default_title, .{
+                .host_id = front.host_id,
+                .tab_id = app.findTabForSurface(split).?.tab.id,
+                .clone_state_from = split,
+            });
+            try std.testing.expect(host.activateTabIndex(0));
+            try std.testing.expect(front.window_visible and !behind.window_visible and !split.window_visible);
+            try app.createWindow(default_title);
+            const other = fixture.newest();
+            _ = try app.createWindowSurface(&app.config, default_title, .{ .host_id = other.host_id });
+            try std.testing.expect(other.host.?.activateTabIndex(1));
+            try std.testing.expectEqual(@as(usize, 6), app.windows.items.len);
+            try std.testing.expectEqual(@as(usize, 2), app.hosts.items.len);
+
+            // The stand-in cores never started, so `destroy` leaves them
+            // registered (`deinitCore`); the core's own teardown would not.
+            for (app.windows.items) |surface| fixture.core_app.deleteSurface(surface);
+            app.quitConfirmed();
+            try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+            try std.testing.expectEqual(@as(usize, 0), app.hosts.items.len);
+            var msg: MSG = undefined;
+            try std.testing.expect(sys.PeekMessageW(&msg, null, c.WM_QUIT, c.WM_QUIT, c.PM_REMOVE) != 0);
         }
     }.body);
 }
@@ -48068,7 +50720,7 @@ test "win32 new host starts with the client area its first frame change keeps" {
     app.use_integrated_titlebar = true;
 
     // The host stays hidden, so the test never touches the foreground.
-    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, false);
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{});
     const hwnd = host.hwnd.?;
     try std.testing.expect(host.usingIntegratedTitlebar());
     try std.testing.expect(sys.IsWindowVisible(hwnd) == 0);
@@ -48123,25 +50775,16 @@ test "win32 new host starts with the client area its first frame change keeps" {
 test "win32 createHost frames an undecorated host for its Windows build" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const alloc = std.testing.allocator;
-
     // Per-monitor aware, so the hosts are laid out at the monitor's DPI. A
     // DPI-unaware thread gets 96, where the linearly scaled frame happens to
     // equal the system's and the maximized check below could not fail.
     const previous_dpi_context = sys.SetThreadDpiAwarenessContext(-4);
     defer _ = sys.SetThreadDpiAwarenessContext(previous_dpi_context);
 
-    var core = try CoreApp.create(alloc);
-    defer core.destroy();
-    var app: App = undefined;
-    try app.init(core, .{ .safe_mode = true });
-    const hinstance = app.hinstance;
-    defer {
-        app.terminate();
-        _ = sys.UnregisterClassW(host_class_name, hinstance);
-        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-    }
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
     app.config.@"window-decoration" = .none;
 
     // `createHost` as a `new_window` clone calls it: the decoration state
@@ -48159,9 +50802,9 @@ test "win32 createHost frames an undecorated host for its Windows build" {
         for ([_]bool{ true, false }) |integrated| {
             app.use_integrated_titlebar = integrated;
             // Hosts stay hidden, so the test never touches the foreground.
-            const first = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, false);
-            const clone = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &source, false);
-            const quick = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, true);
+            const first = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{});
+            const clone = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{ .clone_state_from = &source });
+            const quick = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{ .quick_terminal = true });
             for ([_]*Host{ first, clone, quick }) |host| {
                 const hwnd = host.hwnd.?;
                 const keeps_frame = undecoratedKeepsFrame(os_build, host.quick_terminal);
@@ -49281,6 +51924,50 @@ test "security regression win32 link opener allows local junctions without PATHE
     try std.testing.expect(try App.isAllowedWin32OpenTarget(alloc, junction));
 }
 
+test "win32 link opener opens the Windows path of an MSYS2 link, never the text as written (#514)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("conf.d");
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/config.fish", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "conf.d/run.cmd", .data = "@exit /b 0\r\n" });
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    if (!windows_shell.isDriveAbsolutePath(root)) return error.SkipZigTest;
+
+    for ([_]struct { name: []const u8, allowed: bool }{
+        .{ .name = "conf.d", .allowed = true },
+        .{ .name = "conf.d\\config.fish", .allowed = true },
+        // The opener's every other refusal holds for the Windows path.
+        .{ .name = "conf.d\\run.cmd", .allowed = false },
+        .{ .name = "conf.d\\missing.txt", .allowed = false },
+    }) |case| {
+        const windows_path = try std.fs.path.join(alloc, &.{ root, case.name });
+        defer alloc.free(windows_path);
+        for ([_][]const u8{ "", "/cygdrive" }) |prefix| {
+            const text = try std.fmt.allocPrint(alloc, "{s}/{c}{s}", .{ prefix, std.ascii.toLower(windows_path[0]), windows_path[2..] });
+            defer alloc.free(text);
+            std.mem.replaceScalar(u8, text, '\\', '/');
+            const mapped = try windows_shell.msysDrivePathToWindows(alloc, text) orelse return error.TestUnexpectedResult;
+            defer alloc.free(mapped);
+            try std.testing.expectEqual(case.allowed, try App.isAllowedWin32OpenTarget(alloc, mapped));
+            // What a Ctrl+click handed the opener before #514.
+            try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, text));
+        }
+    }
+
+    // A letter that is no drive here is refused without a lookup.
+    for ("BHJKMNOPQRSTUVWY") |letter| {
+        if (internal_os.windows.driveTypeForLetter(letter) != internal_os.windows.DRIVE_NO_ROOT_DIR) continue;
+        const text = [_]u8{ '/', std.ascii.toLower(letter), '/', 'x' };
+        const mapped = try windows_shell.msysDrivePathToWindows(alloc, &text) orelse return error.TestUnexpectedResult;
+        defer alloc.free(mapped);
+        try std.testing.expect(!try App.isAllowedWin32OpenTarget(alloc, mapped));
+        break;
+    }
+}
+
 test "security regression win32 link opener allows local symlinks" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -49587,6 +52274,21 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
             const result = sys.ShellExecuteW(null, shell_open, wide.ptr, null, null, c.SW_HIDE);
             if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
         }
+        /// Waits up to five seconds for `probe.cmd` to write its marker, then
+        /// removes it for the next check.
+        fn expectMarker(dir: std.fs.Dir) !void {
+            var seen = false;
+            for (0..100) |_| {
+                dir.access("marker", .{}) catch {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                };
+                seen = true;
+                break;
+            }
+            try std.testing.expect(seen);
+            try dir.deleteFile("marker");
+        }
         fn run(desktop: *anyopaque, result: *anyerror!void) void {
             result.* = body(desktop);
         }
@@ -49607,17 +52309,7 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
                 // Positive control proves this host's ShellExecute really
                 // retries the missing literal with probe.cmd, for both slashes.
                 try shell(path);
-                var seen = false;
-                for (0..100) |_| {
-                    tmp.dir.access("marker", .{}) catch {
-                        std.Thread.sleep(50 * std.time.ns_per_ms);
-                        continue;
-                    };
-                    seen = true;
-                    break;
-                }
-                try std.testing.expect(seen);
-                try tmp.dir.deleteFile("marker");
+                try expectMarker(tmp.dir);
                 var probe: @This() = .{};
                 try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, path, dispatch));
                 try std.testing.expectEqual(@as(usize, 0), probe.calls);
@@ -49636,17 +52328,7 @@ test "security regression win32 link opener PATHEXT live probe on hidden desktop
             const dotfile = try std.fs.path.join(alloc, &.{ root, ".cmd" });
             defer alloc.free(dotfile);
             try shell(dotfile);
-            var seen = false;
-            for (0..100) |_| {
-                tmp.dir.access("marker", .{}) catch {
-                    std.Thread.sleep(50 * std.time.ns_per_ms);
-                    continue;
-                };
-                seen = true;
-                break;
-            }
-            try std.testing.expect(seen);
-            try tmp.dir.deleteFile("marker");
+            try expectMarker(tmp.dir);
             probe = .{};
             try std.testing.expectError(error.OpenUrlRejected, App.openWin32Target(alloc, &probe, dotfile, dispatch));
             std.mem.replaceScalar(u8, dotfile, '\\', '/');
@@ -50464,25 +53146,6 @@ test "win32 splitDirectionFromAction preserves requested split direction" {
     try std.testing.expectEqual(SplitTreeSurface.Split.Direction.right, splitDirectionFromAction(.right));
     try std.testing.expectEqual(SplitTreeSurface.Split.Direction.up, splitDirectionFromAction(.up));
     try std.testing.expectEqual(SplitTreeSurface.Split.Direction.down, splitDirectionFromAction(.down));
-}
-
-test "win32 session save deletes stale state file for empty snapshot" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(.{
-        .sub_path = "session-state.json",
-        .data = "stale",
-    });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
-    defer std.testing.allocator.free(path);
-
-    try win32_session_persistence.deleteFileIfPresent(path);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("session-state.json", .{}));
-
-    try win32_session_persistence.deleteFileIfPresent(path);
 }
 
 test "win32 session state scrollback capture enforces line cap budget and secure redaction" {
@@ -52027,8 +54690,8 @@ test "win32 session state is saved only by the process that owns it" {
     app.config.@"initial-command" = null;
 
     // A launch that forwarded to the primary, lost the IPC race or failed
-    // before its first window never took the session, and with no windows
-    // its save would delete it.
+    // before its first window never took the session, and must not save
+    // its own windows over it.
     app.session_owner = null;
     try std.testing.expect(!app.sessionStateEnabled());
 
@@ -52205,21 +54868,46 @@ test "win32 sign-out latches the session snapshot and a Restart Manager close do
     try std.testing.expectEqual(@as(?u64, null), app.session_checkpoint_ms);
 }
 
-test "win32 only a final session save deletes the saved session" {
+test "win32 a snapshot with no session window leaves the saved session alone" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = "{}" });
+    const saved = "{\"schema_version\":1,\"windows\":[]}";
+    try tmp.dir.writeFile(.{ .sub_path = "session-state.json", .data = saved });
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session-state.json");
     defer std.testing.allocator.free(path);
 
-    // A display-change or end-session checkpoint with no session windows
-    // (a host kept alive with zero tabs for undo) keeps the file.
-    try std.testing.expect(!removeEmptySessionState(path, .checkpoint));
-    try tmp.dir.access("session-state.json", .{});
+    // A quick terminal with a tab, and a window kept empty for undo after
+    // its last tab closed: neither holds anything the session records.
+    var core_app: CoreApp = undefined;
+    var app: App = undefined;
+    var quick: Host = undefined;
+    var emptied: Host = undefined;
+    var surface: Surface = undefined;
+    var session: TestSession = .{};
+    try session.init(.{
+        .core_app = &core_app,
+        .app = &app,
+        .hosts = &.{
+            .{ .storage = &quick, .id = 1, .register = true },
+            .{ .storage = &emptied, .id = 2, .register = true },
+        },
+        .surfaces = &.{.{ .storage = &surface, .host = &quick, .register = true }},
+        .tabs = &.{.{ .host = &quick, .surface = &surface, .id = 1 }},
+    });
+    defer session.deinit();
+    quick.quick_terminal = true;
+    try std.testing.expect(!app.hasSessionWindows());
 
-    // The owner closing its last window ends the session.
-    try std.testing.expect(removeEmptySessionState(path, .final));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("session-state.json", .{}));
+    // Before #497 the owner's `.final` save of such a snapshot deleted the
+    // file, and so did `terminate` after every close that left the save to
+    // it. The session's last window saves as it goes now, so an empty
+    // snapshot writes nothing and deletes nothing, checkpoint or final.
+    try std.testing.expect(!app.writeSessionStateAt(path));
+    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "session-state.json", 256);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings(saved, kept);
 }
 
 test "win32 session owner lock admits one live owner" {
@@ -52360,10 +55048,7 @@ test "win32 session placement saves the normal rect in screen coordinates for ev
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             const surface = try placementTestSurface(&app, 120, 140);
             defer _ = sys.DestroyWindow(surface.hwnd.?);
             const hwnd = surface.hwnd.?;
@@ -52417,15 +55102,70 @@ test "win32 session placement saves the normal rect in screen coordinates for ev
     }.body);
 }
 
+test "win32 session placement saves a fullscreen window as the window it leaves fullscreen to" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+
+            const Case = struct {
+                maximize: bool = false,
+                fullscreen: bool = false,
+                /// Maximized by the user before it enters fullscreen.
+                zoomed: bool = false,
+            };
+            // Entered from a normal window and from a maximized one, and
+            // started fullscreen by the settings, alone and with `maximize`.
+            for ([_]Case{ .{}, .{ .zoomed = true }, .{ .fullscreen = true }, .{ .maximize = true, .fullscreen = true } }) |case| {
+                app.config.maximize = case.maximize;
+                app.config.fullscreen = if (case.fullscreen) .true else .false;
+                try app.createWindow(default_title);
+                const surface = fixture.newest();
+                const hwnd = surface.windowHwnd().?;
+                const host = surface.host.?;
+                const created = Fixture.hidden_rect;
+                const maximized = case.zoomed or case.maximize;
+                if (case.zoomed) _ = sys.ShowWindow(hwnd, c.SW_MAXIMIZE);
+                if (!case.fullscreen) try surface.toggleFullscreen(.native);
+                try std.testing.expect(surface.fullscreen);
+                try std.testing.expectEqualDeep(try Fixture.monitorRect(hwnd), try Fixture.screenRect(hwnd));
+
+                // Not a normal window over the whole monitor, which it was
+                // saved as before, and came back as.
+                var placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                // Minimized while fullscreen, the same.
+                _ = sys.ShowWindow(hwnd, c.SW_SHOWMINNOACTIVE);
+                placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                _ = sys.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+
+                // It is the window leaving fullscreen gives back.
+                try surface.toggleFullscreen(.native);
+                try std.testing.expectEqual(maximized, sys.IsZoomed(hwnd) != 0);
+                try std.testing.expectEqualDeep(created, try Fixture.normalRect(hwnd));
+                placed = App.sessionWindowPlacement(host).?;
+                try std.testing.expectEqualDeep(created, placed.rect.?);
+                try std.testing.expectEqual(maximized, placed.maximized);
+                fixture.closeWindows();
+            }
+        }
+    }.body);
+}
+
 test "win32 session restore keeps a window on a monitor and brings one back from a missing monitor" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     try runOnHiddenDesktop(struct {
         fn body() !void {
             _ = sys.SetThreadDpiAwarenessContext(-4);
-            var app: App = undefined;
-            app.os_build = c.OS_BUILD_WIN11_21H2;
-            app.config = .{};
-            app.hosts = .empty;
+            var app = placementTestApp();
             const surface = try placementTestSurface(&app, 120, 140);
             defer _ = sys.DestroyWindow(surface.hwnd.?);
             const hwnd = surface.hwnd.?;
@@ -52488,6 +55228,106 @@ test "win32 session restore keeps a window on a monitor and brings one back from
                     rect.right <= work.right and rect.bottom <= work.bottom) return true;
             }
             return false;
+        }
+    }.body);
+}
+
+test "win32 a restored window and a launched layout take maximize and fullscreen over their saved state" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try runOnHiddenDesktop(struct {
+        fn body() !void {
+            _ = sys.SetThreadDpiAwarenessContext(-4);
+            var fixture: WindowStartTestApp = .{};
+            try fixture.init();
+            defer fixture.deinit();
+            const app = &fixture.app;
+            const Fixture = WindowStartTestApp;
+            const works = WorkAreas.collect();
+            try std.testing.expect(works.count > 0);
+            const work = works.slice()[0];
+            const saved: RECT = .{ .left = work.left + 60, .top = work.top + 70, .right = work.left + 760, .bottom = work.top + 570 };
+
+            const nodes = [_]win32_session_state.Node{.{ .pane = .{} }};
+            const tab: win32_session_state.Tab = .{ .selected_leaf = 0, .layout = .{ .root = 0, .nodes = &nodes } };
+            const Case = struct {
+                maximize: bool = false,
+                fullscreen: bool = false,
+                /// A saved session's window; null is a launched layout's,
+                /// whose geometry and state are stripped.
+                state: ?win32_session_state.WindowState = null,
+                /// Launched minimized: the first show is a minimize.
+                minimized: bool = false,
+                maximized: bool,
+            };
+            for ([_]Case{
+                // Unchanged: a saved normal window comes back normal at its
+                // rect, and a saved maximized one maximized (the positive
+                // control, which passed before the fix).
+                .{ .state = .normal, .maximized = false },
+                .{ .state = .maximized, .maximized = true },
+                .{ .maximize = true, .state = .maximized, .maximized = true },
+                // `maximize` over a saved normal window: its saved rect is
+                // the one it un-maximizes to.
+                .{ .maximize = true, .state = .normal, .maximized = true },
+                .{ .maximize = true, .maximized = true },
+                .{ .fullscreen = true, .state = .normal, .maximized = false },
+                .{ .maximize = true, .fullscreen = true, .state = .normal, .maximized = true },
+                // A minimized launch minimizes the first show, before the
+                // window has its saved rect. It still returns to that rect
+                // (it came back where it was created before), and a
+                // minimized window is not made fullscreen in place (it
+                // stayed a minimized popup).
+                .{ .minimized = true, .state = .normal, .maximized = false },
+                .{ .minimized = true, .state = .maximized, .maximized = true },
+                .{ .minimized = true, .maximize = true, .state = .normal, .maximized = true },
+                .{ .minimized = true, .fullscreen = true, .state = .normal, .maximized = false },
+                .{ .minimized = true, .maximize = true, .fullscreen = true, .state = .normal, .maximized = true },
+                .{ .minimized = true, .fullscreen = true, .maximized = false },
+            }) |case| {
+                app.config.maximize = case.maximize;
+                app.config.fullscreen = if (case.fullscreen) .true else .false;
+                Fixture.minimize_first_show = case.minimized;
+                // Two tabs, the second selected: every tab shares the
+                // window's fullscreen.
+                const tabs = [_]win32_session_state.Tab{ tab, tab };
+                const surface = try app.restoreSessionWindow(.{
+                    .x = if (case.state != null) saved.left else null,
+                    .y = if (case.state != null) saved.top else null,
+                    .width = if (case.state != null) saved.right - saved.left else null,
+                    .height = if (case.state != null) saved.bottom - saved.top else null,
+                    .state = case.state,
+                    .selected_tab = 1,
+                    .tabs = &tabs,
+                });
+                const hwnd = surface.windowHwnd().?;
+                const host = surface.host.?;
+                try std.testing.expectEqual(@as(usize, 2), host.tabs.items.len);
+                try std.testing.expect(host.activeSurface() == surface);
+                // A layout has no rect of its own: it keeps where it was
+                // created.
+                const normal = if (case.state != null) saved else Fixture.hidden_rect;
+                if (case.minimized and !case.maximize and !case.fullscreen and case.state == .normal) {
+                    // Nothing else un-minimizes it before activation.
+                    try std.testing.expect(sys.IsIconic(hwnd) != 0);
+                    try std.testing.expectEqualDeep(normal, try Fixture.normalRect(hwnd));
+                }
+                // As `restoreSessionState` does next.
+                app.activateSurface(surface);
+                try std.testing.expect(sys.IsIconic(hwnd) == 0);
+                for (host.tabs.items) |*each| {
+                    try std.testing.expectEqual(case.fullscreen, each.focusedSurface().?.fullscreen);
+                }
+                if (case.fullscreen) {
+                    try std.testing.expectEqualDeep(try Fixture.monitorRect(hwnd), try Fixture.screenRect(hwnd));
+                    try std.testing.expect(sys.IsZoomed(hwnd) == 0);
+                    try surface.toggleFullscreen(.native);
+                    try std.testing.expect(Fixture.framed(hwnd));
+                }
+                try std.testing.expectEqual(case.maximized, sys.IsZoomed(hwnd) != 0);
+                try std.testing.expectEqualDeep(normal, try Fixture.normalRect(hwnd));
+                if (!case.maximized) try std.testing.expectEqualDeep(normal, try Fixture.screenRect(hwnd));
+                fixture.closeWindows();
+            }
         }
     }.body);
 }
@@ -53499,42 +56339,34 @@ test "win32 installer apply args double embedded quotes" {
     try std.testing.expect(std.mem.indexOf(u8, args, "/DIR=\"C:\\Program Files\\wing\"\"hostty\"") != null);
 }
 
-test "win32 surfaceRepaintRequestMode flushes renderer paints during resize settle" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, surfaceRepaintRequestMode(null, 1000));
+/// Both the surface's and the renderer's repaint requests queue outside
+/// resize, paint at once while a resize settles, and wait for the flush
+/// during a live resize.
+fn expectSettleRepaintModes(comptime mode: fn (?*const Host, u64) SurfaceRepaintRequestMode) !void {
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, mode(null, 1000));
 
     var host: Host = undefined;
     host.is_live_resize = .init(false);
     host.resize_settle_timer_active = false;
     host.resize_settle_until_ms = 0;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, mode(&host, 1000));
 
     host.resize_settle_timer_active = true;
     host.resize_settle_until_ms = 1000 + resize_settle_deadline_ms;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, mode(&host, 1000));
 
     host.is_live_resize = .init(true);
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, surfaceRepaintRequestMode(&host, 1000));
+    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, mode(&host, 1000));
+}
+
+test "win32 surfaceRepaintRequestMode flushes renderer paints during resize settle" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try expectSettleRepaintModes(surfaceRepaintRequestMode);
 }
 
 test "win32 rendererRepaintRequestMode paints synchronously only during resize settle" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, rendererRepaintRequestMode(null, 1000));
-
-    var host: Host = undefined;
-    host.is_live_resize = .init(false);
-    host.resize_settle_timer_active = false;
-    host.resize_settle_until_ms = 0;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.queue, rendererRepaintRequestMode(&host, 1000));
-
-    host.resize_settle_timer_active = true;
-    host.resize_settle_until_ms = 1000 + resize_settle_deadline_ms;
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.update_now, rendererRepaintRequestMode(&host, 1000));
-
-    host.is_live_resize = .init(true);
-    try std.testing.expectEqual(SurfaceRepaintRequestMode.defer_until_flush, rendererRepaintRequestMode(&host, 1000));
+    try expectSettleRepaintModes(rendererRepaintRequestMode);
 }
 
 test "win32 resize settle paint mode ends with its timer or at its deadline" {
@@ -53973,24 +56805,16 @@ test "win32 output starts the scrollbar's heartbeat, and a hidden bar hides its 
     // High Contrast always shows the bar: no heartbeat and nothing to hide.
     if (isHighContrastActive()) return error.SkipZigTest;
 
-    const alloc = std.testing.allocator;
-    var core = try CoreApp.create(alloc);
-    defer core.destroy();
-    var app: App = undefined;
-    try app.init(core, .{ .safe_mode = true });
-    const hinstance = app.hinstance;
-    defer {
-        app.terminate();
-        _ = sys.UnregisterClassW(host_class_name, hinstance);
-        _ = sys.UnregisterClassW(palette_list_class_name, hinstance);
-        _ = sys.UnregisterClassW(scrollbar_class_name, hinstance);
-    }
+    var fixture: SafeModeAppFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
     // The dynamic policy whatever this machine's "Always show scrollbars".
     app.system_dynamic_scrollbars = true;
     // The host stays hidden, so the test never touches the foreground.
-    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), null, false);
+    const host = try app.createHost(std.unicode.utf8ToUtf16LeStringLiteral(""), &app.config, .{});
     var surface: Surface = .{
-        .app = &app,
+        .app = app,
         .host = host,
         .window_visible = true,
         .placement = .{ .rect = .{ .left = 0, .top = 0, .right = 400, .bottom = 300 }, .rect_known = true, .visible = true, .visible_known = true },
@@ -55076,6 +57900,81 @@ test "win32 search bar codicons are rejected in a substitute font" {
     ) orelse return error.FontCreateFailed;
     defer _ = sys.DeleteObject(font);
     try std.testing.expect(!fontHasSearchCodicons(font));
+}
+
+/// A face no machine has. GDI still creates a font for it, from a substitute.
+const icon_font_test_missing_face = std.unicode.utf8ToUtf16LeStringLiteral("noctty test icon face that is not installed");
+
+/// Whether GDI realized `font` from `face` itself rather than a substitute,
+/// judged by the face name and not by the glyph check under test.
+fn fontIsFaceForTest(font: *anyopaque, face: [*:0]const u16) !bool {
+    const hdc = sys.CreateCompatibleDC(null) orelse return error.DcCreateFailed;
+    defer _ = sys.DeleteDC(hdc);
+    const old_font = sys.SelectObject(hdc, font) orelse return error.FontSelectFailed;
+    defer _ = sys.SelectObject(hdc, old_font);
+    var name: [c.LF_FACESIZE]u16 = undefined;
+    if (sys.GetTextFaceW(hdc, name.len, &name) <= 0) return error.TextFaceFailed;
+    return std.mem.eql(u16, std.mem.sliceTo(&name, 0), std.mem.span(face));
+}
+
+/// The first of `titlebar_icon_faces` this machine has, which the default
+/// titlebar icon fonts must come from; null when it has neither.
+fn installedTitlebarIconFaceForTest() !?[*:0]const u16 {
+    for (titlebar_icon_faces) |face| {
+        const font = createIconFontForFace(face, 12) orelse return error.FontCreateFailed;
+        defer _ = sys.DeleteObject(font);
+        if (try fontIsFaceForTest(font, face)) return face;
+    }
+    return null;
+}
+
+test "win32 icon font choice passes over a substituted face by its glyphs" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // The trap: a face that is not installed still gets a font.
+    const substitute = createIconFontForFace(icon_font_test_missing_face, 12) orelse return error.FontCreateFailed;
+    defer _ = sys.DeleteObject(substitute);
+    try std.testing.expectEqual(GlyphCoverage.missing, fontGlyphCoverage(substitute, &titlebar_icon_glyphs));
+
+    // With no face that has the glyphs, there is no font, and the caller
+    // draws `win32_icons` by design rather than after a GDI failure.
+    const none = createIconFontWithGlyphs(&.{icon_font_test_missing_face}, &titlebar_icon_glyphs, 12);
+    try std.testing.expectEqual(@as(?*anyopaque, null), none.font);
+    try std.testing.expect(none.geometric);
+
+    // A missing first face falls through to the next one. The embedded
+    // Codicons font stands in for Segoe MDL2 Assets, which a machine need
+    // not have.
+    search_icon_font_registration.call();
+    const faces = [_][*:0]const u16{ icon_font_test_missing_face, search_icon_font_face };
+    const next = createIconFontWithGlyphs(&faces, &search_codicon_glyphs, search_icon_font_px);
+    const font = next.font orelse return error.TestExpectedFont;
+    defer _ = sys.DeleteObject(font);
+    try std.testing.expect(!next.geometric);
+    try std.testing.expect(fontHasSearchCodicons(font));
+
+    // The face check the Host tests rely on tells the two fonts apart.
+    try std.testing.expect(!try fontIsFaceForTest(substitute, icon_font_test_missing_face));
+    try std.testing.expect(try fontIsFaceForTest(font, search_icon_font_face));
+}
+
+test "win32 icon font choice does not take a failed glyph check for a missing glyph" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // A font handle GDI rejects fails the check itself.
+    const stale = createIconFontForFace(search_icon_font_face, search_icon_font_px) orelse return error.FontCreateFailed;
+    _ = sys.DeleteObject(stale);
+    try std.testing.expectEqual(GlyphCoverage.unknown, fontGlyphCoverage(stale, &search_codicon_glyphs));
+
+    // A check that fails for every face, even a missing one, leaves no font
+    // and no geometric verdict, so the caller retries.
+    search_icon_font_registration.call();
+    test_glyph_check_fails = true;
+    defer test_glyph_check_fails = false;
+    const faces = [_][*:0]const u16{ icon_font_test_missing_face, search_icon_font_face };
+    const failed = createIconFontWithGlyphs(&faces, &search_codicon_glyphs, search_icon_font_px);
+    try std.testing.expectEqual(@as(?*anyopaque, null), failed.font);
+    try std.testing.expect(!failed.geometric);
 }
 
 test "win32 search bar icon font is created at first use and dropped on a DPI or theme change" {

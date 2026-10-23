@@ -9,6 +9,11 @@ param(
     [switch] $ConfiguredScenariosOnly
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-shell-command-live.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -1016,4 +1021,8 @@ finally {
     }
 
     Stop-InteractiveWin11Process -Process $process -Contained
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

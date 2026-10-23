@@ -249,6 +249,19 @@ pub const ScreenSearch = struct {
         self.state = .complete;
     }
 
+    /// Handle an error from setting up or running a matcher: out of memory
+    /// is returned, and anything else is logged as `what` and ends the
+    /// search through `failSearch`. The caller must hold the screen lock.
+    fn failSearchUnlessOutOfMemory(
+        self: *ScreenSearch,
+        err: anyerror,
+        comptime what: []const u8,
+    ) Allocator.Error!void {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        log.warn(what ++ " err={}", .{err});
+        self.failSearch();
+    }
+
     /// Returns all matches as an owned slice (caller must free).
     /// The matches are ordered from most recent to oldest (e.g. bottom
     /// of the screen to top of the screen).
@@ -444,12 +457,8 @@ pub const ScreenSearch = struct {
                 self.screen,
                 self.needle(),
                 self.active.window.query_options,
-            ) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                log.warn("error reinitializing screen search after resize err={}", .{err});
-                self.failSearch();
-                return;
-            };
+            ) catch |err|
+                return self.failSearchUnlessOutOfMemory(err, "error reinitializing screen search after resize");
 
             // Deinit/reinit
             self.deinit();
@@ -597,6 +606,11 @@ pub const ScreenSearch = struct {
     ///
     /// The caller must hold the necessary locks to access the screen state.
     pub fn reloadActive(self: *ScreenSearch) Allocator.Error!void {
+        return self.reloadActiveWithNext(SlidingWindow.next);
+    }
+
+    // A comptime matcher seam lets tests fail after accumulating results.
+    fn reloadActiveWithNext(self: *ScreenSearch, comptime next: anytype) Allocator.Error!void {
         const tw = reloadActive_tw;
 
         // If our selection pin became garbage it means we scrolled off
@@ -658,12 +672,8 @@ pub const ScreenSearch = struct {
                     self.active.window.query_options,
                     list,
                     history_node,
-                ) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    log.warn("error initializing history search err={}", .{err});
-                    self.failSearch();
-                    return;
-                };
+                ) catch |err|
+                    return self.failSearchUnlessOutOfMemory(err, "error initializing history search");
                 errdefer search.deinit();
 
                 const pin = try list.trackPin(.{ .node = history_node });
@@ -693,18 +703,14 @@ pub const ScreenSearch = struct {
                 .forward,
                 self.needle(),
                 self.active.window.query_options,
-            ) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                log.warn("error initializing active-history reconciliation search err={}", .{err});
-                self.failSearch();
-                return;
-            };
+            ) catch |err|
+                return self.failSearchUnlessOutOfMemory(err, "error initializing active-history reconciliation search");
             defer window.deinit();
             while (true) {
                 _ = try window.append(history.start_pin.node);
                 if (history.start_pin.node == history_node) break;
-                const next = history.start_pin.node.next orelse break;
-                history.start_pin.node = next;
+                const next_node = history.start_pin.node.next orelse break;
+                history.start_pin.node = next_node;
             }
             assert(history.start_pin.node == history_node);
 
@@ -712,17 +718,14 @@ pub const ScreenSearch = struct {
                 alloc,
                 self.history_results.items.len,
             );
-            errdefer {
+            defer {
                 for (results.items) |*hl| hl.deinit(alloc);
                 results.deinit(alloc);
             }
             while (true) {
-                const hl = window.next() catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    log.warn("error refreshing history matches err={}", .{err});
-                    self.failSearch();
-                    return;
-                } orelse break;
+                const maybe_hl = next(&window) catch |err|
+                    return self.failSearchUnlessOutOfMemory(err, "error refreshing history matches");
+                const hl = maybe_hl orelse break;
 
                 if (hl.chunks.items(.node)[0] == history_node) continue;
 
@@ -747,6 +750,7 @@ pub const ScreenSearch = struct {
             try results.appendSlice(alloc, self.history_results.items);
             self.history_results.deinit(alloc);
             self.history_results = results;
+            results = .empty;
             self.markMatchRowsDirty();
 
             // If our prior selection was in the history area, update
@@ -1728,6 +1732,73 @@ test "screen search no scrollback has no history" {
     const matches = try search.matches(alloc);
     defer alloc.free(matches);
     try testing.expectEqual(0, matches.len);
+}
+
+test "reloadActive temporary history cleanup on matcher failure or no new matches" {
+    for ([_]?usize{ 0, 1, null }) |matches_before_failure| {
+        const alloc = testing.allocator;
+        var t: Terminal = try .init(alloc, .{
+            .cols = 10,
+            .rows = 2,
+            .max_scrollback = std.math.maxInt(usize),
+        });
+        defer t.deinit(alloc);
+        const list = &t.screens.active.pages;
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice("Fizz\r\nFizz\r\n");
+        while (list.totalPages() < 3) s.nextSlice("\r\n");
+        for (0..list.rows) |_| s.nextSlice("\r\n");
+        s.nextSlice(if (matches_before_failure != null) "Fizz." else "noop");
+
+        var search: ScreenSearch = try .init(alloc, t.screens.active, "Fizz");
+        defer search.deinit();
+        try search.searchAll();
+        _ = try search.select(.next);
+        try testing.expect(search.history_results.items.len > 0);
+        const history_len = search.history_results.items.len;
+        try testing.expect(search.selected != null);
+        const revision = search.matchRowsRevision();
+
+        s.nextSlice(if (matches_before_failure != null) "\r\nFizz\r\nFizz\r\n" else "\r\nnoop\r\n");
+        while (list.totalPages() < 4) s.nextSlice("\r\n");
+        for (0..list.rows) |_| s.nextSlice("\r\n");
+
+        const Probe = struct {
+            var remaining: usize = 0;
+            var failed = false;
+            fn next(window: *SlidingWindow) (SlidingWindow.SearchError || error{InjectedMatcherFailure})!?FlattenedHighlight {
+                if (remaining == 0) {
+                    failed = true;
+                    return error.InjectedMatcherFailure;
+                }
+                const hl = try window.next();
+                if (hl != null) remaining -= 1;
+                return hl;
+            }
+        };
+        Probe.remaining = matches_before_failure orelse 0;
+        Probe.failed = false;
+
+        if (matches_before_failure == null) {
+            // No new matches still reserves capacity for the old results.
+            // Exercise the real matcher and its successful empty fast path.
+            try search.reloadActive();
+            try testing.expect(search.history != null);
+            try testing.expectEqual(history_len, search.history_results.items.len);
+            continue;
+        }
+
+        // A matcher error is logged and consumed, so errdefer cannot own
+        // either the reserved results buffer or its already cloned match.
+        try search.reloadActiveWithNext(Probe.next);
+        try testing.expect(Probe.failed);
+        try testing.expectEqual(@as(usize, 0), Probe.remaining);
+        try testing.expect(search.history == null and search.selected == null);
+        try testing.expectEqual(@as(usize, 0), search.matchesLen());
+        try testing.expectEqual(ScreenSearch.State.complete, search.state);
+        try testing.expect(search.matchRowsRevision() != revision);
+    }
 }
 
 test "reloadActive partial history cleanup on appendSlice error" {

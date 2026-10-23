@@ -194,7 +194,9 @@ $resolutionSourceAsts = foreach ($source in @(
 foreach ($source in $resolutionSourceAsts) {
     $expectedDotSources = if ($source.Path -eq $statefulWin11Lib) {
         @(". (Join-Path (Split-Path -Parent (Split-Path -Parent `$PSScriptRoot)) 'scripts\interactive-win11-window-lib.ps1')")
-    } else { @() }
+    } else {
+        @(". (Join-Path `$PSScriptRoot 'interactive-win11-measure-lib.ps1')")
+    }
     $expectedAmpersands = if ($source.Path -eq $interactiveWin11Lib) {
         @(
             '& $bootstrapCmd powershell.exe -ExecutionPolicy Bypass -File $LauncherPath @ArgumentList',
@@ -248,6 +250,133 @@ try {
 finally {
     $waitUntilCurrentProcess.Dispose()
     Remove-Item -LiteralPath Function:\Wait-InteractiveWin11Until -ErrorAction SilentlyContinue
+}
+
+# A wait whose condition read screen pixels records what was on screen when it
+# times out; any other wait, including the next one, does not
+# (EVIDENCE-PIXEL-DIAG-01). Get-StatefulPixel is what names the window.
+$statefulLibAst = @($resolutionSourceAsts | Where-Object { $_.Path -eq $statefulWin11Lib })[0].Ast
+$pixelReaders = @($statefulLibAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-StatefulPixel'
+}, $true))
+if ($pixelReaders.Count -ne 1 -or
+    $pixelReaders[0].Body.EndBlock.Statements[0].Extent.Text -cne '$script:InteractiveWin11PixelWindow = $Hwnd') {
+    throw 'Get-StatefulPixel must first name the window it reads for the pixel-timeout diagnostic.'
+}
+. ([scriptblock]::Create($waitUntilFunctions[0].Extent.Text))
+$script:pixelDiagnosticCalls = [Collections.Generic.List[string]]::new()
+function script:Save-StatefulPixelDiagnostic {
+    param([IntPtr] $Hwnd, [string] $Description)
+    $script:pixelDiagnosticCalls.Add("$($Hwnd.ToInt64()):$Description")
+    'pixel diagnostic: contract'
+}
+try {
+    $pixelTimeoutMessages = foreach ($case in @(
+            @{ Description = 'contract pixel wait'; Condition = { $script:InteractiveWin11PixelWindow = [IntPtr]77; $false } },
+            @{ Description = 'contract plain wait'; Condition = { $false } }
+        )) {
+        try {
+            # ConditionFirst: the condition runs at least once however late.
+            Wait-InteractiveWin11Until -Condition $case.Condition -Description $case.Description `
+                -Deadline ([DateTime]::UtcNow.AddMilliseconds(50)) -PollMilliseconds 5 -ConditionFirst
+            'no timeout'
+        }
+        catch { $_.Exception.Message }
+    }
+    if (($pixelTimeoutMessages -join '|') -cne 'Timed out waiting for contract pixel wait; pixel diagnostic: contract|Timed out waiting for contract plain wait' -or
+        ($script:pixelDiagnosticCalls -join '|') -cne '77:contract pixel wait') {
+        throw "Pixel-wait timeouts must carry the diagnostic and other timeouts must not: $($pixelTimeoutMessages -join ' | ')"
+    }
+}
+finally {
+    Remove-Item -LiteralPath Function:\Wait-InteractiveWin11Until, Function:\Save-StatefulPixelDiagnostic -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Script -Name pixelDiagnosticCalls, InteractiveWin11PixelWindow -ErrorAction SilentlyContinue
+}
+
+# The diagnostic's screenshot goes to the uploaded artifacts of a public
+# repository, so it may show noctty only: the decision is table-tested from
+# facts, and the diagnostic captures the screen only where it allows.
+$diagnosticFunctions = @{}
+foreach ($name in @('Get-StatefulScreenshotDecision', 'Save-StatefulPixelDiagnostic')) {
+    $diagnosticFound = @($statefulLibAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $true))
+    if ($diagnosticFound.Count -ne 1) { throw "The stateful library must define $name once." }
+    $diagnosticFunctions[$name] = $diagnosticFound[0]
+}
+$saveDiagnostic = $diagnosticFunctions['Save-StatefulPixelDiagnostic']
+$screenCaptures = @($saveDiagnostic.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Extent.Text -ceq 'CopyFromScreen'
+}, $true))
+$decisionCalls = @($saveDiagnostic.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Get-StatefulScreenshotDecision'
+}, $true))
+$gatedCaptures = @($screenCaptures | Where-Object {
+    $gate = $_.Parent
+    while ($null -ne $gate -and -not ($gate -is [System.Management.Automation.Language.IfStatementAst] -and
+            $gate.Clauses[0].Item1.Extent.Text -ceq '$decision.Capture')) { $gate = $gate.Parent }
+    $null -ne $gate
+})
+if ($screenCaptures.Count -ne 1 -or $gatedCaptures.Count -ne 1 -or $decisionCalls.Count -ne 2) {
+    throw 'Save-StatefulPixelDiagnostic must capture the screen once, only when Get-StatefulScreenshotDecision allows it, and decide again after the capture.'
+}
+. ([scriptblock]::Create($diagnosticFunctions['Get-StatefulScreenshotDecision'].Extent.Text))
+try {
+    $ownProcess = [pscustomobject]@{ ProcessId = [uint32]40; ProcessName = 'noctty'; Class = 'noctty.win32.host' }
+    $otherProcess = [pscustomobject]@{ ProcessId = [uint32]41; ProcessName = 'other'; Class = 'Other' }
+    $screenshotFacts = {
+        param([hashtable] $Change)
+        $facts = [ordered]@{
+            Rect = [pscustomobject]@{ Left = 100; Top = 100; Right = 500; Bottom = 400 }
+            Root = $ownProcess
+            WindowVisible = $true; RootVisible = $true; RootMinimized = $false; RootCloaked = [long]0; RootOpaque = $true
+            CaptureBounds = [pscustomobject]@{ Left = 50; Top = 90; Right = 450; Bottom = 800 }
+            Samples = @(1..16 | ForEach-Object { [pscustomobject]@{ Root = $ownProcess } })
+            WindowsAbove = @()
+        }
+        foreach ($key in $Change.Keys) { $facts[$key] = $Change[$key] }
+        return [pscustomobject]$facts
+    }
+    $screenshotAbove = { param($Process, [long] $Cloaked) $Process | Select-Object * | Add-Member -PassThru -NotePropertyName Cloaked -NotePropertyValue $Cloaked }
+    $oneForeignSample = @(1..15 | ForEach-Object { [pscustomobject]@{ Root = $ownProcess } }) + @([pscustomobject]@{ Root = $otherProcess })
+    $noWindowSample = @(1..15 | ForEach-Object { [pscustomobject]@{ Root = $ownProcess } }) + @([pscustomobject]@{ Root = $null })
+    $screenshotCases = @(
+        @{ Name = 'noctty shown and alone'; Change = @{}; Expected = 'capture 100,100,450,400 occluders=0' }
+        @{ Name = 'a window of noctty above'; Change = @{ WindowsAbove = @(& $screenshotAbove $ownProcess 0) }; Expected = 'capture 100,100,450,400 occluders=0' }
+        @{ Name = 'a cloaked window of another process above'; Change = @{ WindowsAbove = @(& $screenshotAbove $otherProcess 1) }; Expected = 'capture 100,100,450,400 occluders=0' }
+        @{ Name = 'a window of another process above'; Change = @{ WindowsAbove = @(& $screenshotAbove $otherProcess 0) }; Expected = 'withheld: 1 window(s) of other processes overlap the sampled rect occluders=1' }
+        @{ Name = 'another process above, cloak unknown'; Change = @{ WindowsAbove = @(& $screenshotAbove $otherProcess -1) }; Expected = 'withheld: 1 window(s) of other processes overlap the sampled rect occluders=1' }
+        @{ Name = 'noctty hidden'; Change = @{ RootVisible = $false }; Expected = "withheld: noctty's window is hidden occluders=0" }
+        @{ Name = 'sampled window hidden'; Change = @{ WindowVisible = $false }; Expected = "withheld: noctty's window is hidden occluders=0" }
+        @{ Name = 'noctty cloaked'; Change = @{ RootCloaked = [long]2 }; Expected = "withheld: noctty's window is cloaked (2) occluders=0" }
+        @{ Name = 'noctty cloak unknown'; Change = @{ RootCloaked = [long]-1 }; Expected = "withheld: DWM could not say whether noctty's window is cloaked occluders=0" }
+        @{ Name = 'noctty minimized'; Change = @{ RootMinimized = $true }; Expected = "withheld: noctty's window is minimized occluders=0" }
+        @{ Name = 'noctty see-through'; Change = @{ RootOpaque = $false }; Expected = "withheld: noctty's window is see-through (layered) occluders=0" }
+        @{ Name = 'a sample on another process'; Change = @{ Samples = $oneForeignSample }; Expected = 'withheld: 1 sample point(s) lie on windows of other processes occluders=0' }
+        @{ Name = 'a sample on no window'; Change = @{ Samples = $noWindowSample }; Expected = 'withheld: 1 sample point(s) lie on windows of other processes occluders=0' }
+        @{ Name = 'no top-level window'; Change = @{ Root = $null; WindowsAbove = @(& $screenshotAbove $ownProcess 0) }; Expected = "withheld: noctty's top-level window could not be found occluders=1" }
+        @{ Name = 'no rect'; Change = @{ Rect = $null }; Expected = 'not taken: the window rect could not be read occluders=0' }
+        @{ Name = 'no client area'; Change = @{ CaptureBounds = $null }; Expected = "withheld: noctty's client area could not be read occluders=0" }
+        @{ Name = 'rect outside the client area'; Change = @{ CaptureBounds = [pscustomobject]@{ Left = 600; Top = 90; Right = 700; Bottom = 800 } }; Expected = "withheld: the sampled rect lies outside noctty's client area occluders=0" }
+    )
+    foreach ($screenshotCase in $screenshotCases) {
+        $screenshotDecision = Get-StatefulScreenshotDecision (& $screenshotFacts $screenshotCase.Change)
+        $screenshotActual = if ($screenshotDecision.Capture) {
+            $screenshotArea = $screenshotDecision.CaptureRect
+            "capture $($screenshotArea.Left),$($screenshotArea.Top),$($screenshotArea.Right),$($screenshotArea.Bottom)"
+        } else { $screenshotDecision.Note }
+        $screenshotActual += " occluders=$(@($screenshotDecision.Occluders).Count)"
+        if ($screenshotActual -cne $screenshotCase.Expected) {
+            throw "Pixel diagnostic screenshot decision ($($screenshotCase.Name)): expected '$($screenshotCase.Expected)', got '$screenshotActual'."
+        }
+    }
+}
+finally {
+    Remove-Item -LiteralPath Function:\Get-StatefulScreenshotDecision -ErrorAction SilentlyContinue
 }
 $harnessMainFunctions = @($interactiveWin11LibAst.FindAll({
     param($node)
@@ -739,7 +868,7 @@ try {
     )
     if ($script:containmentForwardCalls -ne 1 -or
         ($launchArguments -join '|') -ne
-            '--contract-containment-probe|--single-instance=false|--class=noctty-interactive-contract-sandbox') {
+            '--contract-containment-probe|--single-instance=false|--class=noctty-interactive-contract-sandbox|--command=cmd.exe') {
         throw 'Interactive launch composition did not invoke containment policy once and append isolation arguments.'
     }
 }

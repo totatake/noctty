@@ -71,6 +71,13 @@ fn initGL(alloc: std.mem.Allocator, options: renderer.Options) !*GL {
     return value;
 }
 
+fn initD3D(alloc: std.mem.Allocator, options: renderer.Options) !*D3D {
+    const value = try alloc.create(D3D);
+    errdefer alloc.destroy(value);
+    value.* = try D3D.init(alloc, options);
+    return value;
+}
+
 /// After a failed `initGL`: whether OpenGL itself could not start (a WGL
 /// pixel format or context, the functions, the 4.3 floor), rather than the
 /// renderer built on it (an image that does not decode, OutOfMemory). Only
@@ -87,8 +94,7 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
     const safe_mode = options.rt_surface.app.safe_mode;
     const recovery_preference = if (safe_mode) .@"d3d11-warp" else requested;
     const feature = selection.unsupported(config.custom_shaders.value.items.len != 0, config.bg_image != null, false);
-    const base: Windows = .{ .alloc = alloc, .rt_surface = options.rt_surface, .surface_mailbox = options.surface_mailbox, .active = undefined, .thread = options.thread };
-    var result = base;
+    var result: Windows = .{ .alloc = alloc, .rt_surface = options.rt_surface, .surface_mailbox = options.surface_mailbox, .active = undefined, .thread = options.thread };
     const skip_opengl = apprt.win32.openGLUnavailable();
     var opengl_error: ?anyerror = null;
     var opengl_unavailable = false;
@@ -122,43 +128,36 @@ pub fn init(alloc: std.mem.Allocator, options: renderer.Options) !Windows {
         var candidate_options = options;
         candidate_options.config.renderer_backend = candidate;
         // An allocation failure is a candidate failure: OpenGL still gets its turn.
-        const value = alloc.create(D3D) catch |err| {
+        const value = initD3D(alloc, candidate_options) catch |err| {
             d3d11_error = err;
             log.warn("{s} startup failed err={}", .{ @tagName(candidate), err });
             continue;
         };
-        if (D3D.init(alloc, candidate_options)) |initialized| {
-            value.* = initialized;
-            value.config.renderer_backend = requested;
-            value.api.setRecoveryPreference(recovery_preference);
-            result.active = .{ .d3d11 = value };
-            result.last_warp = value.api.stats().warp != 0;
-            // OpenGL is not tried again for images or effects it would draw.
-            result.fallback_blocked = feature != null or opengl_error != null or skip_opengl;
-            if (opengl_unavailable) {
-                apprt.win32.markOpenGLUnavailable();
-                // Later surfaces in this process come straight here
-                // without a banner.
-                result.setNotice("{s}", .{selection.openGLFallbackNotice(result.last_warp)});
-            } else if (opengl_error) |err| {
-                // OpenGL started, but its renderer could not be built.
-                result.setNotice("OpenGL failed ({s}); D3D11 will draw text without unsupported features.", .{@errorName(err)});
-            } else if (requested != .opengl and feature == null) {
-                if (result.last_warp) {
-                    result.setNotice("D3D11 WARP (software): hardware unavailable or software requested; HRESULT 0x{x}.", .{@as(u32, @bitCast(value.api.stats().last_error))});
-                } else {
-                    result.setNotice("D3D11 beta: hardware renderer active.", .{});
-                }
+        value.config.renderer_backend = requested;
+        value.api.setRecoveryPreference(recovery_preference);
+        result.active = .{ .d3d11 = value };
+        result.last_warp = value.api.stats().warp != 0;
+        // OpenGL is not tried again for images or effects it would draw.
+        result.fallback_blocked = feature != null or opengl_error != null or skip_opengl;
+        if (opengl_unavailable) {
+            apprt.win32.markOpenGLUnavailable();
+            // Later surfaces in this process come straight here
+            // without a banner.
+            result.setNotice("{s}", .{selection.openGLFallbackNotice(result.last_warp)});
+        } else if (opengl_error) |err| {
+            // OpenGL started, but its renderer could not be built.
+            result.setNotice("OpenGL failed ({s}); D3D11 will draw text without unsupported features.", .{@errorName(err)});
+        } else if (requested != .opengl and feature == null) {
+            if (result.last_warp) {
+                result.setNotice("D3D11 WARP (software): hardware unavailable or software requested; HRESULT 0x{x}.", .{@as(u32, @bitCast(value.api.stats().last_error))});
+            } else {
+                result.setNotice("D3D11 beta: hardware renderer active.", .{});
             }
-            // An OpenGL failure tried above is handled: neither the startup
-            // dialog nor the recovery ledger may blame a later error on it.
-            apprt.win32.clearOpenGLStartupFailure();
-            return result;
-        } else |err| {
-            alloc.destroy(value);
-            d3d11_error = err;
-            log.warn("{s} startup failed err={}", .{ @tagName(candidate), err });
         }
+        // An OpenGL failure tried above is handled: neither the startup
+        // dialog nor the recovery ledger may blame a later error on it.
+        apprt.win32.clearOpenGLStartupFailure();
+        return result;
     }
     // The startup dialog explains an OpenGL failure ahead of any other, and
     // says Direct3D 11 failed too.
@@ -354,7 +353,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
     const file = try std.fs.cwd().createFile(status_path, .{});
     defer file.close();
     const json = switch (self.active) {
-        .opengl => try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl" }, .{}),
+        .opengl => |v| try std.json.Stringify.valueAlloc(self.alloc, .{ .backend = "opengl", .split_dimmed = v.split_dimmed }, .{}),
         .d3d11 => |v| report: {
             const receipt = v.api.stats();
             var max_image_id: u32 = 0;
@@ -364,6 +363,7 @@ pub fn capture(self: *Windows, hdc: *anyopaque) !void {
             }
             break :report try std.json.Stringify.valueAlloc(self.alloc, .{
                 .backend = "d3d11",
+                .split_dimmed = v.split_dimmed,
                 .warp = receipt.warp != 0,
                 .adapter = std.mem.sliceTo(&receipt.adapter_name, 0),
                 .feature_level = receipt.feature_level,
@@ -501,6 +501,15 @@ pub fn setFocus(self: *Windows, focus: bool) !void {
     defer self.mutex.unlock();
     switch (self.active) {
         inline else => |v| try v.setFocus(focus),
+    }
+}
+
+pub fn setSplitDimmed(self: *Windows, dimmed: bool) void {
+    if (self.opengl.load(.acquire)) |v| return v.setSplitDimmed(dimmed);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    switch (self.active) {
+        inline else => |v| v.setSplitDimmed(dimmed),
     }
 }
 

@@ -7,6 +7,11 @@ param(
     [string] $Scenario = 'Full'
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-hints.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 if ($TimeoutSeconds -le 0) { throw 'TimeoutSeconds must be positive.' }
 $launcherPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
@@ -1083,4 +1088,8 @@ finally {
         }
     }
     if ($null -eq $primaryFailure -and $null -ne $stopFailure) { throw $stopFailure }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

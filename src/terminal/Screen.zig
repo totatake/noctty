@@ -386,11 +386,16 @@ pub fn reset(self: *Screen) void {
     self.pages.reset();
 
     // The above reset preserves tracked pins so we can still use
-    // our cursor pin, which should be at the top-left already.
+    // our cursor pin, which should be at the top-left already. The
+    // reset marks every tracked pin as garbage, but we keep using
+    // this one at its new valid position, so clear the flag: copies
+    // of the cursor pin (e.g. for Kitty image placements) must not
+    // be born garbage.
     const cursor_pin: *PageList.Pin = self.cursor.page_pin;
     assert(cursor_pin.node == self.pages.pages.first.?);
     assert(cursor_pin.x == 0);
     assert(cursor_pin.y == 0);
+    cursor_pin.garbage = false;
     const cursor_rac = cursor_pin.rowAndCell();
     self.cursor.deinit(self.alloc);
     self.cursor = .{
@@ -400,9 +405,15 @@ pub fn reset(self: *Screen) void {
     };
 
     if (comptime build_options.kitty_graphics) {
-        // Reset kitty graphics storage
+        // Reset kitty graphics storage, keeping the configured limit: a
+        // limit of zero (`image-storage-limit = 0`) disables the protocol,
+        // and a program must not turn it back on with RIS.
+        const total_limit = self.kitty_images.total_limit;
         self.kitty_images.deinit(self.alloc, self);
-        self.kitty_images = .{ .dirty = true };
+        self.kitty_images = .{
+            .dirty = true,
+            .total_limit = total_limit,
+        };
     }
 
     // Reset our basic state
@@ -1470,6 +1481,9 @@ pub inline fn eraseHistory(
         .{ .history = .{} },
         bl,
     );
+    if (comptime build_options.kitty_graphics) {
+        self.kitty_images.deleteInErasedRows(self, .{ .history = .{} }, bl);
+    }
     self.pages.eraseHistory(bl);
     self.cursorReload();
 }
@@ -1961,11 +1975,24 @@ pub inline fn resize(
         .pull_scrollback = opts.pull_scrollback,
     });
 
+    // Without pulling scrollback, a resize that would push the cursor's row
+    // into history erases the rows below the new bottom instead, and marks
+    // the tracked pins in them garbage (PageList.keepRowActive). Delete the
+    // images anchored there now rather than at the next placement.
+    if (comptime build_options.kitty_graphics) {
+        if (!opts.pull_scrollback and self.kitty_images.removeGarbagePlacements(self)) {
+            self.kitty_images.dirty = true;
+        }
+    }
+
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
     if (self.no_scrollback) {
         self.semantic_command.invalidateRange(&self.pages, .{ .history = .{} }, null);
+        if (comptime build_options.kitty_graphics) {
+            self.kitty_images.deleteInErasedRows(self, .{ .history = .{} }, null);
+        }
         self.pages.eraseHistory(null);
     }
 
@@ -3694,6 +3721,22 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             self.cursor.pending_wrap = true;
         }
     }
+}
+
+test "Screen reset cursor pin is not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try Screen.init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    defer s.deinit();
+    try s.testWriteString("hello, world");
+
+    // The page reset marks every tracked pin garbage but the screen
+    // keeps using the cursor pin, so it must come back clean: anything
+    // that copies it (e.g. Kitty image placements) would otherwise be
+    // born garbage and reaped.
+    s.reset();
+    try testing.expect(!s.cursor.page_pin.garbage);
 }
 
 test "Screen read and write" {
@@ -11875,6 +11918,42 @@ test "Screen: last-command extracts most recent completed semantic regions" {
     const command = (try s.lastCommandString(alloc)).?;
     defer alloc.free(command);
     try testing.expectEqualStrings("  Write-Output second", command);
+}
+
+test "Screen: last-command survives a prompt on the top row after reset" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 40, .rows = 8, .max_scrollback = 1000 });
+    defer s.deinit();
+    try s.testWriteString("before reset");
+
+    // RIS leaves the cursor at the top-left on the pin the page reset
+    // marked garbage. The prompt and output pins below copy it, and a
+    // garbage prompt or output pin makes the record unavailable.
+    s.reset();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("PS> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.semanticPromptStartInput();
+    try s.testWriteString("Write-Output first");
+    s.cursorSetSemanticContent(.output);
+    try s.semanticPromptStartOutput();
+    try s.testWriteString("\nfirst output");
+    try s.semanticPromptEndCommand();
+
+    // Fail rather than panic on null, so a run without the fix still
+    // reports the tests after this one.
+    const output = try s.lastCommandOutputString(alloc) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(output);
+    try testing.expectEqualStrings("first output", output);
+
+    const command = try s.lastCommandString(alloc) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(command);
+    try testing.expectEqualStrings("Write-Output first", command);
 }
 
 test "Screen: last-command has no region without shell integration or D" {

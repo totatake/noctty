@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const windows = std.os.windows;
 const assert = @import("../quirks.zig").inlineAssert;
 const args = @import("args.zig");
 const Allocator = std.mem.Allocator;

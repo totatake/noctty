@@ -44,6 +44,7 @@ int noctty_renderer_blit(void *dc, unsigned char *rgba, uint32_t w, uint32_t h, 
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     int saved = noctty_renderer_save_bgra(rgba, w, h, bottom_up);
-    int rows = StretchDIBits((HDC)dc, 0, 0, w, h, 0, 0, w, h, rgba, &info, DIB_RGB_COLORS, SRCCOPY);
+    /* No DC (a direct D3D11 bridge caller) saves the BMP only. */
+    int rows = dc ? StretchDIBits((HDC)dc, 0, 0, w, h, 0, 0, w, h, rgba, &info, DIB_RGB_COLORS, SRCCOPY) : 0;
     return saved || (rows != 0 && rows != GDI_ERROR);
 }

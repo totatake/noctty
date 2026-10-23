@@ -3,6 +3,11 @@ param(
     [string]$BashPath = ''
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'bash-shell-integration.ps1'
+try {
+
+
 # Runs src/shell-integration/bash/ghostty.bash in Git for Windows' bash over a
 # pipe and reads back what it writes. It covers what the Zig tests cannot reach:
 # the status in OSC 133;D, the PATH feature, and the working directory in OSC 7
@@ -188,4 +193,8 @@ try {
             Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

@@ -6,6 +6,11 @@ param(
     [switch] $IncludeForegroundHarness
 )
 
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Invoke-InteractiveWin11.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
@@ -161,3 +166,7 @@ if ($status -ne 'pass') {
 
 Get-Content -LiteralPath $transcriptPath | Write-Host
 Write-Host "flagship interactive Win11 composite: PASS (artifacts=$outputPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

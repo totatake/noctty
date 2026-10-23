@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html lang="en" class="nc-no-js" data-theme="dark">
+<html lang="en" class="nc-no-js">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>About Noctty: verification and measurements</title>
   <meta name="description" content="What Noctty is, what has been measured, how to verify a signed release, and how to move over from Windows Terminal or Git Bash." />
   <meta name="robots" content="index, follow" />
-  <meta name="theme-color" content="#05060d" media="(prefers-color-scheme: dark)" />
-  <meta name="theme-color" content="#f7f5ed" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#09090b" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
   <link rel="canonical" href="https://noctty.com/why-noctty.html" />
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Noctty" />
@@ -18,95 +18,94 @@
   <meta property="og:image:type" content="image/jpeg" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-  <meta property="og:image:alt" content="The Noctty crescent mark under a night sky." />
+  <meta property="og:image:alt" content="The Noctty mark and the line: Ghostty's terminal core, as a native Windows app, over a screenshot of Noctty with two panes side by side." />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="About Noctty: verification and measurements" />
   <meta name="twitter:description" content="What Noctty is, what has been measured, and how to verify a release." />
   <meta name="twitter:image" content="https://noctty.com/assets/noctty-social.jpg" />
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
   <link rel="shortcut icon" href="/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/space-grotesk.woff2" crossorigin />
-  <link rel="stylesheet" href="/styles.css?v=6477492a71d23788cd3f29ac9ce8f6c735737babe29597c9c36aa7238148a2ca" />
+  <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/geist.woff2" crossorigin />
+  <link rel="stylesheet" href="/styles.css?v=af1d11bc81a2ac204d8d767dfd9984032e736cf88548ba7c07b033bde9d15762" />
   <script>
     (function () {
       var root = document.documentElement;
       root.classList.remove("nc-no-js");
       root.classList.add("nc-js");
+      var theme = null;
       try {
-        var stored = localStorage.getItem("nc-theme");
-        if (!stored) {
+        theme = localStorage.getItem("nc-theme");
+        if (!theme) {
           var legacy = localStorage.getItem("wg-theme");
           if (legacy) {
-            stored = legacy;
+            theme = legacy;
             localStorage.setItem("nc-theme", legacy);
             localStorage.removeItem("wg-theme");
           }
         }
-        root.setAttribute("data-theme", stored || "dark");
       } catch (e) {}
+      if (theme !== "light" && theme !== "dark") {
+        var media = typeof window !== "undefined" && window.matchMedia
+          ? window.matchMedia("(prefers-color-scheme: light)")
+          : null;
+        theme = media && media.matches ? "light" : "dark";
+      }
+      root.setAttribute("data-theme", theme);
     })();
   </script>
 </head>
 <body>
   <a class="nc-skip-link" href="#main-content">Skip to content</a>
 
-  <header class="nc-topbar">
-    <div class="nc-shell nc-topbar__inner">
+  <header class="nc-header">
+    <div class="nc-frame nc-header__inner">
       <a class="nc-wordmark" href="/" aria-label="Noctty home">
-        <svg class="nc-wordmark__mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-          <rect x="1" y="1" width="30" height="30" rx="7" fill="#16173A" />
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="#F4F1E3" />
-          <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="#8FB7FF" />
-          <circle cx="27.3" cy="12.6" r="0.7" fill="#8FB7FF" />
-          <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="#7DD3A8" />
+        <svg width="22" height="21" viewBox="4 4 25 24" fill="none" aria-hidden="true">
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="currentColor" />
+          <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="currentColor" opacity="0.6" />
+          <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="currentColor" />
         </svg>
-        <span class="nc-wordmark__text">Noctty</span>
+        <span>Noctty</span>
       </a>
 
       <nav class="nc-nav" aria-label="Primary">
-        <a class="nc-nav__link nc-nav__link--optional" href="#why">About</a>
-        <a class="nc-nav__link nc-nav__link--optional" href="#evidence">Measurements</a>
-        <a class="nc-nav__link" href="#verify">Verify</a>
-        <a class="nc-nav__link nc-nav__link--optional" href="#migrate">Migrate</a>
+        <a class="nc-nav__link nc-nav__link--optional" href="/#features">Features</a>
+        <a class="nc-nav__link nc-nav__link--optional" href="/#install">Install</a>
+        <a class="nc-nav__link" href="/why-noctty.html" aria-current="page">About</a>
+        <a class="nc-nav__link" href="https://github.com/amanthanvi/noctty" target="_blank" rel="noopener noreferrer">GitHub</a>
         <button type="button" class="nc-theme-toggle" id="theme-toggle" aria-label="Toggle color theme" title="Toggle color theme">
-          <svg width="16" height="16" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-            <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="currentColor" />
-            <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="currentColor" opacity="0.7" />
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5" />
+            <path d="M8 1.75a6.25 6.25 0 0 1 0 12.5Z" fill="currentColor" />
           </svg>
         </button>
       </nav>
     </div>
   </header>
 
-  <main id="main-content">
-    <section class="nc-hero nc-hero--page" aria-labelledby="proof-title">
-      <img class="nc-hero__sky" src="/assets/hero-sky.webp" alt="" aria-hidden="true" decoding="async" fetchpriority="high" />
-      <div class="nc-hero__veil" aria-hidden="true"></div>
-      <div class="nc-shell">
-      <div class="nc-hero__page">
-        <h1 class="nc-hero__title" id="proof-title">About Noctty</h1>
-        <p class="nc-hero__lede">
-          Noctty is a Windows terminal built on Ghostty's terminal core and
-          maintained by one person. This page covers what the project is, what
-          has been measured, how to verify a release before you run it, and
-          how to move over from another terminal.
-        </p>
-        <div class="nc-hero__actions">
-          <a class="nc-button nc-button--primary" href="#verify">Verify a release</a>
-          <a class="nc-button nc-button--secondary" href="#migrate">Migration guides</a>
-        </div>
-        <p class="nc-hero__meta">
-          Latest stable release: <strong id="nc-version">v1.3.133</strong>.
-          Releases ship when they are ready;
-          <a href="https://github.com/amanthanvi/noctty/releases" target="_blank" rel="noopener noreferrer">the release history</a>
-          has the dates.
-          <span class="nc-sr-only" id="nc-version-summary">Version 1.3.133, latest release, for Windows 10 and 11 on x64 and ARM64, MIT licensed.</span>
-        </p>
+  <main id="main-content" class="nc-frame">
+    <section class="nc-page-hero" aria-labelledby="proof-title">
+      <h1 class="nc-hero__title" id="proof-title">About Noctty</h1>
+      <p class="nc-hero__lede">
+        Noctty is built on Ghostty's terminal core and maintained by one
+        person. This page covers what the project is, what has been measured,
+        how to check a release before you run it, and how to move over from
+        another terminal.
+      </p>
+      <div class="nc-hero__actions">
+        <a class="nc-btn nc-btn--primary" href="#verify">Verify a release</a>
+        <a class="nc-btn nc-btn--outline" href="#migrate">Migration guides</a>
       </div>
-      </div>
+      <p class="nc-hero__meta">
+        Latest stable release: <strong id="nc-version">v1.3.134</strong>.
+        Releases ship when they are ready;
+        <a href="https://github.com/amanthanvi/noctty/releases" target="_blank" rel="noopener noreferrer">the release history</a>
+        has the dates.
+        <span class="nc-sr-only" id="nc-version-summary">Version 1.3.134, latest release, for Windows 11, and Windows 10 version 1809 or later (supported, not tested), on x64 and ARM64.</span>
+      </p>
     </section>
 
-    <section class="nc-shell nc-section" id="why" aria-labelledby="why-title">
+    <section class="nc-section" id="why" aria-labelledby="why-title">
       <h2 class="nc-section__title" id="why-title">What Noctty is</h2>
       <div class="nc-proof-grid">
         <div class="nc-prose">
@@ -120,9 +119,9 @@
           </p>
           <p>
             Other Windows ports of Ghostty exist. Noctty is one maintained
-            application with a public release process: the history is never
-            rewritten, the build and release workflows are on GitHub, and the
-            verifier below ties every release to a single signing key.
+            application with a public release process: the build and release
+            workflows are on GitHub, and the verifier below ties each release
+            from v1.3.124 on to one pinned signing key.
           </p>
           <p>
             Known gaps are listed in
@@ -146,7 +145,7 @@
           </div>
           <div>
             <dt>Network</dt>
-            <dd>The update check is the only outbound traffic; there is no telemetry or analytics. <code>auto-update = off</code> disables automatic release checks and downloads; manual update checks remain available.</dd>
+            <dd>The update check is the only connection Noctty makes on its own; there is no telemetry or analytics. <code>auto-update = off</code> disables automatic release checks and downloads; manual update checks remain available.</dd>
           </div>
           <div>
             <dt>Accessibility</dt>
@@ -160,7 +159,7 @@
       </div>
     </section>
 
-    <section class="nc-shell nc-section" id="evidence" aria-labelledby="evidence-title">
+    <section class="nc-section" id="evidence" aria-labelledby="evidence-title">
       <h2 class="nc-section__title" id="evidence-title">What has been measured</h2>
       <div class="nc-evidence-grid">
         <article>
@@ -209,7 +208,7 @@
       </div>
     </section>
 
-    <section class="nc-shell nc-section" id="verify" aria-labelledby="verify-title">
+    <section class="nc-section" id="verify" aria-labelledby="verify-title">
       <h2 class="nc-section__title" id="verify-title">How to verify a release</h2>
       <p class="nc-section__intro">
         Download the installer or portable ZIP and the checksum file from the
@@ -286,9 +285,11 @@ pwsh .\scripts\verify-published-release.ps1 -Version $version</code></pre>
           both refuse an installer signed with any other key. The rules for
           rotating it are in
           <a href="https://github.com/amanthanvi/noctty/blob/main/docs/adr/0005-pin-updater-publisher-public-keys.md" target="_blank" rel="noopener noreferrer">ADR 0005</a>.
-          A publicly trusted certificate would need either an accepted
-          open-source signing application or a purchase. Neither has happened
-          yet.
+          The project has chosen a publicly trusted service, Azure Artifact
+          Signing, for the move away from this certificate
+          (<a href="https://github.com/amanthanvi/noctty/blob/main/docs/adr/0006-code-signing-certificate-decision.md" target="_blank" rel="noopener noreferrer">ADR 0006</a>).
+          The release workflow already has that signing path, and it is not
+          switched on yet.
         </p>
         <p>
           Who may sign a release, where the key is held, what is signed, and
@@ -298,7 +299,7 @@ pwsh .\scripts\verify-published-release.ps1 -Version $version</code></pre>
       </div>
     </section>
 
-    <section class="nc-shell nc-section" id="migrate" aria-labelledby="migrate-title">
+    <section class="nc-section" id="migrate" aria-labelledby="migrate-title">
       <h2 class="nc-section__title" id="migrate-title">Moving from another terminal</h2>
       <p class="nc-section__intro">
         Noctty does not touch another terminal's settings, so keep the old app
@@ -331,37 +332,33 @@ pwsh .\scripts\verify-published-release.ps1 -Version $version</code></pre>
     </section>
   </main>
 
-  <footer class="nc-footer">
-    <div class="nc-shell">
-      <div class="nc-footer__top">
-        <a class="nc-wordmark" href="/" aria-label="Noctty home">
-          <svg class="nc-wordmark__mark" width="22" height="22" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-            <rect x="1" y="1" width="30" height="30" rx="7" fill="#16173A" />
-            <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="#F4F1E3" />
-            <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="#8FB7FF" />
-            <circle cx="27.3" cy="12.6" r="0.7" fill="#8FB7FF" />
-            <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="#7DD3A8" />
-          </svg>
-          <span class="nc-wordmark__text">Noctty</span>
-        </a>
-        <nav class="nc-footer__links" aria-label="Project links">
-          <a href="/">Home</a>
-          <a href="https://github.com/amanthanvi/noctty" target="_blank" rel="noopener noreferrer">GitHub</a>
-          <a href="https://github.com/amanthanvi/noctty/releases" target="_blank" rel="noopener noreferrer">Releases</a>
-          <a href="https://github.com/amanthanvi/noctty/blob/main/docs/status.md" target="_blank" rel="noopener noreferrer">Status</a>
-          <a href="https://github.com/amanthanvi/noctty/discussions" target="_blank" rel="noopener noreferrer">Discussions</a>
-          <a href="https://github.com/amanthanvi/noctty/blob/main/PRIVACY.md" target="_blank" rel="noopener noreferrer">Privacy</a>
-        </nav>
-      </div>
-      <p class="nc-footer__fine">
-        Built on Ghostty's terminal core by Mitchell Hashimoto and contributors.
-        Win32 runtime by <a href="https://github.com/amanthanvi" target="_blank" rel="noopener noreferrer">@amanthanvi</a>.
-        MIT licensed. Not affiliated with the Ghostty project. Formerly winghostty.
-      </p>
+  <footer class="nc-frame nc-footer">
+    <div class="nc-footer__top">
+      <a class="nc-wordmark" href="/" aria-label="Noctty home">
+        <svg width="22" height="21" viewBox="4 4 25 24" fill="none" aria-hidden="true">
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M5.6 14.6a8.6 8.6 0 1 0 17.2 0 8.6 8.6 0 1 0-17.2 0ZM10.1 13.2a6.1 6.1 0 1 0 12.2 0 6.1 6.1 0 1 0-12.2 0Z" fill="currentColor" />
+          <path d="M25.2 5.4 26.05 6.95 27.6 7.8 26.05 8.65 25.2 10.2 24.35 8.65 22.8 7.8 24.35 6.95Z" fill="currentColor" opacity="0.6" />
+          <rect x="18.5" y="23.8" width="6.4" height="2.6" rx="1.3" fill="currentColor" />
+        </svg>
+        <span>Noctty</span>
+      </a>
+      <nav class="nc-footer__links" aria-label="Project links">
+        <a href="/">Home</a>
+        <a href="https://github.com/amanthanvi/noctty" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/amanthanvi/noctty/releases" target="_blank" rel="noopener noreferrer">Releases</a>
+        <a href="https://github.com/amanthanvi/noctty/blob/main/docs/status.md" target="_blank" rel="noopener noreferrer">Status</a>
+        <a href="https://github.com/amanthanvi/noctty/discussions" target="_blank" rel="noopener noreferrer">Discussions</a>
+        <a href="https://github.com/amanthanvi/noctty/blob/main/PRIVACY.md" target="_blank" rel="noopener noreferrer">Privacy</a>
+      </nav>
     </div>
+    <p class="nc-footer__fine">
+      Built on Ghostty's terminal core by Mitchell Hashimoto and contributors.
+      Win32 runtime by <a href="https://github.com/amanthanvi" target="_blank" rel="noopener noreferrer">@amanthanvi</a>.
+      MIT licensed. Not affiliated with the Ghostty project. Formerly winghostty.
+    </p>
   </footer>
 
-  <script type="module" src="/app.js?v=98916ae44c47820a7a796236e272181592d780769a90b706acea8eeb8eead2d1"></script>
-  <script type="module" src="/version.js?v=23470a3a8a0b77f0507ddbca8e9ba1f9575ff49573998a1f4b53367826f92863"></script>
+  <script type="module" src="/app.js?v=def851c82b908513d211facbc6d1c7122a287a7dcfa678fd18081ebfe51d1c09"></script>
+  <script type="module" src="/version.js?v=bcf4351ab1331a61871565cc782d25500107b6a1c71f878f9f04ab0963126f0a"></script>
 </body>
 </html>

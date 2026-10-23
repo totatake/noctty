@@ -53,8 +53,6 @@ pub const PendingImage = struct {
     };
 };
 
-const CpuPending = PendingImage;
-
 /// Image resources belong to the graphics API that owns their renderer.
 pub fn ForAPI(comptime GraphicsAPI: type) type {
     return struct {
@@ -675,7 +673,7 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                             .gray_alpha => .gray_alpha,
                             .rgb => .rgb,
                             .rgba => .rgba,
-                            .png => unreachable, // should be decoded by now
+                            .png, .jpeg => unreachable, // should be decoded by now
                         },
 
                         // constCasts are always gross but this one is safe is because
@@ -786,7 +784,7 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
             };
 
             /// Pending image data that needs to be uploaded to the GPU.
-            pub const Pending = CpuPending;
+            pub const Pending = PendingImage;
 
             pub fn deinit(self: Image, alloc: Allocator) void {
                 switch (self) {
@@ -1026,4 +1024,69 @@ test "image cleanup preserves live pending data without a graphics device" {
     try std.testing.expect(!state.hasLiveImages());
     state.cleanup(alloc);
     try std.testing.expectEqual(@as(u32, 0), state.images.count());
+}
+
+test "kitty placement whose rows were pruned is not drawn" {
+    const TestAPI = struct {
+        pub const Texture = struct {
+            pub fn deinit(self: @This()) void {
+                _ = self;
+            }
+        };
+    };
+    const Images = ForAPI(TestAPI);
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A one-byte scrollback limit leaves the page list its minimum of one
+    // page beyond the active area, so scrolling soon prunes the oldest page.
+    var t = try terminal.Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+    const cell_size: CellSize = .{ .width = 10, .height = 20 };
+
+    var state: Images.State = .empty;
+    defer state.deinit(alloc);
+
+    const screen = t.screens.active;
+    try screen.kitty_images.addImage(alloc, screen, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = try alloc.dupe(u8, &.{ 255, 0, 0, 255 }),
+        .transmit_time = try std.time.Instant.now(),
+    });
+    const pin = try screen.pages.trackPin(screen.pages.pin(.{ .active = .{} }).?);
+    try screen.kitty_images.addPlacement(alloc, screen, 1, 1, .{
+        .location = .{ .pin = pin },
+        .columns = 1,
+        .rows = 1,
+    });
+
+    // Positive control: the live placement is drawn at the top-left.
+    state.kittyUpdate(alloc, &t, cell_size);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+    try testing.expectEqual(@as(i32, 0), state.kitty_placements.items[0].y);
+
+    // Scroll the placement's row out of the retained history.
+    screen.cursorAbsolute(0, t.rows - 1);
+    for (0..100_000) |_| {
+        if (pin.garbage) break;
+        try t.index();
+    } else return error.TestUnexpectedResult;
+
+    // The pruned pin was moved to the top-left of the oldest remaining
+    // page, so kittyUpdate's unwrapped pointFromPin still resolves it.
+    try testing.expect(screen.pages.pointFromPin(.screen, pin.*) != null);
+
+    // Viewing that row must not draw the image there.
+    screen.pages.scroll(.top);
+    state.kittyUpdate(alloc, &t, cell_size);
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
 }

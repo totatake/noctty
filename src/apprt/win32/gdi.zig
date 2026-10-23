@@ -72,7 +72,7 @@ pub fn drawRoundedRect(hdc: HDC, rect: RECT, bg: u32, border: u32, radius: i32) 
 
 /// Stroke a focus ring without erasing content already painted inside it.
 pub fn drawRoundedOutline(hdc: HDC, rect: RECT, border: u32, radius: i32) void {
-    const brush = sys.GetStockObject(NULL_BRUSH) orelse return;
+    const brush = sys.GetStockObject(c.NULL_BRUSH) orelse return;
     const pen = sys.GetStockObject(c.DC_PEN) orelse return;
     const old_color = sys.SetDCPenColor(hdc, border);
     defer _ = sys.SetDCPenColor(hdc, old_color);
@@ -99,10 +99,6 @@ pub const StatusBadge = union(enum) {
     cross,
 };
 
-const NULL_BRUSH: i32 = 5;
-const NULL_PEN: i32 = 8;
-const PS_SOLID: i32 = 0;
-
 /// Draw `badge` inside the square `rect` in `color`, with lines `stroke`
 /// pixels wide. A progress ring's track is `color` faded into `bg`, or in
 /// high contrast, which allows only system colors, a hairline in `color`.
@@ -117,11 +113,11 @@ pub fn drawStatusBadge(
 ) void {
     const size = rect.right - rect.left;
     if (size < 4 or rect.bottom - rect.top != size) return;
-    const pen = sys.CreatePen(PS_SOLID, stroke, color) orelse return;
+    const pen = sys.CreatePen(c.PS_SOLID, stroke, color) orelse return;
     defer _ = sys.DeleteObject(pen);
     const brush = sys.GetStockObject(c.DC_BRUSH) orelse return;
-    const no_brush = sys.GetStockObject(NULL_BRUSH) orelse return;
-    const no_pen = sys.GetStockObject(NULL_PEN) orelse return;
+    const no_brush = sys.GetStockObject(c.NULL_BRUSH) orelse return;
+    const no_pen = sys.GetStockObject(c.NULL_PEN) orelse return;
     _ = sys.SetDCBrushColor(hdc, color);
     const old_pen = sys.SelectObject(hdc, pen);
     defer _ = sys.SelectObject(hdc, old_pen);
@@ -141,15 +137,13 @@ pub fn drawStatusBadge(
                 .right = rect.right - half,
                 .bottom = rect.bottom - half,
             };
-            const percent = progress orelse {
-                _ = sys.Ellipse(hdc, ring.left, ring.top, ring.right, ring.bottom);
-                return;
-            };
+            // Without a percentage the whole ring is bright, as at 100%.
+            const percent = progress orelse 100;
             if (percent < 100) {
                 const track = if (high_contrast)
-                    sys.CreatePen(PS_SOLID, 1, color) orelse return
+                    sys.CreatePen(c.PS_SOLID, 1, color) orelse return
                 else
-                    sys.CreatePen(PS_SOLID, stroke, blendColorRGB(bg, color, 0.35)) orelse return;
+                    sys.CreatePen(c.PS_SOLID, stroke, blendColorRGB(bg, color, 0.35)) orelse return;
                 defer _ = sys.DeleteObject(track);
                 _ = sys.SelectObject(hdc, track);
                 _ = sys.Ellipse(hdc, ring.left, ring.top, ring.right, ring.bottom);

@@ -8,6 +8,11 @@ param(
     [int] $IdleSoakSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-accessibility.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Recurring cadence for accessibility, focus, and window-state polls.
 $script:ACCESSIBILITY_POLL_MS = 100
@@ -3471,6 +3476,10 @@ $nocttyBeforeIdentities = @($machineProcesses | Where-Object ProcessName -eq 'no
 
 $harness = Initialize-InteractiveWin11Sandbox -RepoRoot $repoRoot -SandboxName 'accessibility' -ResetState:$ResetState
 $layout = $harness.Layout
+# The commands this harness types are cmd syntax (`%TEMP%\wgh*.cmd`), so the terminal must run cmd.exe.
+# Since #443 the default shell is pwsh when installed, where `%TEMP%` is not expanded and the launcher
+# never runs ("Timed out waiting for terminal marker launcher output" in release evidence 39164175922).
+$accessibilityLaunchArguments = @(Get-InteractiveWin11LaunchArguments -Layout $layout)
 $exe = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
 if ((Get-InteractiveWin11LaunchAction -ExePath $exe -Rebuild:$Rebuild -BuildInputs (Get-InteractiveWin11DefaultBuildInputs -RepoRoot $repoRoot)) -eq 'build') {
     Invoke-InteractiveWin11Build -RepoRoot $repoRoot
@@ -3588,7 +3597,7 @@ $inactiveTabEvidence = $null
 $evidence = $null
 $runFailure = $null
 $cleanupFailures = [System.Collections.Generic.List[string]]::new()
-$process = Start-Process -FilePath $exe -ArgumentList @(Get-InteractiveWin11LaunchArguments -Layout $layout) `
+$process = Start-Process -FilePath $exe -ArgumentList $accessibilityLaunchArguments `
     -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
 try {
@@ -6203,6 +6212,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$ownerProbeClass"
+        '--command=cmd.exe'
     )
     $ownerProbeProcess = Start-Process -FilePath $exe -ArgumentList $ownerProbeArguments `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $ownerProbeStdout -RedirectStandardError $ownerProbeStderr -PassThru
@@ -6520,6 +6530,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveProbeClass"
+        '--command=cmd.exe'
     )
     $saveProbeProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -6595,6 +6606,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveVerifyClass"
+        '--command=cmd.exe'
     )
     $saveVerifyProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -7153,7 +7165,7 @@ try {
 
     $relaunchStdout = Join-Path $layout.Logs 'interactive-win11-accessibility-relaunch-stdout.log'
     $relaunchStderr = Join-Path $layout.Logs 'interactive-win11-accessibility-relaunch-stderr.log'
-    $relaunchProcess = Start-Process -FilePath $exe -ArgumentList @(Get-InteractiveWin11LaunchArguments -Layout $layout) `
+    $relaunchProcess = Start-Process -FilePath $exe -ArgumentList $accessibilityLaunchArguments `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $relaunchStdout -RedirectStandardError $relaunchStderr -PassThru
     Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds($TimeoutSeconds)) -Description 'relaunch main HWND' -Condition {
         $relaunchProcess.Refresh()
@@ -7384,3 +7396,7 @@ if ($failureMessages.Count -gt 0) {
 }
 
 Write-Host "interactive Win11 accessibility: PASS ($artifact)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

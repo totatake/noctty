@@ -21,6 +21,11 @@ param(
     [switch] $ProfileThroughput
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'bench-windows.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 $launcherPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
@@ -591,7 +596,7 @@ function Get-BenchTargetArguments {
                 "--class=$script:instanceClass"
                 "--config-file=$script:nocttyConfigPath"
             )
-            if ($EnableAutomation) { return $targetArguments }
+            if ($EnableAutomation) { return $targetArguments + @('--command=cmd.exe') }
             return $targetArguments + @('-e', 'powershell.exe') + $ChildArguments
         }
         'alacritty' {
@@ -2491,3 +2496,7 @@ if ($measurementErrors.Count -gt 0) {
     exit 1
 }
 Write-Host "Windows benchmark: PASS (target=$Target, metric=$Metric, runs=$Runs, evidence=$OutputPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

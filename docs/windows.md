@@ -183,11 +183,10 @@ checksummed and bound to the canonical release workflow by GitHub build
 provenance. The legacy `SHA256SUMS.txt` file remains an x64 auto-update
 compatibility alias.
 
-A Chocolatey package (`noctty`) is built by the release workflow but has not
-been published yet, so `choco install noctty` does not work today. It will
-after the first push clears chocolatey.org moderation, which can take weeks;
-until a version is approved, later pushes are refused with `403`. See
-[chocolatey-publishing.md](chocolatey-publishing.md).
+A Chocolatey package (`noctty`) is built by the release workflow, but
+chocolatey.org has no approved version of it, so `choco install noctty` does
+not work today. Version 1.3.134 was pushed there on 2026-10-21 and is waiting
+in moderation; see [chocolatey-publishing.md](chocolatey-publishing.md).
 
 [getting-started.md](getting-started.md) covers download and install,
 including the SmartScreen warning. [verify-release.md](verify-release.md)
@@ -592,7 +591,8 @@ console sets another one, so cmd's `title`, PowerShell and full-screen
 programs name the window as they do anywhere else. When the client set
 `STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
 Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
-opens it without taking focus, and a maximized start opens it maximized.
+opens it without taking focus, and a maximized start opens it maximized. The
+`maximize` and `fullscreen` settings do not apply to an adopted console.
 `powershell.exe -WindowStyle Hidden` hides its own console window after it
 starts. For an adopted console, noctty follows OpenConsole's show/hide
 notifications as Windows Terminal does: hide minimizes the window, and show
@@ -948,6 +948,15 @@ a DWM dark caption; high-contrast palette switching; IME support;
 drag-and-drop of files, plain text, URLs, and HTML into a pane; and native
 right-click context menus.
 
+In a tab with two or more panes, the renderer dims every pane but the one the
+tab has selected (`unfocused-split-opacity`, toward `unfocused-split-fill`,
+which defaults to the configured `background`), and `split-divider-color`
+colors the gap between them. The selected pane of a window that is not in
+front stays undimmed, and a zoomed pane is never dimmed. The dim covers the
+terminal content, after any custom shader, but not the overlay scrollbar or a
+docked search bar; High Contrast turns it off and keeps the system colors for
+the gap.
+
 The dark caption is chosen at runtime, not by build number:
 `DWMWA_USE_IMMERSIVE_DARK_MODE` (20) is tried first and the legacy attribute
 (19) is used when DWM rejects it. Windows 11 additionally gets an integrated
@@ -972,6 +981,25 @@ with Alt+Space, then Move, or with Win+arrow keys (Snap, not measured). On
 Windows 10 the window is frameless: no border, shadow, or resize edges, no
 Alt+Space menu, and no tab-strip drag, and maximizing it covers the taskbar.
 The quick terminal is frameless on both, so it sits flush with its screen edge.
+
+`maximize = true` and `fullscreen = true` apply to every new window: the
+first one, `new_window`, a profile opened in a new window, a window forwarded
+from another launch (`noctty --maximize`, `noctty +new-window
+--fullscreen=true`), a launched layout, and a window restored from the saved
+session (see [Session restore and recovery](#session-restore-and-recovery)).
+They do not apply to new tabs or splits, to the quick terminal, or to a
+console handed off as the default terminal, which starts in the show state
+its program asked for. Changing them with a config reload does not
+change windows that are already open. A window with no other window to copy
+(the first one, or one opened when none is open) is shown in that state from
+the start. A window opened from another one (`new_window`, a forwarded
+launch) is shown first and then maximized or made fullscreen, as a window
+opened from a maximized one already was. A window that starts fullscreen
+leaves fullscreen to the window it would otherwise have been: its normal size
+and place, or maximized when `maximize` is also set. The settings win over a
+minimized launch (`start /min`, a shortcut set to Run: Minimized): such a
+window starts maximized or fullscreen, not minimized, and the windows opened
+after it (Settings, a new window) are not minimized either.
 
 The universal palette puts actions, live tabs, panes, Windows profiles,
 named layouts, and native settings in one fuzzy-ranked, keyboard-driven
@@ -1085,14 +1113,47 @@ the indicator is later turned off.
 
 One noctty process owns the saved session: the first one started normally,
 which restores it (or opens its first window when there is nothing to
-restore). Only that process saves it, on exit, at sign-out, shutdown or
-reboot, when the display configuration changes, and one second after a burst
-of window, tab or pane structural changes settles. These checkpoints use the
-same ownership, scrollback opt-in and sensitive-input exclusions as the exit
-save; startup restoration completes before checkpointing is enabled. The save at sign-out,
-shutdown or reboot is the last one and never deletes the file, even with no
-windows left: the sign-out also ends the shells, so an empty window list
-then says nothing about what was closed on purpose. A launch that forwards
+restore). Only that process saves it: as the session's last window goes, at
+sign-out, shutdown or reboot, when the display configuration changes, and one
+second after a burst of window, tab or pane structural changes settles. These
+checkpoints use the same ownership, scrollback opt-in and sensitive-input
+exclusions as the save when the last window goes; startup restoration
+completes before checkpointing is enabled.
+
+The saved session is what was open when the session ended, taken just before
+it went. When windows close one at a time, that is what the last window held,
+however it went: its close button, Alt+F4 or the taskbar, `close_window`, the
+X of its only tab, `close_tab:this` on its last tab (saved as the tab closes,
+not when its undo time runs out), `close_surface` on its last pane, or its last
+shell exiting. A `quit`, `close_all_windows` or an update install saves every
+window it closes. The quick terminal is never a session window, and neither is
+a window left empty after its last tab closed, which stays only for undo. Undo
+history is never saved: a tab or pane closed while other tabs or windows stayed
+open does not come back on the next launch, even if noctty quits before its
+undo time runs out. Undoing the close of the last tab, or opening a new tab or
+window, continues the session. No save deletes the file: with no window to
+record, a save writes nothing.
+
+One exception: a restore that ended by itself before anyone used it. If
+nothing has used the session since startup restored it, and every program in
+the panes it still holds has ended by itself (a WSL distribution that fails to
+start, say), saving it back would open and close it again at every launch.
+"Used" means input reached a pane while its program ran: a key, a click, the
+mouse wheel, a paste or drop, a command run from the command palette, or text
+sent by automation (`+send-text`). Opening a tab, pane, window or the quick
+terminal counts too. An action sent with `+perform-action` counts only when
+it opens one of those: it cannot send input to a program. A key pressed in a pane whose program has already ended only closes it,
+and does not count. When the session ends that way, noctty renames the saved
+session to `session-state.json.restore-ended` (or `.1` up to `.4`) instead of
+saving it, writes no checkpoint for it meanwhile, and the next launch opens a
+fresh window. Rename the file back to try that session again. Nothing is
+deleted or replaced: with all five names taken, the file is left where it is
+and the next launch restores it again. These names are separate from the
+`.restore-failed` names below, so they never stop a session that keeps
+ending the process from being moved aside.
+
+The save at sign-out, shutdown or reboot is the last one: the sign-out also
+ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's
 "Open noctty here" and the jump list's recent folders) or with `-e` or
 `initial-command`, the startup profile picker, a `--launch-layout` or
@@ -1131,7 +1192,19 @@ unplugged or the layout changed, or Windows capped an extreme size or position),
 the window moves to the nearest monitor's
 work area, its size capped to it. A window with a caption's worth of title bar
 (48 px wide) on some monitor stays where it was, even if the rest
-of it hangs off the screen.
+of it hangs off the screen. A launch that asked for a minimized window
+(`start /min`, a shortcut set to Run: Minimized) restores windows the same
+way: they come back at their saved rect, not minimized.
+
+`maximize = true` and `fullscreen = true` (or `--maximize` and
+`--fullscreen=true` on the command line) apply to restored windows too: each
+is placed at its saved rect first and then maximized or made fullscreen, so
+the saved rect is the one it returns to. Without them a window comes back in
+its saved state. The saved session does not record fullscreen: a window that
+was fullscreen when the session was saved is saved as the window it leaves
+fullscreen to, at the rect it had before fullscreen and maximized if it was
+maximized then, and comes back as that window (fullscreen again with
+`fullscreen = true`).
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still
@@ -1329,7 +1402,8 @@ on resize, on a click, and when the surface loses focus.
 Completing a label copies the matched text to the clipboard. Hold Ctrl while
 completing to open a target that begins with an allowed URL scheme or names a
 file or folder on this machine (`C:\dir\file.txt`, `.\src\main.zig:12:5`,
-`src\a.cs(3,4)`); other targets, network shares included, are copied. A path
+`src\a.cs(3,4)`, and outside WSL `/c/dir/file.txt`, as described below);
+other targets, network shares included, are copied. A path
 opens through the same checks as a Ctrl+click on it, with a trailing
 `:line:col` or `(line,col)` left off: it must exist and must not be a program
 or script. When it is refused, a banner says it was not opened. Hold Alt to
@@ -1356,6 +1430,28 @@ its own link. So `C:\a.txt copied` ends at `.txt` and
 has no dot still takes the words after it (`C:\Users\amant and then` is one
 match), because that cannot be told from a folder with a space in its name.
 A path inside single or double quotes ends at its closing quote.
+
+In a pane that does not run WSL, an absolute drive path as MSYS2, Git Bash
+and Cygwin print it opens as the Windows path it names: `/c/Users/me` and
+`/cygdrive/c/Users/me` open `C:\Users\me`, and a relative link resolves
+against a pane directory reported in that form (`/c` included). The Windows
+path then goes through the same checks as one written `C:\Users\me`: it
+opens only if it exists on a local drive and is not a program or a file
+Windows would run or install when opened (`.cmd`, `.ps1`, `.msi`, `.lnk` and
+the like). So a letter that is not a local drive, a network drive, a missing
+file and `/c/x/run.cmd` are refused, while `/c/x/config.fish` opens like any
+document. A drive's root is never opened from text, just as `C:\` is not a
+link: `/c` alone is a switch in `cmd /c` far more often than a drive.
+
+A pane counts as WSL when its command starts `wsl.exe` or WSL's `bash.exe`
+launcher (the one in the Windows folder, or the WindowsApps alias), directly
+or as `command = wsl.exe ...`; a bare `bash` counts when the first `bash` on
+the pane's `PATH` is that launcher. There `/c/...` is a Linux path and is
+not opened. Some WSL sessions are not recognized, so a `/c/x` printed in
+them opens `C:\x` when that exists: WSL started by another program in the
+pane (`cmd /c wsl`, `wsl` typed at a prompt), a distribution's own launcher
+such as `ubuntu.exe`, and a session handed to noctty as the default
+terminal.
 
 A quick select with nothing to label, or with too many targets to label
 without overlap, says so in the banner.
@@ -1506,10 +1602,29 @@ layout without prompting, and only for the focused target.
 `+new-window` forwards command-line arguments to the running instance, which
 honors only allowlisted window-scoped presentation settings: window geometry
 and decoration (`--window-width`, `--window-height`, `--window-position-*`,
-`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen`),
+`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen=true`),
 `--title`, non-name font settings (`--font-size`, `--font-thicken`), and
 colors (`--background`, `--foreground`, `--palette`, `--cursor-color`,
 `--background-opacity`).
+
+The new window copies one of the running instance's windows, as a
+`new_window` does: the first in the instance's window list, or the first
+ordinary one if that is the quick terminal. That list is not kept in opening
+order (closing a window can move another into its place), so with several
+windows open, which one is copied does not follow age or focus. The new
+window takes that window's size, one step down and right of it, its
+maximized or fullscreen state, always-on-top, its decorations and its
+background opacity. Forwarded arguments win over the copy: `--window-width`
+and `--window-height` give it its own size (both must be set, by the
+arguments or the config; from a maximized or fullscreen window, it is the
+size the new window returns to), `--window-decoration` its decorations and
+`--background-opacity` its opacity. `--window-position-*` place it as the
+config's `window-position-*` do, at the copied size unless a size is
+forwarded, except that a window opened from a maximized or fullscreen one
+returns to that window's normal place. When there is nothing to copy (no
+window is open, or the first in the list is a window whose last tab was
+closed and is kept only for undo), the arguments apply as they do to a first
+window.
 
 Anything that runs code (`--command`, `--initial-command`, `-e`, `--input`,
 `--env`), loads a file (`--background-image`, `--custom-shader`,

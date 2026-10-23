@@ -18,10 +18,14 @@ pub fn decode(alloc: Allocator, data: []const u8) Error!ImageData {
     // gets around that by using the Zig allocator to allocate enough memory for
     // the struct and then casts it to the appropriate pointer.
 
-    const decoder_buf = try alloc.alloc(u8, c.sizeof__wuffs_jpeg__decoder());
+    const decoder_buf = try alloc.alignedAlloc(
+        u8,
+        .@"16",
+        c.sizeof__wuffs_jpeg__decoder(),
+    );
     defer alloc.free(decoder_buf);
 
-    const decoder: ?*c.wuffs_jpeg__decoder = @ptrCast(decoder_buf);
+    const decoder: ?*c.wuffs_jpeg__decoder = @ptrCast(decoder_buf.ptr);
     {
         const status = c.wuffs_jpeg__decoder__initialize(
             decoder,

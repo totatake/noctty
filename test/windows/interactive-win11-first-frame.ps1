@@ -5,6 +5,11 @@ param(
     [int] $TimeoutSeconds = 30
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-first-frame.ps1'
+try {
+
+
 # Regression harness for #224: the window must present terminal content before
 # it is given any input.
 #
@@ -252,3 +257,7 @@ Write-Host ("interactive-win11 first-frame validation: PASS " +
     $outputTrace.last_swap_process_output_bytes,
     $outputTrace.first_show_wakeup_count,
     $uia)
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

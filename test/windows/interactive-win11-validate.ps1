@@ -3,11 +3,23 @@ param(
     [switch] $ResetState
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-validate.ps1'
+$savedMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+$windowsHarnessStateGuard = $null
+try {
+
+
 $ErrorActionPreference = 'Stop'
+# Inherited by every harness and its VS-dev/PowerShell bootstrap. Individual
+# harnesses retain their redirected LOCALAPPDATA configuration semantics.
+$env:NOCTTY_INTERACTIVE_MEASURE_AUMID = '1'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $suiteLogDir = Join-Path $env:TEMP ("noctty-interactive-win11-suite-{0}" -f $PID)
 New-Item -ItemType Directory -Force -Path $suiteLogDir | Out-Null
+. (Join-Path $repoRoot 'scripts\interactive-win11-state-guard.ps1')
+$windowsHarnessStateGuard = Start-InteractiveWin11StateGuard -Harness 'interactive-win11-validate.ps1' -ReceiptDirectory $suiteLogDir
 $libPath = Join-Path $repoRoot 'scripts\interactive-win11-lib.ps1'
 . $libPath
 
@@ -51,6 +63,7 @@ function Invoke-SuiteBuildIfNeeded {
     if ($launchAction -eq 'build') {
         Invoke-SuiteBuild
     }
+    Assert-InteractiveWin11ExeExists -ExePath $exePath
 }
 
 function Get-HarnessArguments {
@@ -227,6 +240,19 @@ function Get-HarnessSummary {
 
 Invoke-Harness -ScriptName 'interactive-win11.ps1'
 Invoke-SuiteBuildIfNeeded
+$measureLayout = Get-InteractiveWin11MeasureLayout $repoRoot
+$suiteProvenance = Get-Content -LiteralPath $measureLayout.Receipt -Raw | ConvertFrom-Json
+$sourceEvidence = Join-Path $suiteLogDir 'measure-source.json'
+$buildEvidence = Join-Path $suiteLogDir 'measure-build.json'
+Copy-Item -LiteralPath $measureLayout.SourceReceipt -Destination $sourceEvidence -ErrorAction Stop
+Copy-Item -LiteralPath $measureLayout.Receipt -Destination $buildEvidence -ErrorAction Stop
+$sourceEvidenceHash = Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($sourceEvidence))
+if ($sourceEvidenceHash -cne $suiteProvenance.SourceReceiptSHA256) { throw 'Retained measurement source receipt hash differs from build receipt.' }
+$buildEvidenceHash = Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($buildEvidence))
+Write-Host ('interactive-win11 source provenance: ' + ((Get-Content -LiteralPath $sourceEvidence -Raw | ConvertFrom-Json) | ConvertTo-Json -Compress))
+Write-Host ('interactive-win11 measurement provenance: ' + ($suiteProvenance | ConvertTo-Json -Compress))
+Write-Host "interactive-win11 retained provenance: source=$sourceEvidence sha256=$sourceEvidenceHash build=$buildEvidence sha256=$buildEvidenceHash"
+Write-Host 'interactive-win11 coverage: HEAD archive plus recorded process/jump-list identity patch; explicit product toast notifier and command-finish policy retained. Product registration repair and installed cold-start activation are not tested; actual banner delivery is not asserted by this gate.'
 Invoke-Harness -ScriptName 'vt-probe-win32-conformance.ps1' -TimeoutSeconds 10 -PassResetState
 Invoke-Harness -ScriptName 'interactive-win11-smoke.ps1' -TimeoutSeconds 10 -PassResetState
 Invoke-HarnessWithPassSentinel -ScriptName 'interactive-win11-first-frame.ps1' -TimeoutSeconds 30
@@ -318,4 +344,24 @@ $stderr
     }
 }
 
+Assert-InteractiveWin11MeasureBuild -RepoRoot $repoRoot -ExePath $measureLayout.Exe
+$finalProvenance = Get-Content -LiteralPath $measureLayout.Receipt -Raw | ConvertFrom-Json
+if ($finalProvenance.Head -cne $suiteProvenance.Head -or $finalProvenance.ExeSHA256 -cne $suiteProvenance.ExeSHA256 -or
+    $finalProvenance.CliSHA256 -cne $suiteProvenance.CliSHA256 -or
+    $finalProvenance.SourceReceiptSHA256 -cne $suiteProvenance.SourceReceiptSHA256 -or
+    (Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($sourceEvidence))) -cne $sourceEvidenceHash -or
+    (Get-InteractiveWin11MeasureHash ([IO.File]::ReadAllBytes($buildEvidence))) -cne $buildEvidenceHash) {
+    throw 'Measurement HEAD, binaries, or provenance evidence changed during the composite suite.'
+}
+} finally {
+    $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $savedMeasureAumid
+    # Run both even if either fails, and retain both failure messages.
+    $guardFailures = [Collections.Generic.List[string]]::new()
+    try {
+        if ($null -ne $windowsHarnessStateGuard) { Assert-InteractiveWin11StateGuard -Guard $windowsHarnessStateGuard }
+    } catch { $guardFailures.Add($_.Exception.Message) }
+    try { Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard }
+    catch { $guardFailures.Add($_.Exception.Message) }
+    if ($guardFailures.Count) { throw ($guardFailures -join [Environment]::NewLine) }
+}
 Write-Host "interactive-win11 validate suite: PASS ($suiteLogDir)"

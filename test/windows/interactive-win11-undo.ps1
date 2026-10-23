@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 15
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-undo.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Observation delay after closing the last undo-story tab.
 $script:UNDO_LAST_TAB_SETTLE_MS = 500
@@ -487,3 +492,7 @@ finally {
 }
 
 Write-Host "interactive-win11 undo test: PASS ($stderrPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

@@ -85,41 +85,8 @@ test "renderer target recreation tracks custom shader presence" {
     }));
 }
 
-/// Create a renderer type with the provided graphics API wrapper.
-///
-/// The graphics API wrapper must provide the interface outlined below.
-/// Specific details for the interfaces are documented on the existing
-/// implementations (`OpenGL`).
-///
-/// Hierarchy of graphics abstractions:
-///
-/// [ GraphicsAPI ] - Responsible for configuring the runtime surface
-///    |     |        and providing render `Target`s that draw to it,
-///    |     |        as well as `Frame`s and `Pipeline`s.
-///    |     V
-///    | [ Target ] - Represents an abstract target for rendering, which
-///    |              could be a surface directly but is also used as an
-///    |              abstraction for off-screen frame buffers.
-///    V
-/// [ Frame ] - Represents the context for drawing a given frame,
-///    |        provides `RenderPass`es for issuing draw commands
-///    |        to, and reports the frame health when complete.
-///    V
-/// [ RenderPass ] - Represents a render pass in a frame, consisting of
-///   :              one or more `Step`s applied to the same target(s),
-/// [ Step ] - - - - each describing the input buffers and textures and
-///   :              the vertex/fragment functions and geometry to use.
-///   :_ _ _ _ _ _ _ _ _ _/
-///   v
-/// [ Pipeline ] - Describes a vertex and fragment function to be used
-///                for a `Step`; the `GraphicsAPI` is responsible for
-///                these and they should be constructed and cached
-///                ahead of time.
-///
-/// [ Buffer ] - An abstraction over a GPU buffer.
-///
-/// [ Texture ] - An abstraction over a GPU texture.
-///
+/// The renderer configuration derived from the main configuration, shared
+/// by every graphics API (`Renderer(API).DerivedConfig`).
 pub const CommonDerivedConfig = struct {
     const DerivedConfig = @This();
     renderer_backend: configpkg.Config.RendererBackend = .opengl,
@@ -159,6 +126,11 @@ pub const CommonDerivedConfig = struct {
     blending: configpkg.Config.AlphaBlending,
     background_blur: configpkg.Config.BackgroundBlur,
     scroll_to_bottom_on_output: bool,
+    /// `unfocused-split-opacity`, already clamped to 0.15..1 by the config.
+    unfocused_split_opacity: f32,
+    /// `unfocused-split-fill`, or the configured `background` when unset
+    /// (upstream's default), never a color a program sets with OSC 11.
+    unfocused_split_fill: terminal.color.RGB,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -235,6 +207,8 @@ pub const CommonDerivedConfig = struct {
             .blending = config.@"alpha-blending",
             .background_blur = config.@"background-blur",
             .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
+            .unfocused_split_opacity = @floatCast(config.@"unfocused-split-opacity"),
+            .unfocused_split_fill = (config.@"unfocused-split-fill" orelse config.background).toTerminalRGB(),
             .arena = arena,
         };
     }
@@ -246,6 +220,71 @@ pub const CommonDerivedConfig = struct {
     }
 };
 
+test "CommonDerivedConfig split fill defaults to the configured background" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    config.background = .{ .r = 0x0c, .g = 0x0c, .b = 0x0c };
+    config.@"unfocused-split-opacity" = 0.5;
+    {
+        var derived = try CommonDerivedConfig.init(alloc, &config);
+        defer derived.deinit();
+        try std.testing.expectEqual(terminal.color.RGB{ .r = 0x0c, .g = 0x0c, .b = 0x0c }, derived.unfocused_split_fill);
+        try std.testing.expectEqual(@as(f32, 0.5), derived.unfocused_split_opacity);
+    }
+    config.@"unfocused-split-fill" = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+    var derived = try CommonDerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    try std.testing.expectEqual(terminal.color.RGB{ .r = 0xff, .g = 0xff, .b = 0xff }, derived.unfocused_split_fill);
+}
+
+/// The uniforms of the pass that dims an unfocused split
+/// (`unfocused-split-opacity`): the frame's own, with the fill drawn at
+/// `1 - opacity` over the finished frame. Upstream lays a rectangle of the
+/// fill over the view, which blends in sRGB (gamma) space rather than in
+/// linear light, so the fill is not linearized here and the backends blend on
+/// the stored bytes (`framebuffer_srgb = false` on OpenGL, a UNORM view of
+/// the target on Direct3D 11). Null when the pass would change nothing.
+pub fn splitDimUniforms(base: anytype, fill: terminal.color.RGB, opacity: f32) ?@TypeOf(base) {
+    if (!(opacity < 1)) return null;
+    const alpha: u8 = @intFromFloat(@round(std.math.clamp(1 - opacity, 0, 1) * 255));
+    if (alpha == 0) return null;
+    var result = base;
+    result.bg_color = .{ fill.r, fill.g, fill.b, alpha };
+    result.bools.use_linear_blending = false;
+    return result;
+}
+
+test "split dim uniforms blend in gamma space" {
+    const Uniforms = @import("opengl/shaders.zig").Uniforms;
+    var base = std.mem.zeroes(Uniforms);
+    base.bg_color = .{ 0x10, 0x20, 0x30, 0xff };
+    base.min_contrast = 4.5;
+    base.bools.use_linear_blending = true;
+    base.bools.use_linear_correction = true;
+
+    const fill: terminal.color.RGB = .{ .r = 12, .g = 12, .b = 12 };
+    const dim = splitDimUniforms(base, fill, 0.7).?;
+    try std.testing.expectEqual([4]u8{ 12, 12, 12, 77 }, dim.bg_color);
+    var expected = base;
+    expected.bg_color = dim.bg_color;
+    expected.bools.use_linear_blending = false;
+    try std.testing.expect(std.meta.eql(expected, dim));
+
+    // The pass computes `fill * a + frame * (1 - a)` on the stored bytes.
+    // #cccccc text under the default fill then reads 146, the value the
+    // reporter measured on upstream; blending in linear light gives 174.
+    const a = @as(f64, @floatFromInt(dim.bg_color[3])) / 255.0;
+    try std.testing.expectEqual(@as(f64, 146), @round(204.0 * (1 - a) + 12.0 * a));
+
+    // Opaque, or too close to it to change a byte: no pass.
+    try std.testing.expect(splitDimUniforms(base, fill, 1.0) == null);
+    try std.testing.expect(splitDimUniforms(base, fill, 0.999) == null);
+    try std.testing.expect(splitDimUniforms(base, fill, std.math.nan(f32)) == null);
+    try std.testing.expectEqual(@as(u8, 217), splitDimUniforms(base, fill, 0.15).?.bg_color[3]);
+}
+
+/// What `updateFrame` reports, shared by every graphics API.
 pub const CommonFrameUpdate = struct {
     cursor_blinking: bool,
     output_progress: ?renderer.State.OutputProgress = null,
@@ -254,6 +293,41 @@ pub const CommonFrameUpdate = struct {
     synchronized_output: bool = false,
 };
 
+/// Create a renderer type with the provided graphics API wrapper.
+///
+/// The graphics API wrapper must provide the interface outlined below.
+/// Specific details for the interfaces are documented on the existing
+/// implementations (`OpenGL`).
+///
+/// Hierarchy of graphics abstractions:
+///
+/// [ GraphicsAPI ] - Responsible for configuring the runtime surface
+///    |     |        and providing render `Target`s that draw to it,
+///    |     |        as well as `Frame`s and `Pipeline`s.
+///    |     V
+///    | [ Target ] - Represents an abstract target for rendering, which
+///    |              could be a surface directly but is also used as an
+///    |              abstraction for off-screen frame buffers.
+///    V
+/// [ Frame ] - Represents the context for drawing a given frame,
+///    |        provides `RenderPass`es for issuing draw commands
+///    |        to, and reports the frame health when complete.
+///    V
+/// [ RenderPass ] - Represents a render pass in a frame, consisting of
+///   :              one or more `Step`s applied to the same target(s),
+/// [ Step ] - - - - each describing the input buffers and textures and
+///   :              the vertex/fragment functions and geometry to use.
+///   :_ _ _ _ _ _ _ _ _ _/
+///   v
+/// [ Pipeline ] - Describes a vertex and fragment function to be used
+///                for a `Step`; the `GraphicsAPI` is responsible for
+///                these and they should be constructed and cached
+///                ahead of time.
+///
+/// [ Buffer ] - An abstraction over a GPU buffer.
+///
+/// [ Texture ] - An abstraction over a GPU texture.
+///
 pub fn Renderer(comptime GraphicsAPI: type) type {
     const imagepkg = @import("image.zig").ForAPI(GraphicsAPI);
     const ImageState = imagepkg.State;
@@ -297,6 +371,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Flag to indicate that our focus state changed for custom
         /// shaders to update their state.
         custom_shader_focused_changed: bool = false,
+
+        /// This terminal is an unfocused split, so every frame ends with
+        /// the dim pass (`splitDimUniforms`). The apprt decides it from the
+        /// split its tab has focused, not from keyboard focus, so it is
+        /// separate from `focused`.
+        split_dimmed: bool = false,
 
         /// The most recent scrollbar state. We use this as a cache to
         /// determine if we need to notify the apprt that there was a
@@ -494,6 +574,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This is used to implement double/triple buffering.
         const FrameState = struct {
             uniforms: UniformBuffer,
+            /// The dim pass's uniforms (`splitDimUniforms`).
+            split_dim_uniforms: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
 
@@ -528,6 +610,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // a frame is drawn.
                 var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
                 errdefer uniforms.deinit();
+                var split_dim_uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
+                errdefer split_dim_uniforms.deinit();
 
                 // Create GPU buffers for our cells.
                 //
@@ -577,6 +661,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 return .{
                     .uniforms = uniforms,
+                    .split_dim_uniforms = split_dim_uniforms,
                     .cells = cells,
                     .cells_bg = cells_bg,
                     .bg_image_buffer = bg_image_buffer,
@@ -590,6 +675,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pub fn deinit(self: *FrameState) void {
                 self.target.deinit();
                 self.uniforms.deinit();
+                self.split_dim_uniforms.deinit();
                 self.cells.deinit();
                 self.cells_bg.deinit();
                 self.grayscale.deinit();
@@ -1149,6 +1235,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     display_link.stop() catch {};
                 }
             }
+        }
+
+        /// Whether this terminal is drawn dimmed, as an unfocused split.
+        ///
+        /// Must be called on the render thread.
+        pub fn setSplitDimmed(self: *Self, dimmed: bool) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+            self.split_dimmed = dimmed;
         }
 
         /// Callback when the window is visible or occluded.
@@ -1984,6 +2079,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
                 if (apprt.runtime == apprt.win32) log.debug("drawFrame post pipelines done", .{});
             }
+
+            // An unfocused split is dimmed last, over whatever the custom
+            // shaders drew, as upstream's overlay covers the whole view.
+            if (self.split_dimmed) dim: {
+                const dim = splitDimUniforms(
+                    self.uniforms,
+                    self.config.unfocused_split_fill,
+                    self.config.unfocused_split_opacity,
+                ) orelse break :dim;
+                try frame.split_dim_uniforms.sync(&.{dim});
+                var pass = frame_ctx.renderPass(&.{.{ .target = .{ .target = frame.target } }});
+                defer pass.complete();
+                pass.step(.{
+                    .pipeline = self.shaders.pipelines.split_dim,
+                    .uniforms = frame.split_dim_uniforms.buffer,
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                }) catch |err| {
+                    if (comptime @hasDecl(@TypeOf(frame_ctx), "markUnhealthy")) {
+                        frame_ctx.markUnhealthy("split_dim", err);
+                    }
+                    return err;
+                };
+            }
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -2218,7 +2336,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Move CPU frame preparation to another graphics API. GPU resources
         /// are freshly initialized; font, terminal and search state survive.
         pub fn transferCpuState(self: *Self, target: anytype) void {
-            const transferred = .{ "grid_metrics", "size", "focused", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "overlay" };
+            const transferred = .{ "grid_metrics", "size", "focused", "split_dimmed", "scrollbar", "scrollbar_dirty", "last_bottom_node", "last_bottom_y", "search_matches", "search_selected_match", "search_matches_dirty", "cells", "bg_cells_dirty", "fg_cells_dirty_from", "fg_cell_count", "uniforms", "custom_shader_uniforms", "first_frame_time", "last_frame_time", "font_shaper", "font_shaper_cache", "terminal_state", "terminal_state_frame_count", "overlay" };
             // These fields own API-specific resources, shared ownership, or
             // fresh-renderer synchronization state. A backport must classify
             // every new field explicitly instead of silently dropping state.

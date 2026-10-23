@@ -195,12 +195,7 @@ foreach ($docsPath in @("docs/getting-started.md", "docs/windows.md")) {
 Require-Contains -RelativePath "docs/status.md" -Needle "x64 and ARM64" -Reason "Status docs should match the supported public release architectures."
 Require-Contains -RelativePath "docs/status.md" -Needle "checksum metadata" -Reason "Updater docs should mention checksum-gated release metadata."
 
-foreach ($sitePath in @("site/terminal.js")) {
-    Require-Contains -RelativePath $sitePath -Needle 'PROCESSOR_ARCHITEW6432' -Reason "The public site terminal copy should detect the native OS architecture from WOW64 shells."
-    Require-Contains -RelativePath $sitePath -Needle 'windows-$arch-setup.exe' -Reason "The public site terminal copy should not hard-code x64 download URLs."
-    Require-Contains -RelativePath $sitePath -Needle 'windows-$arch-portable.zip' -Reason "The public site terminal copy should not hard-code x64 download URLs."
-    Require-Contains -RelativePath $sitePath -Needle "x64 and ARM64" -Reason "The public site should describe both public release architectures."
-}
+Require-Contains -RelativePath "site/index.html" -Needle "x64 and ARM64" -Reason "The public site should describe both public release architectures."
 
 if ($latestVersion) {
     if ($ExpectedVersion -and $latestVersion -ne $ExpectedVersion) {
@@ -222,7 +217,6 @@ if ($latestVersion) {
 
     $escapedVersion = [regex]::Escape($latestVersion)
     Require-Regex -RelativePath "site/version.js" -Pattern "DEFAULT_NC_VERSION\s*=\s*'$escapedVersion'" -Reason "Site source default release version should match README."
-    Require-Regex -RelativePath "site/terminal.js" -Pattern "NC_VERSION\s*=\s*\(typeof window !== 'undefined' && window\.NC_VERSION\)\s*\|\|\s*'$escapedVersion'" -Reason "Site terminal default release version should match README."
     Require-Regex -RelativePath "site/index.html" -Pattern "(?<![\d.])$escapedVersion(?![\d.])" -Reason "The landing page should ship the current README release version as its compiled default."
     Require-Regex -RelativePath "site/why-noctty.html" -Pattern ('id="nc-version">v' + $escapedVersion + '</strong>') -Reason "The trust page's static latest-release text should match README; it only changes when version.js finds a newer tag."
     Require-Regex -RelativePath "site/why-noctty.html" -Pattern ('id="nc-version-summary">Version ' + $escapedVersion + ',') -Reason "The trust page's screen-reader summary should match README."

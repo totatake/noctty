@@ -1,6 +1,11 @@
 [CmdletBinding()]
 param([switch]$Rebuild, [switch]$ResetState, [int]$TimeoutSeconds = 35)
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-automation.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 if ($TimeoutSeconds -le 0) { throw 'TimeoutSeconds must be positive.' }
 
@@ -136,6 +141,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=true'
         "--class=$instanceClass"
+        '--command=cmd.exe'
     ) -WorkingDirectory $repoRoot -RedirectStandardOutput $serverStdout `
         -RedirectStandardError $serverStderr -PassThru
     $serverPid = $server.Id
@@ -220,3 +226,7 @@ finally {
 }
 
 Write-Host "cli automation validation: PASS (server pid=$serverPid class=$instanceClass)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

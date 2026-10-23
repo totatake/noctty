@@ -10,17 +10,43 @@
     Every child has explicit lpDesktop and CREATE_NO_WINDOW. A kill-on-close job
     owns the worker tree; retained process handles bound each UIA client. No
     desktop switch, global input, Narrator, history contents or clipboard content.
-    Real startup/history metadata+hashes and clipboard counter bracket the batch.
+    Real startup/history metadata and clipboard counter bracket the batch.
+
+    Runtime requires -Run. With both cohort counts zero, the original 30 UIA
+    cases run. Otherwise ColdOpenCount independent cold opens and ReloadCount
+    checkbox Save/fresh-process readbacks run through the same fixture paths.
+    Settings opens through the existing host command palette after a distinct new
+    portable startup attempt is ready. -RawPostedF9 preserves one raw posted pair
+    for reproduction, with a modifier-only async sample at the keydown post.
+    An inactive desktop can make that sample zero; it does not prove the
+    foreground session's modifiers are up.
+    Renderer selects d3d11 (default) or opengl. CPU load remains an external experiment.
+    Each launch gets a private NOCTTY_SETTINGS_OPEN_TRACE JSONL path; receipts
+    summarize stage tags only and retain the original trace without printing it.
+    -RequireTrace asserts a valid route-specific trace and successful Settings dispatch;
+    leave it unset for a build without the optional product instrumentation.
+    NOCTTY_SETTINGS_COMBO_TRACE separately records native CB_SHOWDROPDOWN
+    delivery and return, keyed by control ID. Exercise receipts attach those
+    records to the HRESULT and before/returned/100 ms popup observations.
+    -RequireComboTrace rejects a missing diagnostic trace and successful enabled
+    operations without a native show/return pair for their control.
+    Any clipboard sequence change stops launches without attribution.
 
     Results: summary.json, cases.json, per-control probe JSON, guard snapshots,
+    attempts.json and attempt-NNNN.json (stages, HWND identity, startup and trace),
     and task-only portable config. Failures preserve artifacts. No cleanup of
     shared shell state is attempted; guard changes fail the run for inspection.
+    Individual attempt receipts are atomically published at each stage; attempts.json
+    is a compact receipt index updated at attempt completion/failure. The parent
+    stops the owned job after 300 seconds without an updated individual receipt.
     Real Narrator/NVDA and performance measurements remain separate obligations.
 .EXAMPLE
-    ./settings-uia-patterns-run.ps1 -PortableExe C:/task/stage/noctty.exe `
+    ./settings-uia-patterns-run.ps1 -Run -PortableExe C:/task/stage/noctty.exe `
         -ExpectedExeSha256 <verified-sha256> -OutputDirectory C:/task/set91-run-01
 .EXAMPLE
     ./settings-uia-patterns-run.ps1 -CompileOnly
+.EXAMPLE
+    ./settings-uia-patterns-run.ps1 -TestTraceParser
 #>
 #Requires -Version 7.0
 [CmdletBinding()]
@@ -28,11 +54,22 @@ param(
     [string] $PortableExe,
     [ValidatePattern('^[0-9a-fA-F]{64}$')][string] $ExpectedExeSha256,
     [string] $OutputDirectory,
+    [switch] $Run,
+    [ValidateRange(0,10000)][int] $ColdOpenCount = 0,
+    [ValidateRange(0,10000)][int] $ReloadCount = 0,
+    [switch] $RequireTrace,
+    [switch] $RequireComboTrace,
+    [switch] $RawPostedF9,
+    [ValidateSet('d3d11','opengl')][string] $Renderer = 'd3d11',
     [switch] $CompileOnly,
+    [switch] $TestTraceParser,
     [Parameter(DontShow)][string] $WorkerDesktop
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'settings-open-readiness.psm1') -Force
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+if ($TestTraceParser) { Test-SettingsOpenTraceParser; return }
 
 if (-not ('Set91.Native' -as [type])) {
     Add-Type -TypeDefinition @"
@@ -102,23 +139,6 @@ namespace Set91
         public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y,
             int width, int height, uint flags);
         [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
-        [StructLayout(LayoutKind.Sequential)]
-        struct LastInput { public uint Size, Tick; }
-        [DllImport("user32.dll", SetLastError = true)] static extern bool GetLastInputInfo(ref LastInput input);
-        [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
-        public sealed class InputState
-        {
-            public ulong TickCount;
-            public uint LastInputTick, IdleMilliseconds;
-        }
-        public static InputState ReadInput()
-        {
-            var input = new LastInput { Size = (uint)Marshal.SizeOf(typeof(LastInput)) };
-            if (!GetLastInputInfo(ref input)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            ulong now = GetTickCount64();
-            return new InputState { TickCount = now, LastInputTick = input.Tick,
-                IdleMilliseconds = unchecked((uint)now - input.Tick) };
-        }
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll", SetLastError = true)]
         static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr w, IntPtr l,
@@ -193,6 +213,91 @@ namespace Set91
                 2, 5000, out result) == IntPtr.Zero) throw new InvalidOperationException("Window message timed out");
             return result.ToInt64();
         }
+        public sealed class MessageReceipt
+        {
+            public long Hwnd, Result;
+            public uint Message, RequestedTimeoutMilliseconds;
+            public bool Sent, Success, FailedOrTimedOut;
+            public int Error;
+            public int? AsyncModifierMaskAtPost;
+            public double ElapsedMilliseconds;
+        }
+        [DllImport("kernel32.dll", EntryPoint = "SetLastError")] static extern void ClearError(uint error);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        static int AsyncModifiersAtPost()
+        {
+            // Authorized metadata only: high bits of Shift, Ctrl and Alt, sampled once at posting.
+            int mask = 0;
+            if ((GetAsyncKeyState(0x10) & 0x8000) != 0) mask |= 1;
+            if ((GetAsyncKeyState(0x11) & 0x8000) != 0) mask |= 2;
+            if ((GetAsyncKeyState(0x12) & 0x8000) != 0) mask |= 4;
+            return mask;
+        }
+        public static MessageReceipt Message(IntPtr hwnd, uint message, long w, long l, bool sent)
+        { return MessageTimeout(hwnd, message, w, l, sent, 5000); }
+        static MessageReceipt MessageTimeout(IntPtr hwnd, uint message, long w, long l, bool sent, uint timeout)
+        {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            int? modifiers = !sent && message == 0x100 && w == 0x78 ? (int?)AsyncModifiersAtPost() : null;
+            ClearError(0);
+            IntPtr result = IntPtr.Zero;
+            bool ok = sent ? SendMessageTimeoutW(hwnd, message, (IntPtr)w, (IntPtr)l,
+                0x23, timeout, out result) != IntPtr.Zero : PostMessageW(hwnd, message, (IntPtr)w, (IntPtr)l);
+            int error = ok ? 0 : Marshal.GetLastWin32Error();
+            return new MessageReceipt { Hwnd = hwnd.ToInt64(), Message = message,
+                Result = result.ToInt64(), Sent = sent, Success = ok, Error = error,
+                RequestedTimeoutMilliseconds = sent ? timeout : 0, FailedOrTimedOut = !ok,
+                AsyncModifierMaskAtPost = modifiers,
+                ElapsedMilliseconds = timer.Elapsed.TotalMilliseconds };
+        }
+        public static MessageReceipt CommandMessage(IntPtr hwnd, uint message, long w, long l)
+        { return MessageTimeout(hwnd, message, w, l, true, 15000); }
+        public static MessageReceipt SetFixtureQuery(IntPtr hwnd, string query)
+        {
+            IntPtr text = Marshal.StringToHGlobalUni(query);
+            try { return MessageTimeout(hwnd, 0xC, 0, text.ToInt64(), true, 15000); }
+            finally { Marshal.FreeHGlobal(text); }
+        }
+        public static string FixtureControlText(IntPtr hwnd)
+        {
+            var text = new StringBuilder(2048);
+            IntPtr result;
+            if (ReadControlText(hwnd, 0xD, (IntPtr)text.Capacity, text, 0x23, 5000, out result) == IntPtr.Zero)
+                throw new InvalidOperationException("Fixture control text timed out");
+            return text.ToString();
+        }
+        public sealed class WindowReceipt
+        {
+            public long Hwnd;
+            public int Pid, ControlId;
+            public uint Tid;
+            public string Class, Desktop;
+            public bool Exists, Visible, Enabled;
+        }
+        public static WindowReceipt Window(IntPtr hwnd)
+        {
+            int pid;
+            uint tid = GetWindowThreadProcessId(hwnd, out pid);
+            string desktop = "";
+            if (tid != 0) { try { desktop = ObjectName(GetThreadDesktop(tid)); } catch { desktop = "unavailable"; } }
+            return new WindowReceipt { Hwnd = hwnd.ToInt64(), Pid = pid, Tid = tid,
+                Class = ClassName(hwnd), Desktop = desktop, ControlId = GetDlgCtrlID(hwnd),
+                Exists = IsWindow(hwnd), Visible = IsWindowVisible(hwnd), Enabled = IsWindowEnabled(hwnd) };
+        }
+        public static WindowReceipt[] Windows(int pid)
+        {
+            var rows = new List<WindowReceipt>();
+            EnumWindows((hwnd, data) => {
+                int owner;
+                GetWindowThreadProcessId(hwnd, out owner);
+                if (owner == pid) {
+                    rows.Add(Window(hwnd));
+                    EnumChildWindows(hwnd, (child, unused) => { rows.Add(Window(child)); return true; }, IntPtr.Zero);
+                }
+                return true;
+            }, IntPtr.Zero);
+            return rows.ToArray();
+        }
         public static bool FullyClipped(IntPtr hwnd, IntPtr viewport)
         {
             Rect control, clip;
@@ -242,6 +347,8 @@ namespace Set91
         {
             public IntPtr Handle;
             public int Pid;
+            public uint FinalExitCode;
+            public bool WasTerminated;
             public uint ExitCode()
             {
                 uint code;
@@ -251,13 +358,17 @@ namespace Set91
             public void Dispose()
             {
                 if (Handle == IntPtr.Zero) return;
-                // This retained CreateProcess handle cannot be confused by PID reuse.
-                if (WaitForSingleObject(Handle, 0) == 258)
+                // Let job termination settle; retain exact ownership if cleanup fails.
+                uint wait = WaitForSingleObject(Handle, 5000);
+                if (wait == 258)
                 {
-                    if (!TerminateProcess(Handle, 1) || WaitForSingleObject(Handle, 5000) != 0)
+                    WasTerminated = TerminateProcess(Handle, 1);
+                    if (WaitForSingleObject(Handle, 5000) != 0)
                         throw new InvalidOperationException("Owned process termination failed");
                 }
-                CloseHandle(Handle);
+                else if (wait != 0) throw new InvalidOperationException("Owned process wait failed");
+                FinalExitCode = ExitCode();
+                if (!CloseHandle(Handle)) throw new InvalidOperationException("Owned process handle close failed");
                 Handle = IntPtr.Zero;
             }
         }
@@ -300,34 +411,131 @@ if ($CompileOnly) {
     'SET91 runner and native UIA client: compile-only PASS; runtime NOT RUN'
     return
 }
+if (-not $Run) { throw 'Runtime requires explicit -Run with verified portable stage parameters; use -CompileOnly otherwise.' }
 if (-not $PortableExe -or -not $OutputDirectory -or -not $ExpectedExeSha256) {
     throw 'PortableExe, ExpectedExeSha256 and a new OutputDirectory are required.'
 }
 function Write-Json([string] $Path, $Value) {
-    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding utf8
+    Write-SettingsOpenReceipt -Path $Path -Value $Value
 }
 function Assert-Contract([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
 }
+function Get-TraceSummary {
+    param([string] $Path, [AllowEmptyCollection()][string[]] $Lines, [AllowEmptyString()][string] $Text)
+    # Lines models complete records; Text models a possibly partial writer snapshot, without file access.
+    $inMemory = $PSBoundParameters.ContainsKey('Lines') -or $PSBoundParameters.ContainsKey('Text')
+    $summary = [ordered]@{ file = [IO.Path]::GetFileName($Path); exists = $inMemory -or [IO.File]::Exists($Path); rows = 0; invalidRows = 0; tags = @{}
+        pendingFinalLine = $false; readable = $false; records = [Collections.Generic.List[object]]::new() }
+    if (-not $summary.exists) { return $summary }
+    try {
+        if ($inMemory) {
+            if ($PSBoundParameters.ContainsKey('Lines')) { $Text = if ($Lines.Count) { ($Lines -join "`n") + "`n" } else { '' } }
+            $summary.bytes = [Text.Encoding]::UTF8.GetByteCount($Text)
+        } else {
+            # The product retains its writer handle. Read only the bounded length observed at open,
+            # sharing writes and atomic replacement/deletion; a subsequent poll takes a fresh snapshot.
+            $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $summary.bytes = $stream.Length
+                if ($summary.bytes -le 128KB) {
+                    $buffer = [byte[]]::new([int]$summary.bytes)
+                    $read = 0
+                    while ($read -lt $buffer.Length) {
+                        $count = $stream.Read($buffer, $read, $buffer.Length - $read)
+                        if ($count -eq 0) { break }
+                        $read += $count
+                    }
+                    $Text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                }
+            } finally { $stream.Dispose() }
+        }
+        if ($summary.bytes -gt 128KB) { $summary.reason = 'summary-size-limit; full trace retained'; return $summary }
+        $parsed = ConvertFrom-SettingsOpenTrace -Text $Text
+        foreach ($key in $parsed.Keys) { $summary[$key] = $parsed[$key] }
+    } catch { $summary.reason = 'trace-summary-unavailable; full trace retained' }
+    return $summary
+}
+function Save-Attempt {
+    param([switch] $UpdateIndex)
+    if ($null -eq $script:attempt) { return }
+    $script:attempt.elapsedMilliseconds = $script:attemptClock.Elapsed.TotalMilliseconds
+    $script:attempt.trace = Get-TraceSummary (Join-Path $OutputDirectory $script:attempt.traceFile)
+    Write-Json (Join-Path $OutputDirectory ('attempt-{0:D4}.json' -f $script:attempt.index)) $script:attempt
+    if ($UpdateIndex) {
+        # Compact index only at attempt completion/failure; individual receipts hold the complete stages.
+        $index = @(foreach ($item in $script:attempts) {
+            [ordered]@{ index = $item.index; pid = $item.pid; stage = $item.stage
+                receipt = ('attempt-{0:D4}.json' -f $item.index); elapsedMilliseconds = $item.elapsedMilliseconds }
+        })
+        Write-Json (Join-Path $OutputDirectory 'attempts.json') $index
+    }
+}
+function Add-Stage([string] $Stage, $Data) {
+    if ($null -eq $script:attempt) { return }
+    $script:attempt.stage = $Stage
+    $script:attempt.stages.Add([ordered]@{ stage = $Stage; utc = [DateTimeOffset]::UtcNow.ToString('o')
+        elapsedMilliseconds = $script:attemptClock.Elapsed.TotalMilliseconds; data = $Data })
+    Save-Attempt
+}
+function Save-Diagnostics([string] $Stage, [string] $Reason) {
+    if ($null -eq $script:attempt) { return }
+    # Preserve the first failing boundary when an outer case or cleanup also catches it.
+    if ($script:attempt.Contains('failureStage')) { return }
+    $script:attempt.failureStage = $Stage
+    $script:attempt.error = $Reason
+    if ($null -ne $script:openClock) { $script:attempt.openElapsedMilliseconds = $script:openClock.Elapsed.TotalMilliseconds }
+    $script:attempt.startup = Get-NewReadyAttempt -State (Read-StartupAttempt -Path $startupPath) -PreviousStartedAt $script:attempt.previousStartedAt
+    $rows = if ($script:process) { @([Set91.Native]::Windows($script:process.Pid)) } else { @() }
+    $script:attempt.windows = @($rows)
+    $script:attempt.wmNull = @(foreach ($window in $rows) {
+        if ($window.Class -in 'noctty.win32.host','noctty.win32','noctty.win32.settings') {
+            [Set91.Native]::Message([IntPtr]$window.Hwnd, 0, 0, 0, $true)
+        }
+    })
+    $script:attempt.settingsWindows = @($rows | Where-Object Class -eq 'noctty.win32.settings')
+    if ($script:process) {
+        $script:attempt.process = [ordered]@{ pid = $script:process.Pid; exitCode = $script:process.ExitCode()
+            waitResult = [Set91.Native]::WaitForSingleObject($script:process.Handle, 0) }
+    }
+    Add-Stage "failure-$Stage" ([ordered]@{ reason = $Reason })
+    Save-Attempt -UpdateIndex
+}
+function Get-WorkerProgressState([string] $Token, [string] $PreviousToken, [double] $ElapsedSeconds,
+        [double] $LastProgressSeconds, [double] $LimitSeconds = 300) {
+    if ($Token -cne $PreviousToken) { $LastProgressSeconds = $ElapsedSeconds }
+    return [ordered]@{ token = $Token; lastProgressSeconds = $LastProgressSeconds
+        idleSeconds = $ElapsedSeconds - $LastProgressSeconds
+        stalled = ($ElapsedSeconds - $LastProgressSeconds) -ge $LimitSeconds }
+}
 function Wait-For([scriptblock] $Read, [string] $Description, [int] $Seconds = 15) {
-    $end = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     do {
+        Assert-ClipboardGuard
         $value = & $Read
         $ready = if ($value -is [IntPtr]) { $value -ne [IntPtr]::Zero } else { [bool]$value }
-        if ($ready) { return $value }
+        if ($ready) { Add-Stage $Description ([ordered]@{ waitMilliseconds = $watch.Elapsed.TotalMilliseconds }); return $value }
         Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $end)
+    } while ($watch.Elapsed.TotalSeconds -lt $Seconds)
+    Save-Diagnostics $Description 'stage-timeout'
     throw "Timeout: $Description"
 }
 function Ctl([IntPtr] $Parent, [int] $Id) {
     $hwnd = [Set91.Native]::Child($Parent, $Id, '')
     Assert-Contract ($hwnd -ne [IntPtr]::Zero) "Missing fixture control $Id"
     [Set91.Native]::AssertDesktop($hwnd, $WorkerDesktop)
+    $identity = [Set91.Native]::Window($hwnd)
+    Assert-Contract ($identity.Pid -eq $script:process.Pid) 'Control owner mismatch.'
     return $hwnd
 }
-function Click([IntPtr] $Hwnd) { [void][Set91.Native]::Send($Hwnd, 0xF5, 0, 0) }
+function Click([IntPtr] $Hwnd) {
+    Assert-ClipboardGuard
+    [void][Set91.Native]::Send($Hwnd, 0xF5, 0, 0)
+}
 function Get-GuardSnapshot {
-    # Hash bytes without reading or printing history contents. Labels replace paths.
+    # Metadata only for the maintainer's noctty profile and history files.
+    # Shell jump-list hashes below remain a separate guard.
     $roam = [Environment]::GetFolderPath('ApplicationData')
     $local = [Environment]::GetFolderPath('LocalApplicationData')
     $docs = [Environment]::GetFolderPath('MyDocuments')
@@ -340,7 +548,7 @@ function Get-GuardSnapshot {
         $item = Get-Item -LiteralPath $paths[$label] -ErrorAction SilentlyContinue
         if ($item) {
             [ordered]@{ label = $label; exists = $true; bytes = $item.Length
-                mtime = $item.LastWriteTimeUtc.Ticks; sha256 = (Get-FileHash -LiteralPath $item.FullName).Hash }
+                mtime = $item.LastWriteTimeUtc.Ticks }
         } else { [ordered]@{ label = $label; exists = $false } }
     }
     $destinations = @(Get-ChildItem -LiteralPath (Join-Path $roam 'Microsoft/Windows/Recent/CustomDestinations') `
@@ -348,8 +556,18 @@ function Get-GuardSnapshot {
             [ordered]@{ name = $_.Name; bytes = $_.Length; mtime = $_.LastWriteTimeUtc.Ticks
                 sha256 = (Get-FileHash -LiteralPath $_.FullName).Hash }
         })
-    return [ordered]@{ clipboard = [Set91.Native]::GetClipboardSequenceNumber(); input = [Set91.Native]::ReadInput(); files = @($files)
+    return [ordered]@{ clipboard = [Set91.Native]::GetClipboardSequenceNumber(); files = @($files)
         destinations = $destinations }
+}
+function Assert-ClipboardGuard {
+    $sequence = [Set91.Native]::GetClipboardSequenceNumber()
+    if ($sequence -eq $script:clipboardBase) { return }
+    # Parent and worker can observe the same change: each owns its receipt.
+    $name = if ($WorkerDesktop) { 'clipboard-stop-worker.json' } else { 'clipboard-stop-parent.json' }
+    Write-Json (Join-Path $OutputDirectory $name) ([ordered]@{
+        utc = [DateTimeOffset]::UtcNow.ToString('o'); before = $script:clipboardBase; after = $sequence
+        action = 'STOP launches; no attribution; no clipboard contents accessed' })
+    throw "Clipboard sequence changed: STOP launches and report $name."
 }
 
 if (-not $WorkerDesktop) {
@@ -373,6 +591,9 @@ if (-not $WorkerDesktop) {
         'OutputDirectory must be outside the source stage.'
     [void](New-Item -ItemType Directory -Path $OutputDirectory)
     $before = Get-GuardSnapshot
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness (Split-Path -Leaf $PSCommandPath)
+    $historyFailure = $null
+    $script:clipboardBase = $before.clipboard
     Write-Json (Join-Path $OutputDirectory 'guard-before.json') $before
     $savedLocal = $env:LOCALAPPDATA
     $savedRoam = $env:APPDATA
@@ -381,6 +602,7 @@ if (-not $WorkerDesktop) {
     $worker = $null
     $failure = $null
     $workerCode = $null
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
     try {
         $copy = Join-Path $OutputDirectory 'portable'
         [void](New-Item -ItemType Directory -Path $copy)
@@ -398,21 +620,65 @@ if (-not $WorkerDesktop) {
         $desktopHandle = [Set91.Native]::CreateDesktopW($desktopName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
         Assert-Contract ($desktopHandle -ne [IntPtr]::Zero) 'CreateDesktop failed.'
         $job = [Set91.Native]::CreateJob()
-        $workerArgs = @('-NoProfile', '-NonInteractive', '-File', $PSCommandPath,
+        $workerArgs = @('-NoProfile', '-NonInteractive', '-File', $PSCommandPath, '-Run',
             '-PortableExe', $exe, '-ExpectedExeSha256', $ExpectedExeSha256,
-            '-OutputDirectory', $OutputDirectory, '-WorkerDesktop', $desktopName)
+            '-OutputDirectory', $OutputDirectory, '-WorkerDesktop', $desktopName,
+            '-ColdOpenCount', "$ColdOpenCount", '-ReloadCount', "$ReloadCount", '-Renderer', $Renderer)
+        if ($RequireTrace) { $workerArgs += '-RequireTrace' }
+        if ($RequireComboTrace) { $workerArgs += '-RequireComboTrace' }
+        if ($RawPostedF9) { $workerArgs += '-RawPostedF9' }
+        Assert-ClipboardGuard
         $worker = [Set91.Native]::Launch((Join-Path $PSHOME 'pwsh.exe'), $workerArgs, $desktopName, $OutputDirectory, $job)
-        Assert-Contract ([Set91.Native]::WaitForSingleObject($worker.Handle, 1200000) -eq 0) 'SET91 batch timed out.'
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $budgetSeconds = 1200 + 150 * ($ColdOpenCount + 2 * $ReloadCount)
+        $progressToken = ''
+        $lastProgressSeconds = 0.0
+        $nextProgressCheck = 0.0
+        while ([Set91.Native]::WaitForSingleObject($worker.Handle, 100) -ne 0) {
+            Assert-ClipboardGuard
+            if ($watch.Elapsed.TotalSeconds -ge $nextProgressCheck) {
+                $latestReceipt = Get-ChildItem -LiteralPath $OutputDirectory -Filter 'attempt-*.json' -File |
+                    Sort-Object LastWriteTimeUtc, Name -Descending | Select-Object -First 1
+                $token = if ($latestReceipt) {
+                    '{0}:{1}:{2}' -f $latestReceipt.Name, $latestReceipt.LastWriteTimeUtc.Ticks, $latestReceipt.Length
+                } else { '' }
+                $progress = Get-WorkerProgressState $token $progressToken $watch.Elapsed.TotalSeconds $lastProgressSeconds
+                $progressToken = $progress.token
+                $lastProgressSeconds = $progress.lastProgressSeconds
+                $nextProgressCheck = $watch.Elapsed.TotalSeconds + 1
+                if ($progress.stalled) {
+                    Write-Json (Join-Path $OutputDirectory 'worker-timeout.json') ([ordered]@{
+                        stage = 'worker-progress-timeout'; workerPid = $worker.Pid; exitCode = $worker.ExitCode()
+                        elapsedSeconds = $watch.Elapsed.TotalSeconds; noProgressSeconds = $progress.idleSeconds
+                        progressLimitSeconds = 300; latestReceipt = $(if ($latestReceipt) { $latestReceipt.Name } else { $null }) })
+                    throw 'SET91 worker made no receipt progress for 300 seconds; stop owned job and retain diagnostics.'
+                }
+            }
+            if ($watch.Elapsed.TotalSeconds -gt $budgetSeconds) {
+                Write-Json (Join-Path $OutputDirectory 'worker-timeout.json') ([ordered]@{
+                    stage = 'worker-deadline'; workerPid = $worker.Pid; exitCode = $worker.ExitCode()
+                    elapsedSeconds = $watch.Elapsed.TotalSeconds; budgetSeconds = $budgetSeconds })
+                throw 'SET91 worker timed out; last attempt receipts retained.'
+            }
+        }
         $workerCode = $worker.ExitCode()
     }
     catch { $failure = $_.Exception.Message }
     finally {
         # Kill the owned worker tree before taking the final real-profile snapshot.
-        if ($job -ne [IntPtr]::Zero) { [void][Set91.Native]::CloseHandle($job) }
-        if ($worker) { $worker.Dispose() }
-        if ($desktopHandle -ne [IntPtr]::Zero) { [void][Set91.Native]::CloseDesktop($desktopHandle) }
+        try {
+            if ($job -ne [IntPtr]::Zero -and -not [Set91.Native]::CloseHandle($job)) { throw 'Owned job close failed.' }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
+        try { if ($worker) { $worker.Dispose() } } catch { $cleanupErrors.Add($_.Exception.Message) }
+        try {
+            if ($desktopHandle -ne [IntPtr]::Zero -and -not [Set91.Native]::CloseDesktop($desktopHandle)) { throw 'Owned desktop close failed.' }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
         $env:LOCALAPPDATA = $savedLocal
         $env:APPDATA = $savedRoam
+        $guardPass = $false
+        $newDestinations = @()
+        $after = $null
+        try {
         $after = Get-GuardSnapshot
         Write-Json (Join-Path $OutputDirectory 'guard-after.json') $after
         # Other apps may refresh existing jump lists while the maintainer uses
@@ -422,26 +688,30 @@ if (-not $WorkerDesktop) {
         $newDestinations = @($after.destinations | Where-Object { $_.name -notin $beforeNames })
         $realBefore = @($before.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
         $realAfter = @($after.destinations | Where-Object name -eq 'c2214d6ebc43ff3f.customDestinations-ms')
-        $inputDuringBatch = [uint64]$after.input.IdleMilliseconds -le ([uint64]$after.input.TickCount - [uint64]$before.input.TickCount)
-        $clipboardChanged = $before.clipboard -ne $after.clipboard
-        $clipboardPass = -not $clipboardChanged -or $inputDuringBatch
+        $clipboardPass = $before.clipboard -eq $after.clipboard
         $guardPass = $clipboardPass -and $newDestinations.Count -eq 0 -and
             ($before.files | ConvertTo-Json -Depth 8 -Compress) -ceq ($after.files | ConvertTo-Json -Depth 8 -Compress) -and
             ($realBefore | ConvertTo-Json -Depth 8 -Compress) -ceq ($realAfter | ConvertTo-Json -Depth 8 -Compress)
+        } catch { $cleanupErrors.Add('Final guard snapshot: ' + $_.Exception.Message) }
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure = $_; $cleanupErrors.Add($_.Exception.Message) }
         Write-Json (Join-Path $OutputDirectory 'summary.json') ([ordered]@{
-            pass = ($null -eq $failure -and $workerCode -eq 0 -and $guardPass)
+            pass = ($null -eq $failure -and $workerCode -eq 0 -and $guardPass -and $cleanupErrors.Count -eq 0)
             workerExit = $workerCode; guardPass = $guardPass; error = $failure
-            clipboardBefore = $before.clipboard; clipboardAfter = $after.clipboard
-            inputBefore = $before.input; inputAfter = $after.input; inputDuringBatch = $inputDuringBatch
-            clipboardAttribution = $(if (!$clipboardChanged) { 'unchanged' } elseif ($inputDuringBatch) { 'unattributed maintainer activity' } else { 'changed during a batch with no input' })
-            executableSha256 = $ExpectedExeSha256
-            newDestinations = $newDestinations
+            cleanupErrors = @($cleanupErrors.ToArray())
+            openMode = $(if ($RawPostedF9) { 'raw-posted-f9' } else { 'host-command-palette' }); requireTrace = [bool]$RequireTrace
+            clipboardBefore = $before.clipboard; clipboardAfter = $(if ($after) { $after.clipboard } else { $null })
+            executableSha256 = $ExpectedExeSha256; renderer = $Renderer
+            newDestinations = $newDestinations; coldRequested = $ColdOpenCount; reloadRequested = $ReloadCount
         })
     }
+    if ($historyFailure) { throw $historyFailure }
+    Assert-Contract ($cleanupErrors.Count -eq 0) 'Cleanup or final guard receipt failed; inspect summary.json. Stop launches.'
     Assert-Contract $guardPass 'Real startup/history, shell destination metadata or clipboard sequence changed; stop launches and inspect guard artifacts.'
     Assert-Contract ($null -eq $failure) "Runner failed: $failure"
     Assert-Contract ($workerCode -eq 0) 'SET91 regression failed; inspect cases.json, per-control JSON and clipboard-activity.jsonl.'
-    'SET91 regression PASS (18 controls, 30 operation cases; guard metadata unchanged)'
+    if ($ColdOpenCount -gt 0 -or $ReloadCount -gt 0) {
+        "SETOPEN cohort PASS ($ColdOpenCount cold, $ReloadCount fresh-process reloads; guard metadata unchanged)"
+    } else { 'SET91 regression PASS (18 controls, 30 operation cases; guard metadata unchanged)' }
     return
 }
 
@@ -452,24 +722,16 @@ Assert-Contract ((Get-FileHash -LiteralPath $PortableExe).Hash -eq $ExpectedExeS
 Assert-Contract ($env:LOCALAPPDATA -eq (Join-Path $OutputDirectory 'local')) 'Worker LOCALAPPDATA mismatch.'
 Assert-Contract ($env:APPDATA -eq (Join-Path $OutputDirectory 'roam')) 'Worker APPDATA mismatch.'
 $fixture = Split-Path -Parent $PortableExe
+$paletteTitle = 'SETOPENSettingsOnly' + [guid]::NewGuid().ToString('N')
 $config = Join-Path $fixture 'config.ghostty'
-$clip = [Set91.Native]::GetClipboardSequenceNumber()
-$batchInput = [Set91.Native]::ReadInput()
-$clipObserved = $clip
-function Assert-ClipboardGuard {
-    $sequence = [Set91.Native]::GetClipboardSequenceNumber()
-    if ($sequence -eq $clip) { return }
-    $inputNow = [Set91.Native]::ReadInput()
-    $active = [uint64]$inputNow.IdleMilliseconds -le ([uint64]$inputNow.TickCount - [uint64]$batchInput.TickCount)
-    if ($sequence -ne $script:clipObserved) {
-        [ordered]@{ utc = [DateTimeOffset]::UtcNow.ToString('o'); before = $script:clipObserved; after = $sequence
-            inputBefore = $batchInput; inputNow = $inputNow
-            attribution = $(if ($active) { 'unattributed maintainer activity' } else { 'changed during a batch with no input' }) } |
-            ConvertTo-Json -Depth 5 -Compress | Add-Content (Join-Path $OutputDirectory 'clipboard-activity.jsonl')
-        $script:clipObserved = $sequence
-    }
-    Assert-Contract $active 'Clipboard changed during a batch with no input; stop launches and report.'
-}
+$script:clipboardBase = (Get-Content -LiteralPath (Join-Path $OutputDirectory 'guard-before.json') -Raw | ConvertFrom-Json).clipboard
+Assert-ClipboardGuard
+$startupPath = Join-Path $fixture 'startup-attempts.json'
+$attempt = $null
+$attempts = [Collections.Generic.List[object]]::new()
+$attemptClock = [Diagnostics.Stopwatch]::StartNew()
+$openClock = $null
+$surface = [IntPtr]::Zero
 $process = $null
 $settings = [IntPtr]::Zero
 $hostWindow = [IntPtr]::Zero
@@ -498,26 +760,162 @@ $cases = @(
 )
 function Start-Fixture {
     Assert-ClipboardGuard
+    Assert-Contract (-not $script:cleanupFailed -and $null -eq $script:process) 'Previous fixture has not cleanly exited; stop launches.'
+    $script:hostWindow = [IntPtr]::Zero
+    $script:surface = [IntPtr]::Zero
+    $script:settings = [IntPtr]::Zero
+    $script:openClock = $null
     $class = 'noctty-test-set91-' + [guid]::NewGuid().ToString('N')
-    $script:process = [Set91.Native]::Launch($PortableExe, @('--single-instance=false', "--class=$class"),
-        $WorkerDesktop, $fixture, [IntPtr]::Zero)
+    $tracePath = Join-Path $OutputDirectory ('settings-open-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+    $comboTracePath = Join-Path $OutputDirectory ('settings-combo-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+    $script:attemptClock.Restart()
+    $script:attempt = [ordered]@{ index = $attempts.Count + 1; pid = 0
+        desktop = $WorkerDesktop; traceFile = [IO.Path]::GetFileName($tracePath)
+        comboTraceFile = [IO.Path]::GetFileName($comboTracePath); previousStartedAt = $null
+        stage = 'baseline'; stages = [Collections.Generic.List[object]]::new(); f9 = @()
+        elapsedMilliseconds = 0; trace = $null; cleanup = $null; startup = $null }
+    $attempts.Add($script:attempt)
+    # A malformed baseline cannot be treated as an absent ledger: that could accept stale ready state.
+    $script:baseline = $null
+    [void](Wait-For {
+        $script:baseline = Read-StartupAttempt -Path $startupPath
+        $script:baseline.stage -in 'missing','empty','observed'
+    } 'startup-baseline')
+    if ($baseline.latest) { $script:attempt.previousStartedAt = $baseline.latest.started_at_unix_ms }
+    Add-Stage 'baseline-captured' $baseline
+    Assert-Contract (-not [IO.File]::Exists($tracePath)) 'Trace path must be NEW.'
+    Assert-Contract (-not [IO.File]::Exists($comboTracePath)) 'Combo trace path must be NEW.'
+    Assert-ClipboardGuard
+    $savedTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', 'Process')
+    $savedComboTrace = [Environment]::GetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $tracePath, 'Process')
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', $comboTracePath, 'Process')
+        Add-Stage 'launch-requested' $null
+        $script:process = [Set91.Native]::Launch($PortableExe,
+            @('--single-instance=false', "--class=$class", '--command=cmd.exe /d /q'),
+            $WorkerDesktop, $fixture, [IntPtr]::Zero)
+    } finally {
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_OPEN_TRACE', $savedTrace, 'Process')
+        [Environment]::SetEnvironmentVariable('NOCTTY_SETTINGS_COMBO_TRACE', $savedComboTrace, 'Process')
+    }
+    $script:attempt.pid = $process.Pid
+    Add-Stage 'launched' ([ordered]@{ pid = $process.Pid; priorityClass = 'BelowNormal'; exitCode = $process.ExitCode()
+        waitResult = [Set91.Native]::WaitForSingleObject($process.Handle, 0) })
+    [void](Wait-For {
+        $script:attempt.startup = Get-NewReadyAttempt -State (Read-StartupAttempt -Path $startupPath) `
+            -PreviousStartedAt $script:attempt.previousStartedAt
+        if ([Set91.Native]::WaitForSingleObject($process.Handle, 0) -eq 0) {
+            Save-Diagnostics 'startup-ready' 'process-exited-before-ready'
+            throw 'Fixture exited before startup readiness.'
+        }
+        $script:attempt.startup.ready
+    } 'startup-ready' 30)
     $script:hostWindow = Wait-For { [Set91.Native]::Top($process.Pid, 'noctty.win32.host') } 'host window' 30
     [Set91.Native]::AssertDesktop($hostWindow, $WorkerDesktop)
-    $surface = Wait-For { [Set91.Native]::Child($hostWindow, -1, 'noctty.win32') } 'terminal surface'
+    $script:surface = Wait-For { [Set91.Native]::Child($hostWindow, -1, 'noctty.win32') } 'terminal surface'
     [Set91.Native]::AssertDesktop($surface, $WorkerDesktop)
-    # Posted F9 only, never global input or text in a shell. Repost while startup settles.
-    $script:settings = Wait-For {
-        [void][Set91.Native]::PostMessageW($surface, 0x100, [IntPtr]0x78, [IntPtr]0x00430001)
-        [void][Set91.Native]::PostMessageW($surface, 0x101, [IntPtr]0x78, [IntPtr]0xC0430001)
-        [Set91.Native]::Top($process.Pid, 'noctty.win32.settings')
-    } 'Settings window'
+    $script:attempt.host = [Set91.Native]::Window($hostWindow)
+    $script:attempt.surface = [Set91.Native]::Window($surface)
+    Assert-Contract ($attempt.host.Pid -eq $process.Pid -and $attempt.surface.Pid -eq $process.Pid) 'Fixture window owner mismatch.'
+    Assert-ClipboardGuard
+    $script:openClock = [Diagnostics.Stopwatch]::StartNew()
+    if ($RawPostedF9) {
+    # Raw reproduction: exactly one pair, no retries, focus changes or keyboard-state mutation.
+    foreach ($stroke in @(@(0x100, 0x00430001L), @(0x101, 0xC0430001L))) {
+        $receipt = [Set91.Native]::Message($surface, $stroke[0], 0x78, $stroke[1], $false)
+        $script:attempt.f9 += $receipt
+        Add-Stage 'f9-post' $receipt
+        if (-not $receipt.Success) { Save-Diagnostics 'f9-post' 'PostMessage-failed'; throw 'F9 PostMessage failed.' }
+    }
+    } else {
+        Open-SettingsCommand
+    }
+    $script:settings = Wait-For { [Set91.Native]::Top($process.Pid, 'noctty.win32.settings') } 'Settings window'
+    $script:openClock.Stop()
+    $script:attempt.openElapsedMilliseconds = $script:openClock.Elapsed.TotalMilliseconds
     [Set91.Native]::AssertDesktop($settings, $WorkerDesktop)
+    $script:attempt.settingsWindow = [Set91.Native]::Window($settings)
+    Assert-Contract ($attempt.settingsWindow.Pid -eq $process.Pid) 'Settings owner mismatch.'
+    Add-Stage 'settings-visible' $attempt.settingsWindow
+    if ($RequireTrace) {
+        [void](Wait-For {
+            $trace = Get-TraceSummary $tracePath
+            $expectedFirst = if ($RawPostedF9) { @('f9_keydown','f9_before_core_initialized') } else { @('open_config_action') }
+            $trace.exists -and $trace.readable -and -not $trace.pendingFinalLine -and
+                $trace.invalidRows -eq 0 -and $trace.records.Count -gt 0 -and
+                $trace.records[0].stage -in $expectedFirst -and $trace.tags.ContainsKey('open_config_action') -and
+                $trace.tags.ContainsKey('settings_open_enter') -and $trace.tags.ContainsKey('settings_open_ok') -and
+                -not $trace.tags.ContainsKey('settings_open_error')
+        } 'product-trace')
+    }
     Assert-Contract ([Set91.Native]::SetWindowPos($settings, [IntPtr]::Zero, 0, 0, 1200, 800, 0x16)) `
         'Could not size Settings for viewport regression coverage.'
     Start-Sleep -Milliseconds 300
 }
+function Save-CommandReceipt([string] $Stage, $Receipt) {
+    $script:attempt.command += $Receipt
+    Add-Stage $Stage $Receipt
+    if (-not $Receipt.Success) {
+        $script:cleanupFailed = $true
+        Save-Diagnostics $Stage 'command-send-failed-or-timeout'
+        throw 'Settings command failed; stop launches and inspect receipt.'
+    }
+}
+function Open-SettingsCommand {
+    # Existing host command -> configured palette action. No keyboard messages/state or IPC.
+    $script:attempt.command = @()
+    [Set91.Native]::AssertDesktop([IntPtr]::Zero, $WorkerDesktop)
+    [Set91.Native]::AssertDesktop($hostWindow, $WorkerDesktop)
+    $hostIdentity = [Set91.Native]::Window($hostWindow)
+    Assert-Contract ($hostIdentity.Exists -and $hostIdentity.Pid -eq $process.Pid -and
+        $hostIdentity.Class -eq 'noctty.win32.host' -and $hostIdentity.Desktop -eq $WorkerDesktop -and
+        [Set91.Native]::WaitForSingleObject($process.Handle, 0) -ne 0) 'Settings command host identity mismatch.'
+    Assert-ClipboardGuard
+    Add-Stage 'palette-open-requested' $hostIdentity
+    Save-CommandReceipt 'palette-open-command' ([Set91.Native]::CommandMessage($hostWindow, 0x111, 1901, 0))
+    [void](Wait-For {
+        $editWindow = [Set91.Native]::Child($hostWindow, 2002, '')
+        $editWindow -ne [IntPtr]::Zero -and [Set91.Native]::IsWindowVisible($editWindow)
+    } 'palette-query-visible')
+    $edit = Ctl $hostWindow 2002
+    $label = Ctl $hostWindow 2001
+    $hint = Ctl $hostWindow 2005
+    $accept = Ctl $hostWindow 2003
+    Assert-Contract (([Set91.Native]::Window($edit)).Class -eq 'Edit' -and
+        ([Set91.Native]::Window($label)).Class -eq 'Static' -and
+        ([Set91.Native]::Window($hint)).Class -eq 'Static' -and
+        ([Set91.Native]::Window($accept)).Class -eq 'Button') 'Palette control class mismatch.'
+    $script:attempt.paletteControls = @([Set91.Native]::Window($edit), [Set91.Native]::Window($label),
+        [Set91.Native]::Window($hint), [Set91.Native]::Window($accept))
+    # Restrict to actions and query our unique configured title. A missing row cannot parse as an action.
+    $query = '> ' + $paletteTitle
+    Assert-ClipboardGuard
+    Save-CommandReceipt 'palette-query-set' ([Set91.Native]::SetFixtureQuery($edit, $query))
+    [void](Wait-For {
+        try {
+        $queryMatches = [Set91.Native]::FixtureControlText($edit) -ceq $query
+        $labelText = [Set91.Native]::FixtureControlText($label)
+        $singleMatch = $labelText -ceq 'Command 1'
+        $feedback = [Set91.Native]::FixtureControlText($hint)
+        $selected = $feedback.StartsWith($paletteTitle + ' — ', [StringComparison]::Ordinal) -or
+            $feedback.StartsWith($paletteTitle + '. Enter activates;', [StringComparison]::Ordinal)
+        $script:attempt.paletteSelection = [ordered]@{ queryMatches = $queryMatches; singleMatch = $singleMatch
+            selectedFixtureTitle = $selected; label = $labelText; feedback = $feedback
+            acceptVisible = [Set91.Native]::IsWindowVisible($accept); acceptEnabled = [Set91.Native]::IsWindowEnabled($accept) }
+        $queryMatches -and $singleMatch -and $selected -and $feedback.Contains('Enter activates; Escape closes.') -and
+            [Set91.Native]::IsWindowEnabled($accept)
+        } catch { Save-Diagnostics 'palette-selection-readback' 'bounded-control-read-failed'; throw }
+    } 'palette-exact-action-selected')
+    Add-Stage 'palette-action-verified' ([ordered]@{ queryMatches = $true; matchCount = 1; selectedConfiguredOpenConfig = $true })
+    Assert-ClipboardGuard
+    # Palette mode hides this generic accept button. Its existing, identity-checked
+    # WM_COMMAND handler still submits the verified selected action without keys.
+    Save-CommandReceipt 'palette-accept-command' ([Set91.Native]::CommandMessage($hostWindow, 0x111, 2003, $accept.ToInt64()))
+}
 function Stop-Fixture {
     if (-not $script:process) { return }
+    $closeError = $null
     try {
         if ([Set91.Native]::IsWindow($settings)) {
             [void][Set91.Native]::Send($settings, 0x10, 0, 0)
@@ -527,8 +925,10 @@ function Stop-Fixture {
         if ([Set91.Native]::IsWindow($hostWindow)) {
             [void][Set91.Native]::PostMessageW($hostWindow, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
             [void](Wait-For {
-                [Set91.Native]::WaitForSingleObject($process.Handle, 0) -eq 0 -or
-                    [Set91.Native]::Child($hostWindow, 2003, '') -ne [IntPtr]::Zero
+                if ([Set91.Native]::WaitForSingleObject($process.Handle, 0) -eq 0) { return $true }
+                $candidate = [Set91.Native]::Child($hostWindow, 2003, '')
+                $candidate -ne [IntPtr]::Zero -and [Set91.Native]::IsWindowVisible($candidate) -and
+                    [Set91.Native]::IsCloseButton($candidate)
             } 'fixture close or confirmation')
             # The Close confirmation case can have saved true/always. Accept only
             # this exact Close button after our WM_CLOSE, never another prompt.
@@ -540,11 +940,28 @@ function Stop-Fixture {
             }
         }
         if ([Set91.Native]::WaitForSingleObject($process.Handle, 5000) -ne 0) {
-            $script:cleanupFailed = $true
             throw 'Fixture required forced termination; stop launches to avoid recovery-state contamination.'
         }
+        Assert-Contract ($process.ExitCode() -eq 0 -and -not [Set91.Native]::IsWindow($hostWindow)) 'Fixture exit was not clean.'
+        Add-Stage 'exited' ([ordered]@{ pid = $process.Pid; exitCode = $process.ExitCode(); hostExists = [Set91.Native]::IsWindow($hostWindow) })
     }
-    finally { $script:process.Dispose(); $script:process = $null }
+    catch {
+        $closeError = $_.Exception.Message
+        $script:cleanupFailed = $true
+        Save-Diagnostics 'cleanup' $closeError
+    }
+    finally {
+        $owned = $script:process
+        try { $owned.Dispose() }
+        catch { $script:cleanupFailed = $true; $closeError = 'Owned handle cleanup failed: ' + $_.Exception.Message }
+        finally {
+            $script:attempt.cleanup = [ordered]@{ error = $closeError; finalExitCode = $owned.FinalExitCode
+                terminated = $owned.WasTerminated; handleClosed = $owned.Handle -eq [IntPtr]::Zero }
+            Save-Attempt -UpdateIndex
+            if ($owned.Handle -eq [IntPtr]::Zero) { $script:process = $null }
+        }
+    }
+    if ($closeError) { throw $closeError }
 }
 function Select-Case($Case, [string] $Phase) {
     Click (Ctl $settings $Case[0])
@@ -573,17 +990,152 @@ function Probe-Control($Case, [IntPtr] $Hwnd, [string] $Phase, [bool] $ExerciseC
         '-Desktop', $WorkerDesktop, '-Kind', $Case[2], '-ExpectedName', $Case[3], '-OutputPath', $path)
     if ($ExerciseControl) { $clientArgs += '-Exercise' }
     if ($Phase.EndsWith('-selection')) { $clientArgs += '-UseSelectionItem' }
+    Assert-ClipboardGuard
     $probe = [Set91.Native]::Launch((Join-Path $PSHOME 'pwsh.exe'), $clientArgs, $WorkerDesktop, $OutputDirectory, [IntPtr]::Zero)
     try {
-        Assert-Contract ([Set91.Native]::WaitForSingleObject($probe.Handle, 45000) -eq 0) 'UIA client timed out.'
+        if ([Set91.Native]::WaitForSingleObject($probe.Handle, 45000) -ne 0) {
+            Save-Diagnostics 'uia-client' 'UIA-client-timeout'
+            throw 'UIA client timed out.'
+        }
         Assert-Contract (Test-Path -LiteralPath $path) 'UIA client produced no result.'
         $observed = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        if ($Case[2] -eq 'ComboBox' -and $ExerciseControl) {
+            $nativePath = Join-Path $OutputDirectory $script:attempt.comboTraceFile
+            $messages = [Collections.Generic.List[object]]::new()
+            $malformedLines = 0
+            $pendingFinalLine = $false
+            $readError = $null
+            if (Test-Path -LiteralPath $nativePath) {
+                try {
+                    # Match the open-trace reader: the product retains a writer.
+                    # Snapshot only the bounded length seen at open, not future appends.
+                    $stream = [IO.FileStream]::new($nativePath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                    try {
+                        Assert-Contract ($stream.Length -le 192KB) 'Combo trace exceeds its record bound.'
+                        $buffer = [byte[]]::new([int]$stream.Length)
+                        $read = 0
+                        while ($read -lt $buffer.Length) {
+                            $count = $stream.Read($buffer, $read, $buffer.Length - $read)
+                            if ($count -eq 0) { break }
+                            $read += $count
+                        }
+                        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                    } finally { $stream.Dispose() }
+                    $pendingFinalLine = $text.Length -gt 0 -and -not $text.EndsWith("`n")
+                    $lines = $text.Split("`n")
+                    for ($i = 0; $i -lt $lines.Length - 1; $i++) {
+                        try {
+                            $entry = $lines[$i] | ConvertFrom-Json -ErrorAction Stop
+                            if ($entry.control_id -eq $Case[1]) { $messages.Add($entry) }
+                        } catch { $malformedLines++ }
+                    }
+                } catch { $readError = '{0}:0x{1:X8}' -f $_.Exception.GetType().Name, $_.Exception.HResult }
+            }
+            $observed | Add-Member -NotePropertyName nativeTraceFile -NotePropertyValue $script:attempt.comboTraceFile
+            $observed | Add-Member -NotePropertyName nativeDropdownMessages -NotePropertyValue @($messages.ToArray())
+            $observed | Add-Member -NotePropertyName nativeTraceMalformedLines -NotePropertyValue $malformedLines
+            $observed | Add-Member -NotePropertyName nativeTracePendingFinalLine -NotePropertyValue $pendingFinalLine
+            $observed | Add-Member -NotePropertyName nativeTraceReadError -NotePropertyValue $readError
+            Write-Json $path $observed
+            if ($RequireComboTrace -and $observed.pass) {
+                Assert-Contract (Test-Path -LiteralPath $nativePath) 'Required native combo trace is missing.'
+                Assert-Contract ($null -eq $readError) 'Required native combo trace is unreadable.'
+            }
+            if ($RequireComboTrace -and $observed.pass -and $observed.enabled) {
+                $expansions = @($observed.expansions)
+                Assert-Contract ($expansions.Count -eq 2) 'Successful combo operation must record both expansions.'
+                foreach ($expansion in $expansions) {
+                    # Each Expand has its own clock interval; a complete first
+                    # pair cannot stand in for a missing second expansion.
+                    $inAttempt = @($messages | Where-Object {
+                        $_.tick_ms -ge $expansion.before.tick_ms -and $_.tick_ms -le $expansion.returnTickMs
+                    })
+                    $received = @($inAttempt | Where-Object { $_.stage -eq 'show_received' -and $_.show })
+                    $returned = @($inAttempt | Where-Object { $_.stage -eq 'show_returned' -and $_.show })
+                    Assert-Contract ($received.Count -eq 1 -and $returned.Count -eq 1 -and
+                        $received[0].tick_ms -le $returned[0].tick_ms -and
+                        [Array]::IndexOf($inAttempt, $received[0]) -lt [Array]::IndexOf($inAttempt, $returned[0])) 'Successful combo expansion has no complete native dropdown trace in its interval.'
+                }
+            }
+        }
         Assert-Contract (($probe.ExitCode() -eq 0) -eq [bool]$observed.pass) 'Client exit/result mismatch.'
         return $observed
     }
     finally { $probe.Dispose() }
 }
+function Write-Seed([string] $Notifications = 'no-clipboard-copy,no-config-reload', [bool] $Trim = $false) {
+    Assert-ClipboardGuard
+    Assert-Contract ($null -eq $script:process -and -not $cleanupFailed) 'Cannot seed a live or unclean fixture.'
+    $seed = @('# SET91 unrelated sentinel must survive byte-for-byte', 'font-size = 12',
+        'command = cmd.exe /d /q', "renderer = $Renderer", 'window-save-state = never',
+        'confirm-close-surface = false', 'auto-update = off', 'auto-update-channel = tip',
+        'desktop-notifications = false', "app-notifications = $Notifications",
+        'copy-on-select = false', 'clipboard-read = deny', 'clipboard-write = deny',
+        'windows-job-object-kill-on-close = true', 'keybind = f9=open_config',
+        'command-palette-entry =', "command-palette-entry = title:$paletteTitle,action:open_config",
+        ('clipboard-trim-trailing-spaces = ' + $Trim.ToString().ToLowerInvariant())) -join "`n"
+    [IO.File]::WriteAllText($config, $seed + "`n", [Text.UTF8Encoding]::new($false))
+}
+function Assert-Sentinel {
+    $saved = [IO.File]::ReadAllText($config)
+    Assert-Contract ($saved.Contains("# SET91 unrelated sentinel must survive byte-for-byte`nfont-size = 12`n")) 'Save damaged unrelated sentinel.'
+    return $saved
+}
+function Invoke-CohortCase([string] $Kind, [int] $Index) {
+    $record = [ordered]@{ id = "$Kind-$Index"; kind = $Kind; pass = $false; attemptIndices = @() }
+    try {
+        $initial = ($Index % 2) -eq 0
+        Write-Seed -Trim $initial
+        Start-Fixture
+        $record.attemptIndices += $attempt.index
+        if ($Kind -eq 'reload') {
+            Click (Ctl $settings 202)
+            $trim = Ctl $settings 407
+            $save = Ctl $settings 301
+            Assert-Contract ([Set91.Native]::Send($trim, 0xF0, 0, 0) -eq [int]$initial) 'Seed trim checkbox differs.'
+            Assert-Contract (-not [Set91.Native]::IsWindowEnabled($save)) 'Reload fixture starts dirty.'
+            $beforeHash = (Get-FileHash -LiteralPath $config).Hash
+            Click $trim
+            Assert-Contract ([Set91.Native]::Send($trim, 0xF0, 0, 0) -eq [int](-not $initial)) 'Trim checkbox did not toggle.'
+            Assert-Contract ([Set91.Native]::IsWindowEnabled($save)) 'Trim click did not dirty config.'
+            Click $save
+            [void](Wait-For { -not [Set91.Native]::IsWindowEnabled($save) } 'cohort-save')
+            $saved = Assert-Sentinel
+            $expected = (-not $initial).ToString().ToLowerInvariant()
+            Assert-Contract ($saved -match "(?m)^clipboard-trim-trailing-spaces\s*=\s*$expected\s*$") 'Saved trim config differs.'
+            $record.savedSha256 = (Get-FileHash -LiteralPath $config).Hash
+            Assert-Contract ($record.savedSha256 -ne $beforeHash) 'Save did not change config.'
+            Stop-Fixture
+            Start-Fixture
+            $record.attemptIndices += $attempt.index
+            Click (Ctl $settings 202)
+            Assert-Contract ([Set91.Native]::Send((Ctl $settings 407), 0xF0, 0, 0) -eq [int](-not $initial)) 'Fresh-process trim state differs.'
+            [void](Assert-Sentinel)
+            Assert-Contract ((Get-FileHash -LiteralPath $config).Hash -eq $record.savedSha256) 'Fresh-process load changed config.'
+        }
+        Stop-Fixture
+        $record.pass = $true
+    }
+    catch {
+        $record.error = $_.Exception.Message
+        Save-Diagnostics 'cohort-case' $record.error
+        throw
+    }
+    finally {
+        try { Stop-Fixture } catch { $record.pass = $false; $record.cleanupError = $_.Exception.Message; throw }
+        finally {
+            $results.Add($record)
+            Write-Json (Join-Path $OutputDirectory 'cases.json') @($results.ToArray())
+        }
+    }
+}
+$cohortMode = $ColdOpenCount -gt 0 -or $ReloadCount -gt 0
 try {
+    if ($cohortMode) {
+        for ($i = 1; $i -le $ColdOpenCount; $i++) { Invoke-CohortCase 'cold' $i }
+        for ($i = 1; $i -le $ReloadCount; $i++) { Invoke-CohortCase 'reload' $i }
+    } else {
     foreach ($selectionMode in @($false, $true)) {
     foreach ($case in $cases) {
         if ($selectionMode -and $case[2] -ne 'ComboBox') { continue }
@@ -594,13 +1146,7 @@ try {
             # Start the config-reload checkbox ON so its tested toggle turns notifications OFF
             # before Save; Settings save otherwise invokes a system toast even on a hidden desktop.
             $notifications = if ($case[1] -eq 419) { 'no-clipboard-copy,config-reload' } else { 'no-clipboard-copy,no-config-reload' }
-            $seed = @('# SET91 unrelated sentinel must survive byte-for-byte', 'font-size = 12',
-                'command = cmd.exe /d /q', 'renderer = d3d11', 'window-save-state = never',
-                'confirm-close-surface = false', 'auto-update = off', 'auto-update-channel = tip',
-                'desktop-notifications = false', "app-notifications = $notifications",
-                'copy-on-select = false', 'clipboard-read = deny', 'clipboard-write = deny',
-                'windows-job-object-kill-on-close = true', 'keybind = f9=open_config') -join "`n"
-            [IO.File]::WriteAllText($config, $seed + "`n", [Text.UTF8Encoding]::new($false))
+            Write-Seed -Notifications $notifications
             Start-Fixture
             $hwnd = Select-Case $case "exercise-$phase"
             $save = Ctl $settings 301
@@ -642,7 +1188,7 @@ try {
             }
             $record.pass = $true
         }
-        catch { $record.error = $_.Exception.Message }
+        catch { $record.error = $_.Exception.Message; Save-Diagnostics 'uia-case' $record.error }
         finally {
             try { Stop-Fixture } catch { $record.pass = $false; $record.cleanupError = $_.Exception.Message }
             $results.Add($record)
@@ -652,17 +1198,25 @@ try {
         Assert-Contract (-not $cleanupFailed) 'Cleanup failed; stop batch and inspect the retained fixture.'
     }
     }
+    }
 }
 finally {
     try { Stop-Fixture }
     finally {
         Write-Json (Join-Path $OutputDirectory 'coverage.json') ([ordered]@{
-            expectedControls = $cases.Count; expectedCases = $cases.Count + 12
-            completedControls = @($results.id | Sort-Object -Unique).Count
+            mode = $(if ($cohortMode) { 'cohort' } else { 'uia' })
+            expectedControls = $(if ($cohortMode) { 0 } else { $cases.Count })
+            expectedCases = $(if ($cohortMode) { $ColdOpenCount + $ReloadCount } else { $cases.Count + 12 })
+            completedControls = @($results | ForEach-Object { $_.id } | Sort-Object -Unique).Count
             completedCases = $results.Count; passedCases = @($results | Where-Object { $_.pass }).Count
-            clippedFieldChecks = $clippedChecks
+            clippedFieldChecks = $clippedChecks; launches = $attempts.Count
         })
     }
 }
 Assert-Contract (@($results | Where-Object { -not $_.pass }).Count -eq 0) 'One or more SET91 cases failed.'
-Assert-Contract ($clippedChecks -gt 0) 'No fully clipped field was observed; clipping coverage is missing.'
+if (-not $cohortMode) {
+    Assert-Contract ($results.Count -eq 30) 'Default UIA case coverage is incomplete.'
+    Assert-Contract ($clippedChecks -gt 0) 'No fully clipped field was observed; clipping coverage is missing.'
+} else {
+    Assert-Contract ($results.Count -eq $ColdOpenCount + $ReloadCount) 'Cohort coverage is incomplete.'
+}

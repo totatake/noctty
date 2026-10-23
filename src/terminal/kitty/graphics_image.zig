@@ -164,7 +164,7 @@ pub const LoadingImage = struct {
         const expected_size: usize = switch (self.image.format) {
             // Png we decode the full data size because later decoding will
             // get the proper dimensions and assert validity.
-            .png => stat_size,
+            .png, .jpeg => stat_size,
 
             // For these formats we have a size we must have.
             .gray, .gray_alpha, .rgb, .rgba => |f| size: {
@@ -347,8 +347,12 @@ pub const LoadingImage = struct {
         // Decompress the data if it is compressed.
         try self.decompress(alloc);
 
-        // Decode the png if we have to
-        if (img.format == .png) try self.decodePng(alloc);
+        // Decode compressed image formats if we have to
+        switch (img.format) {
+            .png => try self.decodePng(alloc),
+            .jpeg => try self.decodeJpeg(alloc),
+            .gray, .gray_alpha, .rgb, .rgba => {},
+        }
 
         // Validate our dimensions.
         if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
@@ -414,22 +418,23 @@ pub const LoadingImage = struct {
     }
 
     fn decompressZlib(self: *LoadingImage, alloc: Allocator) !void {
-        // Open our zlib stream
-        var buf: [std.compress.flate.max_window_len]u8 = undefined;
-        var reader: std.Io.Reader = .fixed(self.data.items);
-        var stream: std.compress.flate.Decompress = .init(&reader, .zlib, &buf);
-
-        // Write it to an array list
-        var list: std.ArrayList(u8) = .empty;
-        errdefer list.deinit(alloc);
-        stream.reader.appendRemaining(alloc, &list, .limited(max_size)) catch {
-            log.warn("failed to read decompressed data: {?}", .{stream.err});
+        // Use the WUFFS zlib decoder rather than std.compress.flate. Every
+        // crash dump from high-frequency `o=z` streaming (termway video)
+        // faulted on the io-reader thread inside the std flate bit reader
+        // with a wild decompressor pointer, before and after the placement
+        // pin fixes. WUFFS is already linked for PNG and is memory safe.
+        const result = wuffs.zlib.decompress(
+            alloc,
+            self.data.items,
+            max_size,
+        ) catch |err| {
+            log.warn("failed to decompress image data err={}", .{err});
             return error.DecompressionFailed;
         };
 
-        // Empty our current data list, take ownership over managed array list
+        // Replace our compressed data with the decompressed data
         self.data.deinit(alloc);
-        self.data = .{ .items = list.items, .capacity = list.capacity };
+        self.data = .{ .items = result, .capacity = result.len };
 
         // Make sure we note that our image is no longer compressed
         self.image.compression = .none;
@@ -459,6 +464,35 @@ pub const LoadingImage = struct {
         self.data = .{};
         try self.data.ensureUnusedCapacity(alloc, result.data.len);
         try self.data.appendSlice(alloc, result.data[0..result.data.len]);
+
+        // Store updated image dimensions
+        self.image.width = result.width;
+        self.image.height = result.height;
+        self.image.format = .rgba;
+    }
+
+    /// Decode the data as JPEG. This will also update the image dimensions.
+    fn decodeJpeg(self: *LoadingImage, alloc: Allocator) !void {
+        assert(self.image.format == .jpeg);
+
+        const result = wuffs.jpeg.decode(
+            alloc,
+            self.data.items,
+        ) catch |err| switch (err) {
+            error.WuffsError => return error.InvalidData,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Overflow => return error.InvalidData,
+        };
+        errdefer alloc.free(result.data);
+
+        if (result.data.len > max_size) {
+            log.warn("jpeg image too large size={} max_size={}", .{ result.data.len, max_size });
+            return error.InvalidData;
+        }
+
+        // Replace our compressed JPEG bytes with the decoded RGBA buffer.
+        self.data.deinit(alloc);
+        self.data = .{ .items = result.data, .capacity = result.data.len };
 
         // Store updated image dimensions
         self.image.width = result.width;
@@ -901,5 +935,105 @@ test "image load: png, not compressed, regular file" {
     defer img.deinit(alloc);
     try testing.expect(img.compression == .none);
     try testing.expect(img.format == .rgba);
+    try tmp_dir.dir.access(path, .{});
+}
+
+const test_jpeg_1x1_black = [_]u8{
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
+    0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+    0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27, 0x20,
+    0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1f, 0x27,
+    0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xff, 0xc4, 0x00, 0x14,
+    0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x3f, 0xbf, 0xff, 0xd9,
+};
+
+test "image load: jpeg, not compressed, direct" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .jpeg,
+            .medium = .direct,
+            .compression = .none,
+            .width = 0,
+            .height = 0,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, &test_jpeg_1x1_black),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(alloc, &cmd);
+    defer loading.deinit(alloc);
+    var img = try loading.complete(alloc);
+    defer img.deinit(alloc);
+
+    try testing.expectEqual(command.Transmission.Compression.none, img.compression);
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+    try testing.expectEqual(@as(u32, 1), img.width);
+    try testing.expectEqual(@as(u32, 1), img.height);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, img.data);
+}
+
+test "image load: jpeg, corrupt data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .jpeg,
+            .medium = .direct,
+            .compression = .none,
+            .width = 0,
+            .height = 0,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, "not a jpeg file at all"),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(alloc, &cmd);
+    defer loading.deinit(alloc);
+    try testing.expectError(error.InvalidData, loading.complete(alloc));
+}
+
+test "image load: jpeg, not compressed, regular file" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "test_image.jpg",
+        .data = &test_jpeg_1x1_black,
+    });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("test_image.jpg", &buf);
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .jpeg,
+            .medium = .file,
+            .compression = .none,
+            .width = 0,
+            .height = 0,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+    defer cmd.deinit(alloc);
+    var loading = try LoadingImage.init(alloc, &cmd);
+    defer loading.deinit(alloc);
+    var img = try loading.complete(alloc);
+    defer img.deinit(alloc);
+    try testing.expectEqual(command.Transmission.Compression.none, img.compression);
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+    try testing.expectEqual(@as(u32, 1), img.width);
+    try testing.expectEqual(@as(u32, 1), img.height);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, img.data);
     try tmp_dir.dir.access(path, .{});
 }

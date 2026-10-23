@@ -250,7 +250,6 @@ function Get-ZigFixtureProblems {
                 [Text.RegularExpressions.RegexOptions]::RightToLeft)
             [pscustomobject]@{
                 Name = $header.Groups['name'].Value
-                Total = [int]$header.Groups['total'].Value
                 Outcome = if ($outcome.Success) { $outcome.Groups['outcome'].Value } else { 'UNFINISHED' }
                 Detail = ($rest -split '\r?\n' | Select-Object -First 25) -join "`n"
             }
@@ -260,19 +259,16 @@ function Get-ZigFixtureProblems {
     # named ones are `<path>.test.<name>`.
     $namedTests = @($tests | Where-Object { $_.Name -notmatch '\.test_\d+$' })
     $filters = @($Fixtures | ForEach-Object { $_.Filter })
+    $matchesAnyFilter = { param([string] $Name) @($filters | Where-Object { $Name.Contains($_, [StringComparison]::Ordinal) }).Count -gt 0 }
 
     if ($tests.Count -eq 0) {
         $problems.Add('The Zig test executable listed no tests; it ran nothing or its output was not captured.')
     }
-    elseif ($tests[$tests.Count - 1].Total -ne $tests.Count -and $ExitCode -eq 0) {
-        $problems.Add("The Zig test executable announced $($tests[$tests.Count - 1].Total) tests but listed $($tests.Count).")
+    elseif ($runTotal -ne $tests.Count -and $ExitCode -eq 0) {
+        $problems.Add("The Zig test executable announced $runTotal tests but listed $($tests.Count).")
     }
     foreach ($test in $namedTests) {
-        $matchesAFilter = $false
-        foreach ($filter in $filters) {
-            if ($test.Name.Contains($filter, [StringComparison]::Ordinal)) { $matchesAFilter = $true; break }
-        }
-        if (-not $matchesAFilter) {
+        if (-not (& $matchesAnyFilter $test.Name)) {
             $problems.Add(
                 "Test '$($test.Name)' ran although it matches none of the fixture filters; the batch did not run the filtered build."
             )
@@ -307,11 +303,7 @@ function Get-ZigFixtureProblems {
     # Any failing test fails the run, including the unnamed ones no filter
     # claims and a leak, which the runner reports only through its exit code.
     if ($ExitCode -ne 0) {
-        $unattributed = @($tests | Where-Object {
-            $test = $_
-            $_.Outcome -ceq 'FAIL' -and
-                -not @($filters | Where-Object { $test.Name.Contains($_, [StringComparison]::Ordinal) }).Count
-        })
+        $unattributed = @($tests | Where-Object { $_.Outcome -ceq 'FAIL' -and -not (& $matchesAnyFilter $_.Name) })
         $unfinished = @($tests | Where-Object { $_.Outcome -ceq 'UNFINISHED' })
         $reason = if ($unattributed.Count -gt 0) {
             "failed: $($unattributed.Name -join ', ')`n$($unattributed[0].Detail)"
@@ -895,6 +887,106 @@ function Get-PowerShellBlockText {
     }, $true))
     if ($blocks.Count -ne 1) { throw "Expected exactly one PowerShell block for '$HeaderPattern'; found $($blocks.Count)." }
     $blocks[0].Extent.Text
+}
+
+function Get-HistoryGuardedScriptBody {
+    param(
+        [Parameter(Mandatory)] [System.Management.Automation.Language.ScriptBlockAst] $Ast,
+        [Parameter(Mandatory)] [string] $Harness
+    )
+
+    # Unwrap only the metadata guard's root envelope. All original ownership
+    # checks must still compare direct children of this one effective body.
+    $rootStatements = @($Ast.EndBlock.Statements)
+    $rootTries = @($rootStatements | Where-Object {
+        $_ -is [System.Management.Automation.Language.TryStatementAst]
+    })
+    if ($null -ne $Ast.BeginBlock -or $null -ne $Ast.ProcessBlock -or
+        $null -ne $Ast.CleanBlock -or $null -ne $Ast.DynamicParamBlock -or
+        $Ast.EndBlock.Unnamed -ne $true -or
+        ($null -ne $Ast.EndBlock.Traps -and $Ast.EndBlock.Traps.Count -ne 0) -or
+        $rootStatements.Count -ne 3 -or $rootTries.Count -ne 1 -or
+        -not [object]::ReferenceEquals($rootTries[0], $rootStatements[2])) {
+        throw "$Harness must own exactly one outer root history-guard try after its import and start guard."
+    }
+
+    $import = $rootStatements[0]
+    if ($import -isnot [System.Management.Automation.Language.PipelineAst] -or
+        $import.Background -or $import.PipelineElements.Count -ne 1 -or
+        $import.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+        throw "$Harness must import the history guard directly at the root."
+    }
+    $importCommand = $import.PipelineElements[0]
+    if ($importCommand.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Dot -or
+        $importCommand.Redirections.Count -ne 0 -or $importCommand.CommandElements.Count -ne 1 -or
+        $importCommand.CommandElements[0] -isnot [System.Management.Automation.Language.ParenExpressionAst]) {
+        throw "$Harness must dot-source the history guard directly at the root."
+    }
+    $importPath = $importCommand.CommandElements[0].Pipeline
+    if ($importPath -isnot [System.Management.Automation.Language.PipelineAst] -or
+        $importPath.Background -or $importPath.PipelineElements.Count -ne 1 -or
+        $importPath.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+        throw "$Harness must resolve the history guard import with Join-Path."
+    }
+    $joinPath = $importPath.PipelineElements[0]
+    if ($joinPath.GetCommandName() -cne 'Join-Path' -or
+        $joinPath.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+        $joinPath.Redirections.Count -ne 0 -or $joinPath.CommandElements.Count -ne 3 -or
+        $joinPath.CommandElements[1] -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+        $joinPath.CommandElements[1].VariablePath.UserPath -cne 'PSScriptRoot' -or
+        $joinPath.CommandElements[2] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        $joinPath.CommandElements[2].Value -cne '..\..\scripts\windows-harness-history.ps1') {
+        throw "$Harness must import the shared history guard from its repository path."
+    }
+
+    $start = $rootStatements[1]
+    if ($start -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $start.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or
+        $start.Left -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+        $start.Left.VariablePath.UserPath -cne 'windowsHarnessHistoryGuard' -or
+        $start.Right -isnot [System.Management.Automation.Language.PipelineAst] -or
+        $start.Right.Background -or $start.Right.PipelineElements.Count -ne 1 -or
+        $start.Right.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+        throw "$Harness must assign its start guard directly at the root before the outer try."
+    }
+    $startCommand = $start.Right.PipelineElements[0]
+    $startElements = @($startCommand.CommandElements)
+    if (@(Get-NamedCommands -Ast $Ast -Name 'Start-WindowsHarnessHistoryGuard').Count -ne 1 -or
+        $startCommand.GetCommandName() -cne 'Start-WindowsHarnessHistoryGuard' -or
+        $startCommand.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+        $startCommand.Redirections.Count -ne 0 -or $startElements.Count -ne 3 -or
+        $startElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+        $startElements[1].ParameterName -cne 'Harness' -or $null -ne $startElements[1].Argument -or
+        $startElements[2] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        $startElements[2].Value -cne $Harness) {
+        throw "$Harness must start exactly one history guard for its own harness name."
+    }
+
+    $outerTry = $rootTries[0]
+    if ($outerTry.CatchClauses.Count -ne 0 -or $null -eq $outerTry.Finally -or
+        ($null -ne $outerTry.Finally.Traps -and $outerTry.Finally.Traps.Count -ne 0) -or
+        $outerTry.Finally.Statements.Count -ne 1) {
+        throw "$Harness must have no outer catch and only the history assertion in its outer finally."
+    }
+    $assertion = $outerTry.Finally.Statements[0]
+    if ($assertion -isnot [System.Management.Automation.Language.PipelineAst] -or
+        $assertion.Background -or $assertion.PipelineElements.Count -ne 1 -or
+        $assertion.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+        throw "$Harness must assert its history guard directly in the outer finally."
+    }
+    $assertCommand = $assertion.PipelineElements[0]
+    $assertElements = @($assertCommand.CommandElements)
+    if (@(Get-NamedCommands -Ast $Ast -Name 'Assert-WindowsHarnessHistoryGuard').Count -ne 1 -or
+        $assertCommand.GetCommandName() -cne 'Assert-WindowsHarnessHistoryGuard' -or
+        $assertCommand.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+        $assertCommand.Redirections.Count -ne 0 -or $assertElements.Count -ne 3 -or
+        $assertElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+        $assertElements[1].ParameterName -cne 'Guard' -or $null -ne $assertElements[1].Argument -or
+        $assertElements[2] -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+        $assertElements[2].VariablePath.UserPath -cne 'windowsHarnessHistoryGuard') {
+        throw "$Harness must finally assert exactly Assert-WindowsHarnessHistoryGuard -Guard `$windowsHarnessHistoryGuard."
+    }
+    return $outerTry.Body
 }
 
 function Test-DirectStatementBlockChild {
