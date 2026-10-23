@@ -602,22 +602,39 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                     return;
                 }
 
-                // Copy the data so we own it.
-                const data = if (alloc.dupe(
-                    u8,
-                    pending.dataSlice(),
-                )) |v| v else |_| {
-                    if (!gop.found_existing) {
-                        // If this is a new entry we can just remove it since it
-                        // was never sent to the GPU.
-                        _ = self.images.remove(id);
-                    } else {
-                        // If this was an existing entry, it is invalid and
-                        // we must unload it.
-                        gop.value_ptr.image.markForUnload();
+                // Copy or convert the data so we own it. Non-RGBA formats (e.g. RGB
+                // from video streams) are swizzled directly to RGBA here, avoiding an
+                // intermediate buffer allocation and memcpy that would be freed immediately.
+                const data = if (pending.pixel_format == .rgba)
+                    alloc.dupe(u8, pending.dataSlice()) catch |err| {
+                        if (!gop.found_existing) {
+                            _ = self.images.remove(id);
+                        } else {
+                            gop.value_ptr.image.markForUnload();
+                        }
+                        return err;
                     }
-
-                    return error.OutOfMemory;
+                else blk: {
+                    const src = pending.dataSlice();
+                    const converted = (switch (pending.pixel_format) {
+                        .gray => wuffs.swizzle.gToRgba(alloc, src),
+                        .gray_alpha => wuffs.swizzle.gaToRgba(alloc, src),
+                        .rgb => wuffs.swizzle.rgbToRgba(alloc, src),
+                        .bgr => wuffs.swizzle.bgrToRgba(alloc, src),
+                        .rgba => unreachable,
+                        .bgra => wuffs.swizzle.bgraToRgba(alloc, src),
+                    }) catch |err| {
+                        if (!gop.found_existing) {
+                            _ = self.images.remove(id);
+                        } else {
+                            gop.value_ptr.image.markForUnload();
+                        }
+                        return switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.ImageConversionError,
+                        };
+                    };
+                    break :blk converted;
                 };
                 // Note: we don't need to errdefer free the data because it is
                 // put into the map immediately below and our errdefer to
@@ -628,7 +645,7 @@ pub fn ForAPI(comptime GraphicsAPI: type) type {
                     .pending = .{
                         .width = pending.width,
                         .height = pending.height,
-                        .pixel_format = pending.pixel_format,
+                        .pixel_format = .rgba,
                         .data = data.ptr,
                     },
                 };
