@@ -248,8 +248,10 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class TYPE_NAME {
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
-    public class DesktopWindowObservation { public int ProcessId, ThreadId; public bool CompletedAttempt; }
+    public class DesktopWindowObservation { public int ProcessId, ThreadId; public bool CompletedAttempt; public string ClassName; public bool Visible; }
     public static bool OpenFails, EnumFails, OwnerFails, CloseFails;
+    static string Class(IntPtr h) { return "class-" + h.ToInt32(); }
+    static bool IsWindowVisible(IntPtr h) { return h.ToInt32() == 2; }
     public static int Opens, Enums, Closes;
     static int[] JobProcessIds(IntPtr job) { if (job != new IntPtr(7)) throw new Exception("wrong job"); return new[] { 41, 42 }; }
     static IntPtr OpenDesktopW(string name, uint flags, bool inherit, uint access) {
@@ -279,9 +281,11 @@ METHOD
         if ([bool]$failure -ne [bool]$fixture.Api -or ($failure -and ($failure.Message -cne $fixture.Api -or $failure.NativeErrorCode -ne $fixture.Code))) { throw 'Private desktop API failure changed or was accepted.' }
         if ($type::Opens -ne 1 -or $type::Closes -ne [int](-not $fixture.OpenFails)) { throw 'Private desktop read handle was leaked.' }
         if (-not $failure -and ($type::Enums -ne 1 -or $rows.Count -ne 2 -or @($rows | Where-Object { $_.ProcessId -ne 42 -or -not $_.CompletedAttempt }).Count)) { throw 'Private desktop oracle omitted actual windows or accepted wrong PID.' }
+        if (-not $failure -and ($rows[0].ClassName -cne 'class-1' -or $rows[0].Visible -or $rows[1].ClassName -cne 'class-2' -or -not $rows[1].Visible)) { throw 'Private desktop oracle lost the class or visibility of an owned window.' }
         if ($fixture.Cleanup -and ($failure.Data['CleanupApi'] -cne 'CloseDesktop' -or $failure.Data['CleanupCode'] -ne 6)) { throw 'Private desktop oracle lost secondary cleanup error.' }
     }
 }
+Assert-HiddenMutation 'private native visibility not recorded' $privateWindows ($privateWindows.Replace('Visible = IsWindowVisible(h)', 'Visible = false')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native wrong PID included' $privateWindows ($privateWindows.Replace('if (ids.Contains(id))', 'if (true)')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native read handle inheritable' $privateWindows ($privateWindows.Replace('OpenDesktopW(desktopName, 0, false, 0x0001)', 'OpenDesktopW(desktopName, 0, true, 0x0001)')) ${function:Test-PrivateWindowNative}
 Assert-HiddenMutation 'private native errors ignored' $privateWindows ($privateWindows.Replace('throw failure;', '')) ${function:Test-PrivateWindowNative}
@@ -319,6 +323,8 @@ public static class TYPE_NAME {
     }
     static bool EnumWindows(EnumWindow cb, IntPtr state) { return RunEnum(cb, state); }
     static bool EnumDesktopWindows(IntPtr h, EnumWindow cb, IntPtr state) { return RunEnum(cb, state); }
+    static string Class(IntPtr h) { return "fixture"; }
+    static bool IsWindowVisible(IntPtr h) { return false; }
 METHODS
 }
 '@
@@ -481,6 +487,8 @@ function Test-HiddenDriverCode([string] $Code) {
     $script:driverRunnerGuardCalled = $false
     function Assert-HiddenRunner { $script:driverRunnerGuardCalled = $true }
     function Get-RealStateFingerprints { return @{ Startup = @{}; History = @{} } }
+    function Start-WindowsHarnessHistoryGuard { param($Harness) return @{} }
+    function Assert-WindowsHarnessHistoryGuard { param($Guard) }
     function Get-FileFingerprint { return @{ Exists = $true; Hash = 'managed fixture' } }
     function Test-SameFingerprint { return $true }
     function Copy-PortableBin { }
@@ -595,6 +603,9 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         @{ WrongCurrent = $true; Blocked = $true }, @{ BadName = $true; Blocked = $true }
         @{ NoWindows = $true; Blocked = $true }, @{ Empty = $true; NoWindows = $true }
         @{ Stale = $true }, @{ Stale = $true; Required = 42; Blocked = $true }, @{ Stale = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'noctty.win32.lifecycle'; NoWindows = $true }, @{ Class = 'noctty.win32.lifecycle'; Visible = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'IME'; NoWindows = $true }, @{ Class = 'MSCTFIME UI'; NoWindows = $true }, @{ Class = 'IME'; Visible = $true; NoWindows = $true; Blocked = $true }
+        @{ Class = 'noctty.win32.host'; NoWindows = $true; Blocked = $true }
         @{ Native = 'OpenDesktopW'; Code = 5; Blocked = $true }
         @{ Native = 'EnumDesktopWindows'; Code = 170; Blocked = $true }
         @{ Native = 'GetWindowThreadProcessId'; Code = 1400; Blocked = $true }
@@ -619,7 +630,8 @@ function Test-HiddenDesktopAssertion([string] $Code) {
         }
         if ($fixture.Observed) { [HiddenDesktopContract]::Failure.Data['ObservedWindows'] = @(@{ ProcessId = 42; ThreadId = 123 }, @{ ProcessId = 'secret'; ThreadId = 'secret' }) }
         [HiddenDesktopContract]::Current = if ($fixture.WrongCurrent) { 'Default' } else { $name }
-        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }); CompletedAttempt = -not $fixture.Stale } })
+        [HiddenDesktopContract]::Rows = @(if (-not $fixture.Empty) { @{ ProcessId = $(if ($fixture.WrongPid) { 99 } else { 42 }); ThreadId = $(if ($fixture.ZeroTid) { 0 } else { 123 }); CompletedAttempt = -not $fixture.Stale
+            ClassName = $fixture.Class; Visible = [bool]$fixture.Visible } })
         $blocked = $false
         try { Assert-HiddenDesktop -Job ([IntPtr]7) -DesktopName $(if ($fixture.BadName) { 'Default' } else { $name }) -ReceiptPath 'unused.jsonl' -RequiredWindowPid ([int]$fixture.Required) -NoWindows:([bool]$fixture.NoWindows) } catch { $blocked = $true; if ($fixture.Required -and $_.Exception.Message.StartsWith('Hidden desktop')) { throw 'Missing readiness window must remain an ordinary startup failure.' } }
         if ($blocked -ne [bool]$fixture.Blocked -or $receipts.Count -ne 1 -or $receipts[0].Contains('secret')) { throw 'Private desktop oracle lost failure rejection or sanitized receipt.' }
@@ -645,7 +657,9 @@ Assert-HiddenMutation 'private wrong PID accepted' $desktopAssertion ($desktopAs
 Assert-HiddenMutation 'private wrong self desktop accepted' $desktopAssertion ($desktopAssertion.Replace('[HiddenDesktopContract]::CurrentDesktopName() -cne $DesktopName', '$false')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private missing ready window accepted' $desktopAssertion ($desktopAssertion.Replace('$RequiredWindowPid -gt 0 -and', '$false -and')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private stale ready window accepted' $desktopAssertion ($desktopAssertion.Replace(' -and $_.CompletedAttempt -eq $true', '')) ${function:Test-HiddenDesktopAssertion}
-Assert-HiddenMutation 'private idle window accepted' $desktopAssertion ($desktopAssertion.Replace('$NoWindows -and $rows.Count', '$false')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private idle window accepted' $desktopAssertion ($desktopAssertion.Replace('$NoWindows -and $unexpectedRows.Count', '$false')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private visible lifecycle window accepted' $desktopAssertion ($desktopAssertion.Replace(' -and $_.Visible -eq $false', '')) ${function:Test-HiddenDesktopAssertion}
+Assert-HiddenMutation 'private lifecycle exemption covers every class' $desktopAssertion ($desktopAssertion.Replace("`$toleratedHidden -ccontains `$_.ClassName", '$true')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'desktop receipt removed' $desktopAssertion ($desktopAssertion.Replace('Add-Content -LiteralPath $ReceiptPath', 'Out-Null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private native receipt code lost' $desktopAssertion ($desktopAssertion.Replace('$errorCode = $failure.NativeErrorCode', '$errorCode = $null')) ${function:Test-HiddenDesktopAssertion}
 Assert-HiddenMutation 'private arbitrary native label disclosed' $desktopAssertion ($desktopAssertion.Replace('$nativeStages -ccontains $failure.Message', '$true')) ${function:Test-HiddenDesktopAssertion}
@@ -1275,7 +1289,9 @@ Assert-HiddenMutation 'PowerShell wrong readiness PID accepted' $promptWait ($pr
 Assert-HiddenMutation 'PowerShell readiness without forwarded OSC accepted' $promptWait ($promptWait.Replace('$ready.CwdOscForwarded -eq $true', '$true')) ${function:Test-PowerShellPromptWait}
 Assert-HiddenMutation 'PowerShell readiness without history isolation accepted' $promptWait ($promptWait.Replace("`$ready.HistorySaveStyle -ceq 'SaveNothing'", '$true')) ${function:Test-PowerShellPromptWait}
 
-$delegationGuard = Get-HiddenFunction $hiddenLibText 'Assert-EmbeddingDelegationSafe'
+# The -Embedding delegation guard has one copy, which both hidden libraries dot-source.
+$embeddingGuardText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-embedding-guard.ps1') -Raw)
+$delegationGuard = Get-HiddenFunction $embeddingGuardText 'Assert-EmbeddingDelegationSafe'
 function Test-EmbeddingDelegationGuard([string] $Code) {
     . ([scriptblock]::Create($Code))
     foreach ($value in @($null, '', '{11111111-1111-1111-1111-111111111111}', '{33368c6f-d328-410c-b225-26dc9f12c728}', '33368C6F-D328-410C-B225-26DC9F12C728', 'missing-key', 'unreadable')) {
@@ -1299,6 +1315,36 @@ function Test-EmbeddingGuardCalls([string] $Code) {
         $Code -notmatch '(?m)^Assert-EmbeddingDelegationSafe\r?\n\$started = Start-HiddenNoctty') { throw 'Embedding launch lost the entry/prelaunch delegation guard.' }
 }
 Assert-HiddenMutation 'delegation guard call removed' $embeddingText ($embeddingText -replace '(?m)^Assert-EmbeddingDelegationSafe\r?\n', '') ${function:Test-EmbeddingGuardCalls}
+Assert-HiddenMutation 'unreadable delegation key accepted' $delegationGuard ($delegationGuard.Replace('catch [Management.Automation.ItemNotFoundException] { return }', 'catch { return }')) ${function:Test-EmbeddingDelegationGuard}
+
+# Every harness that starts -Embedding gets the guard from that one file: no private copy that
+# no fixture above exercises.
+$localLibText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-local-lib.ps1') -Raw)
+$restartManagerText = Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-restart-manager.ps1') -Raw)
+function Test-DelegationGuardSource([string] $Code) {
+    if ($Code -notmatch "(?m)^\. \(Join-Path \`$PSScriptRoot 'hidden-win11-embedding-guard\.ps1'\)\r?$" -or
+        $Code -match '(?im)^\s*function\s+[\w-]*Delegation') { throw 'A hidden library lost the shared delegation guard or carries a copy of its own.' }
+}
+foreach ($libText in @($hiddenLibText, $localLibText)) {
+    Assert-HiddenMutation 'shared delegation guard not dot-sourced' $libText ($libText -replace "(?m)^\. \(Join-Path \`$PSScriptRoot 'hidden-win11-embedding-guard\.ps1'\)\r?\n", '') ${function:Test-DelegationGuardSource}
+}
+# The Restart Manager harness's embedding-idle case runs by default: the guard runs before the
+# driver starts whenever that case is selected, right before the only -Embedding launch, and the
+# harness defines no guard of its own.
+function Test-RestartManagerGuardCalls([string] $Code) {
+    $entry = [regex]::Match($Code, "(?m)^if\(\`$requestedCases -contains 'embedding-idle'\) \{ Assert-EmbeddingDelegationSafe \}\r?$")
+    $driver = $Code.IndexOf('Invoke-LocalHiddenDriver')
+    $launches = @([regex]::Matches($Code, '(?m)^.*\bStart-Case\b[^\r\n]*\s-Embedding\b'))
+    $guarded = @([regex]::Matches($Code, '(?m)^\s*Assert-EmbeddingDelegationSafe\r?\n.*\bStart-Case\b[^\r\n]*\s-Embedding\b'))
+    if (-not $entry.Success -or $driver -lt 0 -or $entry.Index -gt $driver -or
+        $Code -notmatch "(?m)^\`$requestedCases=if\(\`$Cases\) \{[^\r\n]*\} else \{ @\('embedding-idle'\) \}\r?$" -or
+        $launches.Count -lt 1 -or $guarded.Count -ne $launches.Count -or
+        $Code -match '(?im)^\s*function\s+[\w-]*Delegation') { throw 'The Restart Manager harness lost its entry or prelaunch delegation guard, or carries a copy of its own.' }
+}
+Assert-HiddenMutation 'Restart Manager entry delegation guard removed' $restartManagerText ($restartManagerText -replace "(?m)^if\(\`$requestedCases -contains 'embedding-idle'\) \{ Assert-EmbeddingDelegationSafe \}\r?\n", '') ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager entry guard skipped by default' $restartManagerText ($restartManagerText.Replace("else { @('embedding-idle') }", 'else { @() }')) ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager prelaunch delegation guard removed' $restartManagerText ($restartManagerText -replace '(?m)^\s*Assert-EmbeddingDelegationSafe\r?\n(?=.*\bStart-Case\b[^\r\n]*\s-Embedding\b)', '') ${function:Test-RestartManagerGuardCalls}
+Assert-HiddenMutation 'Restart Manager private delegation guard' $restartManagerText ($restartManagerText -replace '(?m)^(\$requestedCases=)', "function Assert-RmEmbeddingDelegationSafe { }`n`$1") ${function:Test-RestartManagerGuardCalls}
 
 $requiredProfileLoop = [regex]::Match($profileText, '(?ms)^foreach \(\$key in \$Profile\).*?^}').Value
 $requiredProfileForwarding = [regex]::Match($profileText, '(?m)^    if \(\$RequireAll\)[^\r\n]*').Value
@@ -1309,6 +1355,7 @@ function Test-RequiredProfile([string] $Code) {
             $expectations = @{ 'missing.exe' = @{} }; $cases = [Collections.Generic.List[object]]::new()
             $script:requiredFailures = 0
             function Test-Available { return $false }
+            function Write-Step { }
             function Check($Case, $Name, $Passed, $Expected, $Actual) { if (-not $Passed) { $script:requiredFailures++ } }
             function Invoke-Case { throw 'Unavailable profile must never launch.' }
             . ([scriptblock]::Create($Code))
@@ -1387,6 +1434,84 @@ Assert-HiddenMutation 'WSL bash accepted' $gitFunctions ($gitFunctions.Replace('
             $probes[0] -ine 'C:\PKG76\bin\git.exe') { throw 'Local PATH lookup lost quoting/order or queried an unsafe component.' }
     } finally { $env:PATH = $savedPath }
 }
+
+# The two process-tree walks, Get-Descendants (the profile matrix finds the shell under noctty with it)
+# and the default-shell harness's Find-Shell, follow ParentProcessId, which is a number and not an
+# identity: Windows reuses numbers, so a process whose parent exited can name a newer process that
+# took its number. Here noctty (100) took the number of an older process whose stale children (500,
+# and 600 under it) still name it, and noctty's own real parent is 600, so the links form the cycle
+# 100 -> 500 -> 600 -> 100. Its real descendants are cmd.exe (101) and conhost.exe (102); the stale
+# 500 is a pwsh.exe listed first, which a walk without the age rule takes for noctty's shell, and the
+# stale 103 names 101 but is older than it (not older than noctty), which a rule that compares a
+# child with the root instead of its own parent keeps. With
+# one start time for all, only the visited set ends the cycle; a start time CIM did not return
+# proves nothing. The fake CIM query drops CreationDate unless it is asked for, as CIM does, and
+# records the deadline. Each walk runs in a runspace of its own with a deadline, because a walk that
+# regresses hangs instead of throwing.
+$walkStart = [datetime]'2026-10-25T02:00:00Z'
+function New-WalkProcess([int] $Id, [int] $Parent, [string] $Name, $Created) {
+    [pscustomobject]@{ ProcessId = $Id; ParentProcessId = $Parent; Name = $Name; ExecutablePath = "C:\fixture\$Name"; CommandLine = $Name; CreationDate = $Created }
+}
+$walkTables = @(
+    @{ Name = 'a recycled parent number'; Descendants = '101,102'; Shell = '101'; Table = @(
+        New-WalkProcess 500 100 'pwsh.exe' $walkStart.AddHours(-1)
+        New-WalkProcess 600 500 'stale.exe' $walkStart.AddHours(-1).AddSeconds(1)
+        New-WalkProcess 100 600 'noctty.exe' $walkStart
+        New-WalkProcess 103 101 'pwsh.exe' $walkStart.AddMilliseconds(500)
+        New-WalkProcess 101 100 'cmd.exe' $walkStart.AddSeconds(1)
+        New-WalkProcess 102 101 'conhost.exe' $walkStart.AddSeconds(2)
+        New-WalkProcess 700 4 'other.exe' $walkStart.AddHours(-2)) }
+    @{ Name = 'a parent cycle with one start time'; Descendants = '500,600'; Shell = '500'; Table = @(
+        New-WalkProcess 100 600 'noctty.exe' $walkStart
+        New-WalkProcess 500 100 'cmd.exe' $walkStart
+        New-WalkProcess 600 500 'stale.exe' $walkStart) }
+    @{ Name = 'a child without a start time'; Descendants = '110'; Shell = '110'; Table = @(
+        New-WalkProcess 100 4 'noctty.exe' $walkStart
+        New-WalkProcess 110 100 'cmd.exe' $null) }
+)
+$walkRunner = {
+    param($Tables, $FunctionText, $FunctionName)
+    $script:walkTable = $null; $script:walkTimeout = $null
+    function Get-CimInstance {
+        [CmdletBinding()] param([string] $ClassName, [string[]] $Property, [uint32] $OperationTimeoutSec)
+        if ($ClassName -cne 'Win32_Process') { throw "Unexpected CIM class $ClassName." }
+        $script:walkTimeout = $OperationTimeoutSec
+        if ($Property -and $Property -notcontains 'CreationDate') { return @($script:walkTable | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine) }
+        return $script:walkTable
+    }
+    $shellNames = @('pwsh.exe', 'powershell.exe', 'cmd.exe')
+    . ([scriptblock]::Create($FunctionText))
+    foreach ($case in $Tables) {
+        $script:walkTable = $case.Table
+        $result = & $FunctionName 100
+        $ids = if ($FunctionName -ceq 'Find-Shell') { "$($result.Pid)" } else { (@($result | ForEach-Object { [int]$_.ProcessId }) | Sort-Object) -join ',' }
+        [pscustomobject]@{ Name = $case.Name; Ids = $ids; Timeout = $script:walkTimeout }
+    }
+}
+function Test-ProcessWalk([string] $Code, [string] $FunctionName, [string] $Expected) {
+    $results = @(Invoke-ContractScriptWithDeadline -Script $walkRunner -Arguments @($walkTables, $Code, $FunctionName) -TimeoutSeconds 10 `
+            -HangMessage "$FunctionName did not return for a process table with a parent cycle.")
+    foreach ($case in $walkTables) {
+        $got = $results | Where-Object { $_.Name -ceq $case.Name }
+        if ($got.Ids -cne $case[$Expected]) { throw "$FunctionName returned '$($got.Ids)' for $($case.Name); expected '$($case[$Expected])'." }
+        if ($got.Timeout -lt 1 -or $got.Timeout -gt 60) { throw "$FunctionName queried the process table without a deadline." }
+    }
+}
+function Test-HiddenDescendants([string] $Code) { Test-ProcessWalk $Code 'Get-Descendants' 'Descendants' }
+function Test-DefaultShellWalk([string] $Code) { Test-ProcessWalk $Code 'Find-Shell' 'Shell' }
+$descendantsWalk = Get-HiddenFunction $hiddenLibText 'Get-Descendants'
+Test-HiddenDescendants $descendantsWalk
+Assert-HiddenMutation 'descendant walk without a visited set' $descendantsWalk ($descendantsWalk.Replace('if (-not $seen.Add([int]$child.ProcessId)) { continue }', '[void]$seen.Add([int]$child.ProcessId)')) ${function:Test-HiddenDescendants}
+Assert-HiddenMutation 'descendant walk without the age rule' $descendantsWalk ($descendantsWalk.Replace('$childStart.ToUniversalTime() -lt $parentStart.ToUniversalTime()', '$false')) ${function:Test-HiddenDescendants}
+Assert-HiddenMutation 'descendant walk dating children against the root' $descendantsWalk ($descendantsWalk.Replace('$parentStart = $started[$parent]', '$parentStart = $started[$RootPid]')) ${function:Test-HiddenDescendants}
+Assert-HiddenMutation 'descendant walk without start times' $descendantsWalk ($descendantsWalk.Replace(', CreationDate -OperationTimeoutSec', ' -OperationTimeoutSec')) ${function:Test-HiddenDescendants}
+Assert-HiddenMutation 'descendant query without a deadline' $descendantsWalk ($descendantsWalk.Replace(' -OperationTimeoutSec 15', '')) ${function:Test-HiddenDescendants}
+$defaultShellWalk = Get-HiddenFunction (Remove-PowerShellComments (Get-Content -LiteralPath (Join-Path $repoRoot 'test\windows\hidden-win11-default-shell.ps1') -Raw)) 'Find-Shell'
+Test-DefaultShellWalk $defaultShellWalk
+Assert-HiddenMutation 'default-shell walk without the age rule' $defaultShellWalk ($defaultShellWalk.Replace('$p.CreationDate.ToUniversalTime() -lt $parentStart.ToUniversalTime()', '$false')) ${function:Test-DefaultShellWalk}
+Assert-HiddenMutation 'default-shell walk dating children against the root' $defaultShellWalk ($defaultShellWalk.Replace('$parentStart = $started[[int]$p.ParentProcessId]', '$parentStart = $started[$RootPid]')) ${function:Test-DefaultShellWalk}
+Assert-HiddenMutation 'default-shell walk without start times' $defaultShellWalk ($defaultShellWalk.Replace(',CreationDate -OperationTimeoutSec', ' -OperationTimeoutSec')) ${function:Test-DefaultShellWalk}
+Assert-HiddenMutation 'default-shell query without a deadline' $defaultShellWalk ($defaultShellWalk.Replace(' -OperationTimeoutSec 15', '')) ${function:Test-DefaultShellWalk}
 
 # Pin the actual executable workflow line, so a comment or reporting-only invocation cannot pass.
 $skipWorkflow = Get-Content -LiteralPath (Join-Path $repoRoot '.github\workflows\windows10-branches.yml') -Raw

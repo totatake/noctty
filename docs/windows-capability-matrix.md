@@ -44,6 +44,7 @@ Last reviewed: 2026-10-16 (jump list, native settings and scrollbar rows; render
 | [Configuration: `auto-update`](https://ghostty.org/docs/config/reference)                    | Stable-release checking and prompts backed by GitHub Releases. `download` stages installer releases after SHA-256 and Authenticode verification; portable ZIP staging/apply additionally requires a pinned-publisher-signed manifest covering every payload file and otherwise stays on the release-page path. Apply is user-initiated. See [windows.md](windows.md#updates). |
 | [Configuration: `window-save-state`](https://ghostty.org/docs/config/reference)              | Persists windows, tabs, splits, profiles, working directories, and titles under `%LOCALAPPDATA%\noctty\session-state.json`. `window-save-state-scrollback` opts in to bounded plain-text pane snapshots; child processes are not restored.                                                                                                                                    |
 | [Configuration: `background-blur`](https://ghostty.org/docs/config/reference)                | Accepted but inert on every Windows build: nothing in the Win32 runtime opts into a DWM transparency mechanism, so no backdrop material can show. Enabling it logs a warning. See [background blur](#background-blur).                                                                                                                                                        |
+| [Configuration: `unfocused-split-opacity`](https://ghostty.org/docs/config/reference)        | Unfocused splits are dimmed by the renderer on OpenGL and D3D11, toward `unfocused-split-fill` in sRGB space as upstream does, and `split-divider-color` colors the gap between panes. The overlay scrollbar and a docked search bar are not dimmed, the gap and the focus accent do not scale with DPI, and High Contrast keeps system colors with no dim.                   |
 | [Features overview](https://ghostty.org/docs/features)                                       | Accessibility is partial: UI Automation covers the daily chrome and terminal text, but caption buttons, overlay rows, and menus are uncovered. Only NVDA has been measured, with mixed results. See [accessibility notes](#accessibility) and the [screen-reader matrix](accessibility-matrix.md).                                                                            |
 | OSC 52 primary/selection clipboard selectors                                                 | Windows has one native clipboard: writes with selectors `c`, `s`, and `p` all target it; read replies still echo the requested selector.                                                                                                                                                                                                                                      |
 | [Configuration: `link-previews`](https://ghostty.org/docs/config/reference)                  | Link opening works; preview tooltips are not wired on Windows. Settings disables the control and explains why; the config key remains.                                                                                                                                                                                                                                        |
@@ -67,10 +68,11 @@ Last reviewed: 2026-10-16 (jump list, native settings and scrollbar rows; render
 | Tab dragging                                                                      | Same-window reorder and exact-pane drag-to-split. See [tab dragging notes](#tab-dragging).                                                                                                                           |
 | Power-aware rendering                                                             | `unfocused-render-fps` caps visible background presentation; `power-saver-rendering` controls saver pacing; minimized and DWM-cloaked windows do not present. See [power and battery](windows.md#power-and-battery). |
 | SSH host discovery                                                                | Concrete aliases from `%USERPROFILE%\.ssh\config` appear as system `ssh.exe` launch entries in the picker and palette.                                                                                               |
+| Visual Studio developer shells                                                    | Each Visual Studio install's Developer Command Prompt and Developer PowerShell appear in the picker, palette and jump list (`visual-studio-profiles`, default the newest install). See [Visual Studio developer shells](windows.md#visual-studio-developer-shells). |
 | Windows default terminal                                                          | `+register-default-terminal` selects noctty per user through the Windows Terminal 1.24-or-newer OpenConsole handoff; see [windows.md](windows.md#default-terminal).                                                  |
-| Taskbar jump lists                                                                | Recent working directories and detected shell profiles launch from the pinned or running taskbar button; from 1.3.133 a portable copy builds none. See [taskbar jump list](windows.md#taskbar-jump-list).            |
+| Taskbar jump lists                                                                | Recent working directories and the shell profiles the picker shows (detected ones, Visual Studio developer shells and your own user profiles; `profile-hidden` ones are left out) launch from the pinned or running taskbar button; from 1.3.133 a portable copy builds none. See [taskbar jump list](windows.md#taskbar-jump-list). |
 | Quick terminal and global hotkeys                                                 | Configurable edge/center terminal toggled by a bindable action; `global:` bindings use `RegisterHotKey`. See [quick terminal](#quick-terminal).                                                                      |
-| Desktop notifications                                                             | WinRT Action Center toasts with a local fallback; command-finish and program status toasts focus their pane when clicked. See [notifications and progress](#notifications-and-progress).                             |
+| Desktop notifications                                                             | WinRT Action Center toasts with a local fallback; every terminal toast names its tab and focuses its pane when its popup is clicked. See [notifications and progress](#notifications-and-progress).                  |
 | Taskbar progress                                                                  | OSC 9;4 reports, or the root OSC 7501 status once a program reports one, drive the active pane's taskbar indicator when `progress-style` is enabled.                                                                 |
 | Program status (OSC 7501)                                                         | Tab badges, taskbar state, rate-limited toasts, UIA `ItemStatus`, and `goto_attention`. See [program status](windows.md#program-status-osc-7501).                                                                    |
 | Docked search                                                                     | Each pane has a docked scrollback search with regex, case, whole-word, navigation, and scrollbar markers. See [search and scrollbars](#search-and-scrollbars).                                                       |
@@ -214,9 +216,11 @@ that:
   `wsl.exe`, noctty lists `COLORTERM`, `TERM_PROGRAM` and
   `TERM_PROGRAM_VERSION`, and `TERM` when the distribution has a terminfo
   entry for it (asked with `infocmp`); otherwise the distribution keeps
-  `xterm-256color`. `ssh.exe` sends `TERM` to the server, so a host without
-  the entry needs the `ssh-env` or `ssh-terminfo` shell integration feature,
-  or `term = xterm-256color`.
+  `xterm-256color`. A launch of WSL's `bash.exe` gets the same three, and
+  keeps `xterm-256color`. In both, a `TERM` that `env` sets is listed as it
+  is. `ssh.exe` sends `TERM` to the server, so a host
+  without the entry needs the `ssh-env` or `ssh-terminfo` shell integration
+  feature, or `term = xterm-256color`.
 
 ### Keyboard input
 
@@ -351,9 +355,13 @@ supported on Windows", so nobody there toggles it and waits for a change.
 noctty keeps the full upstream configuration surface so that a shared config
 file loads, and only `background-blur` (below) logs a warning when it is set.
 Searching `src/` (outside `Config.zig`, the doc generators and the tests'
-deny-lists) on `e6dae0919` finds no code that acts on these keys, so setting
-them changes nothing on Windows:
+deny-lists) on `e6dae0919` finds no code that acts on these keys beyond that
+warning and the Settings controls marked "not supported on Windows", so
+setting them changes nothing on Windows:
 
+- `background-blur`: no window here can show a blur behind it (see
+  [Background blur](#background-blur)).
+- `link-previews`: links open, but no preview pops up.
 - `focus-follows-mouse`, `window-inherit-font-size`, `resize-overlay`,
   `resize-overlay-position` and `resize-overlay-duration`: the Win32 runtime has no code for them (a new
   window or tab does not inherit an adjusted font size).
@@ -361,15 +369,28 @@ them changes nothing on Windows:
   are applied (see [Notifications and progress](#notifications-and-progress)).
 - `quick-terminal-space-behavior`: copied into the quick-terminal settings,
   where nothing reads it.
-- The GTK and X11 keys: `gtk-opengl-debug`, `gtk-single-instance`,
+- `accent-follow-system`: it made the active tab's border and underline follow
+  the Windows accent; the tab strip no longer uses an accent colour, and the
+  active tab takes the terminal's background instead.
+- `window-subtitle` and `window-step-resize`: a forwarded command line may set
+  them (`ipc_server.zig`), and nothing reads them after that.
+- `drag-handle` and `scrollback-compression`: upstream Ghostty 1.4 added them
+  for the split drag handles of its macOS and GTK apps and for compressing
+  idle scrollback, neither of which this build has. They were added after the
+  search above, and nothing reads them either.
+- The GTK and X11 keys: `gtk-opengl-debug`,
   `gtk-custom-css`, `gtk-quick-terminal-layer`, `gtk-quick-terminal-namespace`,
   `gtk-titlebar`, `gtk-titlebar-style`, `gtk-titlebar-hide-when-maximized`,
-  `gtk-toolbar-style`, `gtk-tabs-location`, `gtk-wide-tabs`,
-  `x11-instance-name`, `async-backend` and `_xdg-terminal-exec`.
+  `gtk-toolbar-style`, `gtk-tabs-location`, `gtk-tabs-inverted`,
+  `gtk-wide-tabs`, `gtk-horizontal-tab-scroll`, `x11-instance-name`,
+  `async-backend` and `_xdg-terminal-exec`.
 
-`background-blur` is the one accepted-but-inert key that does log a warning
-(see [Background blur](#background-blur)). A Windows Terminal `bellStyle` maps
-to `bell-features` (see [the migration guide](migrate-from-windows-terminal.md#the-bell)).
+`gtk-single-instance` is not one of them: `Config.finalize` reads it as the old
+name of `single-instance`, which Windows honours. Settings' All settings page
+says what Windows does beside each key in the list, from `windows_notes` in
+`src/apprt/win32_settings_reference.zig`; a verification contract keeps that
+list and this one the same. A Windows Terminal `bellStyle` maps to
+`bell-features` (see [the migration guide](migrate-from-windows-terminal.md#the-bell)).
 
 ### Universal palette
 
@@ -388,15 +409,33 @@ share one typed, fuzzy-ranked list with:
 ### Native settings
 
 Appearance, Terminal, Shell, Privacy, Updates, Keybindings, and Advanced
-sections ship. Edits are staged until Save and applied through an atomic,
+sections ship, and an All settings page lists every config key with its
+value in effect, its description, where the config file sets it (read only
+when the file, and every link on its way, is on a local drive, and no cloud
+placeholder is on the way), and what
+Windows does with it for the keys [above](#settings-accepted-without-effect).
+Copy name puts a key's name on the clipboard, and Open config file opens the
+file through the `.txt` association (as the escape hatch below does), which
+takes no line number, so the page shows the line instead. A key that has a
+Settings control is edited from its row on that control's own page (F2 or
+Edit), so the edit takes the control's Save path; the others, and the two
+whose controls Windows does not support, are read-only and say so. Edits are staged until Save and applied through an atomic,
 source-preserving config patch; Discard changes asks how many fields would be
-lost before it throws the draft away. Advanced shows the pending field diff and
+lost before it throws the draft away. A field that differs from its built-in
+default is marked, and its Reset button, its context menu and
+Ctrl+Shift+Delete put the default back in the draft
+([details](windows.md#windows-tabs-and-splits)). Ctrl+F searches every page
+by name, description and keywords, and `@modified` lists the fields that
+differ from their defaults. Advanced shows the pending field diff and
 keeps the plain-text escape hatch, which opens the config through the `.txt`
 association rather than the file's own. Owned snapshots survive external reloads,
 and native fields support reversible live preview, revision-aware
 external-edit merging, and explicit Keep mine / Use disk conflict
-resolution. Keybinding editing still uses the text config and CLI discovery
-commands.
+resolution. The Keybindings page lists every key binding in effect (the
+defaults with the config's `keybind` lines, key tables and sequences
+included), searchable with the rest, read-only: bindings are still edited in
+the text config, and Copy binding gives the `keybind = ...` lines to paste
+there.
 
 ### Tab dragging
 
@@ -420,11 +459,18 @@ input, and `quick-terminal-space-behavior` has no Windows effect.
 WinRT toasts use noctty's AppUserModelID and fall back to a host banner, then
 the log, when native delivery fails. `desktop-notifications` gates every
 toast. Command-finish toasts additionally need `notify-on-command-finish` and
-a `notify-on-command-finish-action` that includes `notify`. Command-finish and
-[program status](windows.md#program-status-osc-7501) toasts carry a launch
-argument and focus the originating pane when clicked; OSC 9 / OSC 777 toasts
-are display-only. Reliable cold-start
-activation depends on the installed Start menu shortcut.
+a `notify-on-command-finish-action` that includes `notify`. Every toast from
+a terminal pane (OSC 9, OSC 777, command finished,
+[program status](windows.md#program-status-osc-7501) and the clipboard-copy
+notices) names its tab (and its window while several are open) in a final
+attribution line, carries a launch argument, and focuses the originating pane
+when its popup is clicked, and in an installed copy also when its Action
+Center entry is clicked (a COM toast activator; portable copies have none).
+A pane's newer toast, once Windows takes it,
+replaces its older one, and noctty removes a pane's toast from Action Center
+when its tab is seen, when the pane or its tab closes, and every toast it
+showed for a pane at exit. A click with noctty not running starts the
+installed copy through the activator's registration.
 `notify-on-command-finish-after` and the focus policy are applied before the
 bell or toast; command marks come from shell integration or OSC 133, which
 plain `cmd.exe` does not supply (Clink with the shipped script does).
@@ -518,11 +564,11 @@ best-effort failures continue without limits unless hard-fail is set.
 - `src/config/Config.zig` — config docs, keybinds, feature gates, and limits.
 - `src/termio/shell_integration.zig` and `src/config/windows_shell.zig` —
   shell integration and Windows shell detection.
-- `src/apprt/win32.zig`, `src/apprt/win32_quick_terminal.zig`,
-  `src/apprt/win32_search_bar.zig`, and
+- `src/apprt/win32.zig`, `src/apprt/win32/*.zig`,
+  `src/apprt/win32_quick_terminal.zig`, and
   `src/apprt/win32_scrollbar_geometry.zig` — Win32 runtime and interactive UI.
 - `src/apprt/win32_toast_winrt.zig`, `src/apprt/win32_toast_activation.zig`,
-  `src/apprt/win32_aumid.zig`, and `src/apprt/win32_taskbar_progress.zig` —
+  `src/apprt/win32_toast_activator.zig`, `src/apprt/win32_aumid.zig`, and `src/apprt/win32_taskbar_progress.zig` —
   notifications and shell progress.
 - `src/apprt/win32_clipboard_html.zig`, `src/apprt/win32_paste_protection.zig`,
   `src/apprt/win32_surface_drop_target.zig`, and

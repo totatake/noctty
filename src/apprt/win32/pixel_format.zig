@@ -304,15 +304,20 @@ fn betterClassicPixelFormatCandidate(
     return candidate.index < current.index;
 }
 
+fn keepBetterClassicPixelFormatCandidate(
+    selected: *?ClassicPixelFormatCandidate,
+    candidate: ClassicPixelFormatCandidate,
+) void {
+    if (selected.* == null or betterClassicPixelFormatCandidate(candidate, selected.*.?)) {
+        selected.* = candidate;
+    }
+}
+
 fn rankClassicPixelFormatCandidates(
     candidates: []const ClassicPixelFormatCandidate,
 ) ?ClassicPixelFormatCandidate {
     var selected: ?ClassicPixelFormatCandidate = null;
-    for (candidates) |candidate| {
-        if (selected == null or betterClassicPixelFormatCandidate(candidate, selected.?)) {
-            selected = candidate;
-        }
-    }
+    for (candidates) |candidate| keepBetterClassicPixelFormatCandidate(&selected, candidate);
     return selected;
 }
 
@@ -1169,15 +1174,12 @@ fn considerClassicPixelFormat(
     descriptor: PIXELFORMATDESCRIPTOR,
 ) void {
     const provenance = validateSelectedPixelFormat(pixel_format, descriptor) catch return;
-    const candidate: ClassicPixelFormatCandidate = .{
+    keepBetterClassicPixelFormatCandidate(selected, .{
         .index = pixel_format,
         .descriptor = descriptor,
         .provenance = provenance,
         .acceleration = classicPixelFormatAcceleration(descriptor.dwFlags),
-    };
-    if (selected.* == null or betterClassicPixelFormatCandidate(candidate, selected.*.?)) {
-        selected.* = candidate;
-    }
+    });
 }
 
 fn enumerateClassicPixelFormat(hdc: HDC) !WglPixelFormatSelection {
@@ -1494,6 +1496,9 @@ test "win32 pixel format ranking prefers zero attachments but permits honest fal
     try std.testing.expectEqual(@as(u8, 64), attached.accum_bits);
 }
 
+// WGL_ARB_pixel_format_float. NVIDIA's RGBA16F window formats carry it.
+const WGL_TYPE_RGBA_FLOAT_ARB = 0x21A0;
+
 /// One format of a table shaped like NVIDIA's R580 inventory (#299). The
 /// reporter's laptop exposed 1172 extended formats; an RTX 5070 Ti on the same
 /// driver (32.0.16.1742) measured 670 with this layout. Every RGBA8 window
@@ -1506,9 +1511,6 @@ test "win32 pixel format ranking prefers zero attachments but permits honest fal
 /// Indices 10, 12, 14, 123, 258, 262 and 270 match the reporter's rows. The
 /// classic test walks the whole table; a real classic inventory is shorter
 /// (220 formats here).
-// WGL_ARB_pixel_format_float. NVIDIA's RGBA16F window formats carry it.
-const WGL_TYPE_RGBA_FLOAT_ARB = 0x21A0;
-
 const R580FixtureFormat = struct {
     wgl: WglPixelFormatCandidate,
     base_contract: bool,

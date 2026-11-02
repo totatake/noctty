@@ -196,6 +196,15 @@ pub fn deinit(self: *Exec) void {
     self.subprocess.deinit();
 }
 
+/// Whether this pane runs WSL, decided from the launch command line as
+/// `Subprocess.wsl_launch` says. A WSL started by another program inside the
+/// pane (`cmd /c wsl`, `wsl` typed at a prompt), a distribution's own
+/// launcher (`ubuntu.exe`), and a session adopted from a default-terminal
+/// handoff do not count.
+pub fn launchesWsl(self: *const Exec) bool {
+    return self.subprocess.wsl_launch;
+}
+
 /// Call to initialize the terminal state as necessary for this backend.
 /// This is called before any termio begins. This should not be called
 /// after termio begins because it may put the internal terminal state
@@ -794,6 +803,10 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
+    /// Windows: the command line `command` was split from (a user profile's),
+    /// passed to CreateProcess unchanged when the argv finally run is exactly
+    /// its split. See `windows_shell.verbatimCommandLine`.
+    command_line: ?[]const u8 = null,
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -825,6 +838,9 @@ const Subprocess = struct {
     env: ?EnvMap,
     args: []const [:0]const u8,
     windows_cmd_shell: bool,
+    /// The line `start` hands CreateProcess as written, when it still
+    /// describes `args`; null quotes `args` as usual.
+    command_line: ?[]const u8 = null,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
     pty_options: ptypkg.OpenOptions = .{},
@@ -841,6 +857,13 @@ const Subprocess = struct {
     /// the distribution has said it knows the entry. See `wsl_env`.
     wsl_probe: ?wsl_env.Probe = null,
 
+    /// Whether this launch starts WSL: `wsl.exe` (`wsl_env.launchArgv`) or
+    /// WSL's `bash.exe` launcher (`wsl_env.launchesBashLauncher`). Either
+    /// lists the terminal's identity in `WSLENV`, and a POSIX path such a
+    /// pane prints is a Linux path. Set by `init` and never changed, so the
+    /// surface may read it on its own thread (`Exec.launchesWsl`).
+    wsl_launch: bool = false,
+
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
     windows_job_object_plan: WindowsJobObjectPlan,
@@ -852,17 +875,6 @@ const Subprocess = struct {
 
         /// Flatpak DBus command
         flatpak: FlatpakHostCommand,
-    };
-
-    const ArgsFormatter = struct {
-        args: []const [:0]const u8,
-
-        pub fn format(this: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            for (this.args, 0..) |a, i| {
-                if (i > 0) try writer.writeAll(", ");
-                try writer.print("`{s}`", .{a});
-            }
-        }
     };
 
     /// Initialize the subprocess. This will NOT start it, this only sets
@@ -1144,6 +1156,19 @@ const Subprocess = struct {
         // integration, launch preparation and user environment overrides.
         try windows_shell.configureShellSearch(&env, exec_command.windows_cmd_shell);
 
+        // A user profile's line, kept only while it still splits to the argv
+        // this launch runs: integration, the WSL rewrite, the cmd preamble and
+        // `initial-command` all change that argv.
+        const command_line: ?[]const u8 = if (comptime builtin.os.tag == .windows)
+            if (try windows_shell.verbatimCommandLine(
+                alloc,
+                cfg.command_line,
+                exec_command.args,
+                exec_command.windows_cmd_shell,
+            )) |line| try alloc.dupe(u8, line) else null
+        else
+            null;
+
         // We separate the terminal-visible PWD from the Windows host cwd.
         // For WSL launches, the shell may start in `~` or another WSL path
         // via `wsl.exe --cd ...`, while CreateProcess still needs a valid
@@ -1172,9 +1197,9 @@ const Subprocess = struct {
         } else shell_pwd;
 
         if (builtin.os.tag == .windows) {
-            log.info("windows launch host_cwd={?s} shell_pwd={?s} is_wsl={}", .{
-                cwd,
-                shell_pwd,
+            log.info("windows launch host_cwd={f} shell_pwd={f} is_wsl={}", .{
+                internal_os.redact.optionalBytes(cwd),
+                internal_os.redact.optionalBytes(shell_pwd),
                 windows_shell.isWslCommand(launch_command),
             });
         }
@@ -1189,20 +1214,28 @@ const Subprocess = struct {
         if (shell_pwd) |pwd| try env.put("PWD", pwd);
 
         // wsl.exe passes a Linux process only what WSLENV lists, so the
-        // terminal's identity has to be listed there. Do it after every
-        // override, to merge the user's own WSLENV instead of replacing it.
-        // TERM waits for `start`, which can ask the distribution.
+        // terminal's identity has to be listed there, for WSL's bash.exe
+        // launcher too. Do it after every override, to merge the user's own
+        // WSLENV instead of replacing it. TERM waits for `start`, which can
+        // ask the distribution of a wsl.exe launch.
+        const wsl_argv: ?[]const [:0]const u8 = if (comptime builtin.os.tag == .windows)
+            try wsl_env.launchArgv(alloc, exec_command.args, exec_command.windows_cmd_shell)
+        else
+            null;
+        const wsl_launch = if (comptime builtin.os.tag == .windows)
+            wsl_argv != null or
+                try wsl_env.launchesBashLauncher(alloc, exec_command.args, exec_command.windows_cmd_shell, &env)
+        else
+            false;
+        if (wsl_launch) try wsl_env.forwardIdentity(&env, term_overridden);
         const wsl_probe: ?wsl_env.Probe = if (comptime builtin.os.tag == .windows) wsl: {
-            const argv = try wsl_env.launchArgv(
-                alloc,
-                exec_command.args,
-                exec_command.windows_cmd_shell,
-            ) orelse break :wsl null;
-            try wsl_env.forwardIdentity(&env, term_overridden);
+            const argv = wsl_argv orelse break :wsl null;
             if (term_overridden or std.mem.eql(u8, cfg.term, "xterm-256color")) break :wsl null;
-            if (!exec_command.windows_cmd_shell and !wsl_env.canProbeDirect(argv[0])) break :wsl null;
-            if (exec_command.windows_cmd_shell and !wsl_env.canProbeShell(exec_command.args[2])) break :wsl null;
-            if (exec_command.windows_cmd_shell and !wsl_env.cmdAutoRunAbsent()) break :wsl null;
+            const can_probe = if (exec_command.windows_cmd_shell)
+                wsl_env.canProbeShell(exec_command.args[2]) and wsl_env.cmdAutoRunAbsent()
+            else
+                wsl_env.canProbeDirect(argv[0]);
+            if (!can_probe) break :wsl null;
             break :wsl .{ .argv = argv, .term = try alloc.dupe(u8, cfg.term), .cwd = cwd };
         } else null;
 
@@ -1212,12 +1245,14 @@ const Subprocess = struct {
             .cwd = cwd,
             .args = exec_command.args,
             .windows_cmd_shell = exec_command.windows_cmd_shell,
+            .command_line = command_line,
             .pty_options = cfg.pty_options,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
             .windows_job_object_plan = cfg.windows_job_object_plan,
             .wsl_probe = wsl_probe,
+            .wsl_launch = wsl_launch,
 
             // Should be initialized with initTerminal call.
             .grid_size = .{},
@@ -1299,7 +1334,7 @@ const Subprocess = struct {
             }
         };
 
-        log.debug("starting command command={f}", .{ArgsFormatter{ .args = self.args }});
+        log.debug("starting command command={f}", .{internal_os.redact.argv(self.args)});
 
         // If we can't access the cwd, then don't set any cwd and inherit.
         // This is important because our cwd can be set by the shell (OSC 7)
@@ -1379,6 +1414,7 @@ const Subprocess = struct {
             .path = self.args[0],
             .args = self.args,
             .windows_cmd_shell = self.windows_cmd_shell,
+            .windows_command_line = self.command_line,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
             .stdin = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
@@ -2063,7 +2099,6 @@ test "Windows pty reader cancel is retried for a read that starts after the firs
 test "child exit report gives up on a full app mailbox once the surface is closing" {
     const alloc = std.testing.allocator;
     var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
     const app_queue = try AppMailbox.Queue.create(alloc);
@@ -2190,27 +2225,53 @@ test "handoff adopted execution reuses pipes without spawn job or terminate" {
 }
 
 test "Subprocess.init frees the env it takes when it fails" {
-    // A first put into an empty map allocates this many times.
-    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var probe = EnvMap.init(counting.allocator());
-    try probe.put("TERM", "xterm-256color");
-    probe.deinit();
+    const testing = std.testing;
 
-    // Without a resources dir, init puts TERM and then COLORTERM: fail the
-    // second put while the env holds the first. Before the fix nobody freed
-    // it, since the caller cannot tell what the env grew into.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = counting.alloc_index,
-    });
-    try std.testing.expectError(error.OutOfMemory, Subprocess.init(std.testing.allocator, .{
-        .env = EnvMap.init(failing.allocator()),
-        .resources_dir = null,
-        .term = "xterm-256color",
-        .rt_pre_exec_info = undefined,
-        .rt_post_fork_info = undefined,
-    }));
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    const Run = struct {
+        fn initWithEnv(alloc: Allocator) !void {
+            var env: EnvMap = .init(alloc);
+            {
+                errdefer env.deinit();
+                try env.put("HOME", "C:\\Users\\noctty");
+                try env.put("SHELL", "cmd.exe");
+            }
+
+            // The env is not freed here once init has it: the failing
+            // allocator reports it as a leak unless init freed it. A direct
+            // command skips profile discovery, and xterm-256color and no
+            // resources dir skip the terminfo and WSL probes.
+            var subprocess = try Subprocess.init(alloc, .{
+                .command = .{ .direct = &.{"cmd.exe"} },
+                .env = env,
+                .resources_dir = null,
+                .term = "xterm-256color",
+                .rt_pre_exec_info = undefined,
+                .rt_post_fork_info = undefined,
+            });
+            subprocess.deinit();
+        }
+    };
+
+    // Fail each allocation in turn, while building the env and inside init,
+    // as std.testing.checkAllAllocationFailures does. That function cannot
+    // be used directly: init deliberately falls back to a basic shell when
+    // building the command fails, so some runs succeed despite the failure.
+    // Every run must still free all it allocated.
+    const count = count: {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        try Run.initWithEnv(failing.allocator());
+        break :count failing.alloc_index;
+    };
+    for (0..count) |fail_index| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        Run.initWithEnv(failing.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 /// Builds the argv array for the process we should exec for the
@@ -2792,6 +2853,42 @@ test "PKG48 final launch form scopes the cwd search guard after environment over
     }
 }
 
+test "Subprocess keeps a user profile's command line only for the argv it describes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const line = "cmd.exe /k \"\"C:\\Tools Dir\\init.cmd\" \"some arg\"\" & echo \"a&b\"";
+    const argv = try windows_shell.splitWindowsCommandLine(alloc, line);
+    const Case = struct { command: configpkg.Command, kept: bool };
+    for ([_]Case{
+        // The profile's own argv: CreateProcess gets the line as written.
+        .{ .command = .{ .direct = argv }, .kept = true },
+        // `initial-command` (or anything else) runs another argv.
+        .{ .command = .{ .direct = &.{ "cmd.exe", "/k", "other" } }, .kept = false },
+        // A shell-form command runs through the cmd /C trampoline.
+        .{ .command = .{ .shell = "cmd.exe /k echo x" }, .kept = false },
+    }) |case| {
+        var subprocess = try Subprocess.init(testing.allocator, .{
+            .command = case.command,
+            .command_line = line,
+            .env = EnvMap.init(testing.allocator),
+            .resources_dir = null,
+            .utf8_console = .never,
+            .term = "xterm-256color",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer subprocess.deinit();
+        if (case.kept) {
+            try testing.expectEqualStrings(line, subprocess.command_line.?);
+        } else {
+            try testing.expect(subprocess.command_line == null);
+        }
+    }
+}
+
 test "a WSL launch lists the terminal's identity in WSLENV" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
@@ -2877,6 +2974,52 @@ test "a WSL launch lists the terminal's identity in WSLENV" {
         }
     }
 
+    // WSL's bash.exe launcher passes WSLENV as wsl.exe does, so its pane
+    // gets the identity too. It names no distribution, so nothing asks one
+    // for TERM: that stays wsl.exe's unless the configuration sets it.
+    {
+        const system_root = try std.process.getEnvVarOwned(arena.allocator(), "SystemRoot");
+        const bash = try std.fs.path.joinZ(arena.allocator(), &.{ system_root, "System32", "bash.exe" });
+        var overrides: configpkg.RepeatableStringMap = .{};
+        try overrides.parseCLI(arena.allocator(), "WSLENV=GOPATH/l");
+        var subprocess = try Subprocess.init(testing.allocator, .{
+            .command = .{ .direct = &.{bash} },
+            .env = EnvMap.init(testing.allocator),
+            .env_override = overrides,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer subprocess.deinit();
+        try testing.expect(subprocess.wsl_launch);
+        try testing.expectEqualStrings(
+            "GOPATH/l:COLORTERM/u:TERM_PROGRAM/u:TERM_PROGRAM_VERSION/u",
+            subprocess.env.?.get("WSLENV").?,
+        );
+        try testing.expectEqual(null, subprocess.wsl_probe);
+
+        // A TERM the configuration sets is listed, as for wsl.exe.
+        var term_set: configpkg.RepeatableStringMap = .{};
+        try term_set.parseCLI(arena.allocator(), "TERM=xterm-kitty");
+        var with_term = try Subprocess.init(testing.allocator, .{
+            .command = .{ .direct = &.{bash} },
+            .env = EnvMap.init(testing.allocator),
+            .env_override = term_set,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer with_term.deinit();
+        try testing.expectEqualStrings(
+            "COLORTERM/u:TERM_PROGRAM/u:TERM_PROGRAM_VERSION/u:TERM/u",
+            with_term.env.?.get("WSLENV").?,
+        );
+        try testing.expectEqualStrings("xterm-kitty", with_term.env.?.get("TERM").?);
+        try testing.expectEqual(null, with_term.wsl_probe);
+    }
+
     // Another program is not a WSL launch.
     {
         const env = EnvMap.init(testing.allocator);
@@ -2913,6 +3056,102 @@ test "a WSL launch lists the terminal's identity in WSLENV" {
             "COLORTERM/u:TERM_PROGRAM/u:TERM_PROGRAM_VERSION/u",
             subprocess.env.?.get("WSLENV").?,
         );
+    }
+}
+
+test "a pane knows it runs WSL from its launch command, probe or not" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // A TERM set through `env` is never probed, but the pane is still WSL.
+    var term_set: configpkg.RepeatableStringMap = .{};
+    try term_set.parseCLI(arena.allocator(), "TERM=xterm-kitty");
+
+    for ([_]struct { command: configpkg.Command, env: configpkg.RepeatableStringMap = .{}, wsl: bool }{
+        .{ .command = .{ .direct = &.{ "C:\\Windows\\System32\\wsl.exe", "-d", "Ubuntu" } }, .wsl = true },
+        .{ .command = .{ .direct = &.{"wsl"} }, .wsl = true },
+        .{ .command = .{ .direct = &.{"wsl.exe"} }, .env = term_set, .wsl = true },
+        .{ .command = .{ .shell = "wsl.exe -d Ubuntu" }, .wsl = true },
+        .{ .command = .{ .direct = &.{"C:\\Windows\\System32\\cmd.exe"} }, .wsl = false },
+        .{ .command = .{ .direct = &.{ "C:\\msys64\\usr\\bin\\fish.exe", "-l" } }, .wsl = false },
+        .{ .command = .{ .shell = "C:\\msys64\\usr\\bin\\fish.exe -l" }, .wsl = false },
+        .{ .command = .{ .direct = &.{"C:\\Program Files\\Git\\bin\\bash.exe"} }, .wsl = false },
+    }) |case| {
+        var exec = try Exec.init(testing.allocator, .{
+            .command = case.command,
+            .env = EnvMap.init(testing.allocator),
+            .env_override = case.env,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer exec.deinit();
+        try testing.expectEqual(case.wsl, exec.launchesWsl());
+    }
+}
+
+test "a pane that starts WSL's bash.exe launcher runs WSL (#520 review)" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A bare `bash` is the first one on the child's PATH, as for shell
+    // integration: WSL's alias lives in a WindowsApps folder, Git's does not.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("WindowsApps");
+    try tmp.dir.makePath("Git\\bin");
+    try tmp.dir.writeFile(.{ .sub_path = "WindowsApps\\bash.exe", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "Git\\bin\\bash.exe", .data = "" });
+    const apps = try tmp.dir.realpathAlloc(a, "WindowsApps");
+    const git = try tmp.dir.realpathAlloc(a, "Git\\bin");
+
+    const system_root = try std.process.getEnvVarOwned(a, "SystemRoot");
+    const system_bash = try std.fs.path.joinZ(a, &.{ system_root, "System32", "bash.exe" });
+    const system_argv = [_][:0]const u8{system_bash};
+    const alias_argv = [_][:0]const u8{"C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe"};
+    const system_line = try std.fmt.allocPrintSentinel(a, "\"{s}\" -l", .{system_bash}, 0);
+
+    for ([_]struct { command: configpkg.Command, path: ?[]const u8 = null, wsl: bool }{
+        .{ .command = .{ .direct = &system_argv }, .wsl = true },
+        .{ .command = .{ .shell = system_line }, .wsl = true },
+        .{ .command = .{ .direct = &alias_argv }, .wsl = true },
+        .{ .command = .{ .direct = &.{"bash"} }, .path = apps, .wsl = true },
+        .{ .command = .{ .direct = &.{"bash.exe"} }, .path = apps, .wsl = true },
+        .{ .command = .{ .shell = "bash -l" }, .path = apps, .wsl = true },
+        .{ .command = .{ .direct = &.{"bash"} }, .path = git, .wsl = false },
+        .{ .command = .{ .shell = "bash -l" }, .path = git, .wsl = false },
+        .{ .command = .{ .direct = &.{"bash"} }, .wsl = false },
+        // Not recognized, as docs/windows.md says: WSL started by another
+        // program, and a distribution's own launcher.
+        .{ .command = .{ .shell = "cmd /c wsl" }, .wsl = false },
+        .{ .command = .{ .direct = &.{"C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\ubuntu.exe"} }, .wsl = false },
+    }, 0..) |case, index| {
+        var env = EnvMap.init(testing.allocator);
+        if (case.path) |path| try env.put("PATH", path);
+        var exec = try Exec.init(testing.allocator, .{
+            .command = case.command,
+            .env = env,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        });
+        defer exec.deinit();
+        testing.expectEqual(case.wsl, exec.launchesWsl()) catch |err| {
+            std.debug.print("case {d}\n", .{index});
+            return err;
+        };
+        // And it lists the terminal's identity for WSL exactly then.
+        testing.expectEqual(case.wsl, exec.subprocess.env.?.get("WSLENV") != null) catch |err| {
+            std.debug.print("case {d} WSLENV\n", .{index});
+            return err;
+        };
     }
 }
 

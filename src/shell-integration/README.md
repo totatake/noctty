@@ -104,7 +104,10 @@ distributed module by its absolute path in the startup clause. A user-supplied
 
 Nushell provides many shell features itself, such as `title` and `cursor`,
 so our integration focuses on noctty-specific features like `sudo`,
-`ssh-env`, and `ssh-terminfo`.
+`ssh-env`, and `ssh-terminfo`. The integration's `ssh` and `sudo` wrappers keep
+your external completer (such as carapace) through `@complete external`, which
+needs Nushell 0.108 or later; an older Nushell cannot parse the module and loads
+none of it.
 
 The shell integration is automatically enabled when running Nushell in noctty,
 but you can also load it manually if shell integration is disabled. Replace the
@@ -193,8 +196,12 @@ segment percent-encoded, and OSC 133 A / B / D prompt marks with a stable
 user's prompt writes itself lands after A. B is written by the line reader
 (below), after the host has drawn the prompt and before PSReadLine starts, so
 it lands where input begins whatever the prompt returned, and the returned
-string stays exactly the user's: a transcript, including one the "Turn on
-PowerShell Transcription" group policy starts, records the prompt without it.
+string stays exactly the user's: a `Start-Transcript` transcript records the
+prompt without it (measured in FullLanguage, which the automatic bootstrap
+needs: it skips ConstrainedLanguage). The "Turn on PowerShell Transcription" group
+policy is expected to start the same host transcription, so its transcript
+should do the same; that is inferred, not measured, and no policy has been
+set to check it.
 A B written from inside the prompt function would land ahead of the visible
 prompt, because the host draws the returned string only after the function
 returns, and the prompt's cells would be taken for input. Two cases have no
@@ -215,11 +222,14 @@ line is read. The one prompt drawn before that, by the user's own function,
 gets its marks from the line reader instead, all after its text: the D for the
 command that replaced the prompt, OSC 7, and `133;P;k=i;redraw=0` in place of
 its missing A (P does not fresh-line, so the cursor stays where the prompt
-ended), then B. A prompt that cannot be wrapped, because it is `ReadOnly` or
-was deleted, gets OSC 7, P and B on every line, but no D (see below). Only the
-host's own read of a prompt line gets these marks: not a script that calls
-`PSConsoleHostReadLine` itself, whose command they would cut short, and not a
-remote prompt under `Enter-PSSession`.
+ended), then B. A venv's one prompt is the exception: it writes `(venv) ` and
+calls the saved copy of our wrapper, which writes D, OSC 7 and A itself, so they
+land after `(venv) ` instead of before it, and the line reader adds only B. A
+prompt that cannot be wrapped, because it is `ReadOnly` or was deleted, gets
+OSC 7, P and B on every line, but no D (see below). Only the host's own read of
+a prompt line gets these marks: not a script that calls `PSConsoleHostReadLine`
+itself, whose command they would cut short, and not a remote prompt under
+`Enter-PSSession`.
 
 That D is worked out by the wrapper's rules (below), from the `$?` the host
 hands the line reader, which is still the command's, and from the snapshots
@@ -246,10 +256,8 @@ finds nothing, and copying its output returns the prompt's text, with or
 without the D. That is why a prompt that stays unwrapped gets no D: every
 command is typed at such a prompt, and a D after it would make copying any
 command's output return the prompt's text instead of nothing, at the price of
-those commands' notifications and exit status. (For a venv that one prompt is
-`(venv) ` followed by the saved copy of our wrapper, so its marks land after
-`(venv) ` instead of before it.) All of this needs PSReadLine; without it a
-replaced prompt stays unwrapped and gets no D, as before.
+those commands' notifications and exit status. All of this needs PSReadLine;
+without it a replaced prompt stays unwrapped and gets no D, as before.
 
 Hooking `prompt` through a global alias instead, which PowerShell resolves
 before a function of the same name, would catch that one prompt too. It was

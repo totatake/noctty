@@ -3,6 +3,11 @@ param(
     [string]$BashPath = ''
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'bash-shell-integration.ps1'
+try {
+
+
 # Runs src/shell-integration/bash/ghostty.bash in Git for Windows' bash over a
 # pipe and reads back what it writes. It covers what the Zig tests cannot reach:
 # the status in OSC 133;D, the PATH feature, and the working directory in OSC 7
@@ -148,7 +153,7 @@ try {
     $out = Invoke-Bash -StartPwd $cwd -WorkingDirectory $cwd -Stdin "echo PWDNOW:`$PWD`ncd /tmp`ncd /`nexit`n"
     $posix = [regex]::Match($out, 'PWDNOW:([^\r\n]*)').Groups[1].Value
     Assert-True ($posix.StartsWith('/')) "PWD stayed a Windows path: '$posix'"
-    $reports = Get-Osc7 $out
+    $reports = @(Get-Osc7 $out)
     Assert-True ($reports.Count -ge 3) "Expected an OSC 7 for the start and each cd, got $($reports.Count)."
     # Compare the tail only: a runner's TEMP can be an 8.3 name that bash resolves.
     Assert-True ($reports[0][1].EndsWith('/a b#c%d')) "First OSC 7 path was '$($reports[0][1])', expected the start directory"
@@ -157,6 +162,58 @@ try {
         # noctty reads only `/X:/...` as a Windows directory; `/c/...` is a WSL path.
         Assert-True ($report[1] -match '^/[A-Z]:/') "OSC 7 path '$($report[1])' is not in the /X:/... form."
     }
+
+    # A directory name is untrusted text. Git Bash shows the U+F001-U+F01F that
+    # a Windows name holds for control bytes as raw bytes in $PWD, so an
+    # unstripped BEL and ESC would end the OSC 7 and send an OSC 52. The report
+    # must name the real directory, and the host name loses its controls too.
+    $sohName = 'z' + [char]0xF001 + 'q'
+    $escName = 'x' + [char]0xF007 + [char]0xF01B + ']52;c;SGVsbG8=' + [char]0xF007
+    foreach ($name in @($sohName, $escName)) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:TempDir $name) | Out-Null
+    }
+    # Git's own prompt from /etc/bash.bashrc prints $PWD raw in its title and
+    # is not noctty's, so the first line replaces it. The host name changes
+    # only after the SOH directory: its ESC would cut that report short.
+    $stdin = "PS1='`$ '`necho PWDNOW:`$PWD`ncd z*`nHOSTNAME=`$'h\e]52;c;SGk=\a'`ncd ../x*`nexit`n"
+    $out = Invoke-Bash -StartPwd $script:TempDir -WorkingDirectory $script:TempDir -Stdin $stdin
+    # Started from /tmp (where Git Bash mounts TEMP), cd would take the cygpath
+    # branch, which never passed the raw bytes on.
+    $posix = [regex]::Match($out, 'PWDNOW:([^\r\n]*)').Groups[1].Value
+    Assert-True ($posix -match '^/[a-z]/') "The control-byte case did not start on a drive mount: '$posix'"
+    Assert-True (-not $out.Contains("$([char]27)]52;")) "A directory or host name sent an OSC 52 (output: $(Show-Output $out))"
+    foreach ($body in [regex]::Matches($out, "\x1b\]7;([^\x07\x1b]*)")) {
+        Assert-True ($body.Groups[1].Value -notmatch '[\x00-\x1f\x7f]') "An OSC 7 carried a control byte: '$(Show-Output $body.Groups[1].Value)'"
+    }
+    # bash's output is read as Latin-1, so match the UTF-8 bytes of each name.
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $osc7 = @(Get-Osc7 $out)
+    foreach ($name in @($sohName, $escName)) {
+        $tail = '/' + $latin1.GetString([System.Text.Encoding]::UTF8.GetBytes($name))
+        $named = @($osc7 | Where-Object { $_[1].EndsWith($tail) })
+        Assert-True ($named.Count -eq 1) "No OSC 7 named the directory '$(Show-Output $tail)' (output: $(Show-Output $out))"
+    }
+    # `cd ../x*` is the last cd, so the last report is the ESC directory's,
+    # sent after the host name changed.
+    Assert-True ($osc7[-1][0] -ceq 'h]52;c;SGk=') "OSC 7 host was '$(Show-Output $osc7[-1][0])', expected the host name without its controls"
+
+    # Standalone Cygwin mounts a drive only under /cygdrive and resolves any
+    # other absolute path under its own root. A stand-in cygpath models that, so
+    # /cygdrive/c/.../z<SOH>q must report the directory that /c/... reported.
+    $cygwinBin = Join-Path $script:TempDir 'cygwin-bin'
+    New-Item -ItemType Directory -Force -Path $cygwinBin | Out-Null
+    $standIn = @(
+        '#!/bin/sh'
+        'for p; do :; done'
+        'case $p in'
+        '/cygdrive/?/*) exec /usr/bin/cygpath -m -- "${p#/cygdrive}" ;;'
+        '*) echo "C:/cygwin64$p" ;;'
+        'esac'
+    ) -join "`n"
+    [System.IO.File]::WriteAllText((Join-Path $cygwinBin 'cygpath'), $standIn + "`n")
+    $stdin = "PS1='`$ '`nbin=`$PWD/cygwin-bin`ncd z*`nPATH=`$bin:`$PATH PWD=/cygdrive`$PWD`nexit`n"
+    $osc7 = @(Get-Osc7 (Invoke-Bash -StartPwd $script:TempDir -WorkingDirectory $script:TempDir -Stdin $stdin))
+    Assert-True ($osc7.Count -eq 3 -and $osc7[2][1] -ceq $osc7[1][1]) "A /cygdrive directory with a control byte was not reported as the real one: $(($osc7 | ForEach-Object { Show-Output $_[1] }) -join ' | ')"
 
     # Normalising the Windows PWD keeps a junction in the path and leaves
     # OLDPWD as it was, set or not.
@@ -188,4 +245,8 @@ try {
             Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

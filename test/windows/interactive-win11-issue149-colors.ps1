@@ -7,6 +7,11 @@ param(
     [ValidateRange(10, 300)] [int]$TimeoutSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-issue149-colors.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $launcher = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -125,6 +130,9 @@ function Write-Issue149Config(
     $lines.Add('window-width = 90')
     $lines.Add('window-height = 24')
     $lines.Add('background-opacity = 1')
+    # The new-split phase reads both panes for the exact configured colors;
+    # the default dim of the pane that loses focus would blend them.
+    $lines.Add('unfocused-split-opacity = 1')
     if ($Case -ne 'default') { $lines.Add('theme = Cobalt2') }
     if ($Case -eq 'explicit') {
         # These follow the theme on purpose: explicit values must win.
@@ -314,7 +322,7 @@ Assert-Issue149PublicConfig $cli 'default' '282c34' 'ffffff' 'cc6666' $repoRoot
 $run = $null
 $primaryError = $null
 try {
-    $run = Start-StatefulApp $layout $exe $repoRoot 'issue149-colors'
+    $run = Start-StatefulApp $layout $exe $repoRoot 'issue149-colors' -UseConfiguredCommand
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $hostHwnd = Wait-StatefulHost $run $deadline
     Wait-InteractiveWin11Until -Deadline $deadline -Description 'initial issue149 payload marker' -Process $run.Process -Condition {
@@ -387,3 +395,7 @@ finally {
 
 if ($null -ne $primaryError) { throw $primaryError }
 Write-Host 'PASS: issue #149 default/theme/explicit colors reached the presented WGL framebuffer across reload, new tab, and new split.'
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

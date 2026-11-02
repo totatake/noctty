@@ -872,12 +872,9 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // Deinit our old config. We do this in the lock because the
     // stream handler may be referencing the old config (i.e. enquiry resp)
     //
-    // This must happen before `StreamHandler.changeConfig` below: that queues
-    // the mode 2031 report, and the queued message is drained against
-    // `self.config`. Installing after it would answer with the outgoing
-    // scheme. There is deliberately no direct write here — the queued report
-    // is the single source of these bytes, so an OS scheme flip produces
-    // exactly one report.
+    // This must happen before the mode 2031 report below, which reads the
+    // scheme from `self.config`: installing after it would answer with the
+    // outgoing scheme.
     installDerivedConfig(&self.config, config);
 
     // Update our stream handler. The stream handler uses the same
@@ -904,6 +901,17 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         break :cursor color.toTerminalRGB() orelse break :cursor null;
     };
 
+    // The config could have changed any of our colors so update mode 2031.
+    // This is written directly rather than queued as a color_scheme_report
+    // message because we're on the io thread, the only reader of our
+    // mailbox: if the mailbox were full, queueing would wait forever.
+    // (Fork: upstream writes it last; here it comes before the image limits,
+    // whose `try` would otherwise skip it. Pinned by "issue149 config change
+    // writes exactly one color scheme report".)
+    self.colorSchemeReportLocked(td, false) catch |err| {
+        log.warn("error sending color scheme report err={}", .{err});
+    };
+
     // Set the image size limits
     var it = self.terminal.screens.all.iterator();
     while (it.next()) |entry| {
@@ -917,7 +925,7 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 }
 
 /// Replace the live derived config. Split out so the ordering contract with
-/// the queued mode 2031 report is testable: whatever is installed here is what
+/// the mode 2031 report is testable: whatever is installed here is what
 /// `colorSchemeReportLocked` will report.
 fn installDerivedConfig(current: *DerivedConfig, replacement: *DerivedConfig) void {
     current.deinit();
@@ -932,19 +940,24 @@ pub fn resize(
 ) !void {
     const grid_size = size.grid();
 
-    // Update the size of our pty. A pty that refuses (a pseudo console whose
-    // host is gone, a handoff session whose signal pipe closed) must not
-    // keep the grid and the renderer at the old size: the surface has the
-    // new size either way. A mode 2048 report below then says the new size
-    // while the pty may keep the old one until a later resize succeeds.
-    self.backend.resize(grid_size, size.terminal()) catch |err| {
-        log.warn("pty resize failed, resizing the terminal anyway err={}", .{err});
-    };
-
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+
+        // Resizing the pty can make the shell, or the pseudo console's host,
+        // redraw at once. Hold the same lock used by processOutput before
+        // notifying it, so that redraw cannot be parsed against the old
+        // terminal dimensions.
+        //
+        // A pty that refuses (a pseudo console whose host is gone, a handoff
+        // session whose signal pipe closed) must not keep the grid and the
+        // renderer at the old size: the surface has the new size either way.
+        // A mode 2048 report below then says the new size while the pty may
+        // keep the old one until a later resize succeeds.
+        self.backend.resize(grid_size, size.terminal()) catch |err| {
+            log.warn("pty resize failed, resizing the terminal anyway err={}", .{err});
+        };
 
         // The stream handler reads this under the same lock (DECCOLM's
         // mode 3 reset, size reports).
@@ -1057,60 +1070,79 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    // Whether the rows above the cursor were erased; null at a prompt.
-    const erased_off_prompt: ?bool = clear: {
+    const cleared = clear: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-
-        // If we're on the alternate screen, we do not clear. Since this is an
-        // emulator-level screen clear, this messes up the running programs
-        // knowledge of where the cursor is and causes rendering issues. So,
-        // for alt screen, we do nothing.
-        if (self.terminal.screens.active_key == .alternate) return;
-
-        // Clear our selection
-        self.terminal.screens.active.clearSelection();
-
-        // Clear our scrollback
-        if (history) self.terminal.eraseDisplay(.scrollback, false);
-
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
-            const erased = self.terminal.screens.active.cursor.y > 0;
-            if (erased) {
-                self.terminal.screens.active.eraseActive(
-                    self.terminal.screens.active.cursor.y - 1,
-                );
-            }
-
-            // Keep the screen clear consistent by dropping Kitty graphics
-            // state alongside the text clear.
-            self.terminal.screens.active.kitty_images.delete(
-                self.terminal.screens.active.alloc,
-                &self.terminal,
-                .{ .all = true },
-            );
-
-            break :clear erased;
-        }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        self.terminal.eraseDisplay(.complete, false);
-        break :clear null;
+        break :clear clearTerminalScreen(&self.terminal, history);
     };
 
-    // Off a prompt nothing tells the child: ConPTY still holds the erased
-    // rows and its cursor stays below them, so the next line a console
-    // program draws by ConPTY's cursor lands that many rows down. ConPTY
-    // makes the cursor's row its top row too.
-    if (erased_off_prompt) |erased| {
-        if (erased) self.ptyClear(true);
-        return;
+    switch (cleared) {
+        .none => {},
+
+        // Off a prompt nothing tells the child: ConPTY still holds the erased
+        // rows and its cursor stays below them, so the next line a console
+        // program draws by ConPTY's cursor lands that many rows down. ConPTY
+        // makes the cursor's row its top row too.
+        .above_cursor => self.ptyClear(true),
+
+        // At a prompt, we send a form-feed so the shell repaints the screen.
+        .at_prompt => try self.queueWrite(td, &[_]u8{0x0C}, false),
+    }
+}
+
+/// What `clearTerminalScreen` cleared, which decides what the child is told.
+const ScreenClear = enum {
+    /// Nothing the child needs to hear of: the alternate screen, which is
+    /// never cleared, or a cursor on the top row off a prompt.
+    none,
+    /// Off a prompt, the rows above the cursor.
+    above_cursor,
+    /// At a prompt, the whole screen.
+    at_prompt,
+};
+
+/// The terminal half of `clearScreen`, called under the renderer lock.
+fn clearTerminalScreen(t: *terminalpkg.Terminal, history: bool) ScreenClear {
+    // If we're on the alternate screen, we do not clear. Since this is an
+    // emulator-level screen clear, this messes up the running programs
+    // knowledge of where the cursor is and causes rendering issues. So,
+    // for alt screen, we do nothing.
+    if (t.screens.active_key == .alternate) return .none;
+
+    // Clear our selection
+    t.screens.active.clearSelection();
+
+    // Clear our scrollback
+    if (history) t.eraseDisplay(.scrollback, false);
+
+    // If we're not at a prompt, we just delete above the cursor.
+    if (!t.cursorIsAtPrompt()) {
+        const erased = t.screens.active.cursor.y > 0;
+        if (erased) {
+            t.screens.active.eraseActive(t.screens.active.cursor.y - 1);
+        }
+
+        // Keep the screen clear consistent by dropping Kitty graphics
+        // state alongside the text clear.
+        t.screens.active.kitty_images.delete(
+            t.screens.active.alloc,
+            t,
+            .{ .all = true },
+        );
+
+        return if (erased) .above_cursor else .none;
     }
 
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    // At a prompt, we want to first fully clear the screen, and then after
+    // send a FF (0x0C) to the shell so that it can repaint the screen.
+    t.eraseDisplay(.complete, false);
+
+    // ED 2 at a prompt scrolls the screen into scrollback when the last
+    // non-empty row is the prompt, blank rows below it included (the #905
+    // heuristic, upstream #14668), so the scrollback erased above would
+    // get the screen back. Erase it again.
+    if (history) t.eraseDisplay(.scrollback, false);
+    return .at_prompt;
 }
 
 /// Scroll the viewport
@@ -1218,7 +1250,7 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
         );
         // Record the wake before the lock lets the renderer see this state:
         // its follow-up leaves dirt to a recorded wake, and would otherwise
-        // draw it here and then again for the wake (`renderFollowupDecision`).
+        // draw it here and then again for the wake (`Pacer.followupDue`).
         if (should_render) self.renderer_state.noteWakeSource(.io_output);
         break :render .{
             .should_render = should_render,
@@ -1356,7 +1388,7 @@ fn processOutputLocked(self: *Termio, buf: []const u8) struct {
     };
 }
 
-fn shouldWakeRendererAfterOutput(
+pub fn shouldWakeRendererAfterOutput(
     had_render_work: bool,
     has_render_work: bool,
     queued_renderer_message: bool,
@@ -1439,6 +1471,41 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "clear screen at a prompt above blank rows leaves no scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_]bool{ true, false }) |history| {
+        var t = try terminalpkg.Terminal.init(alloc, .{ .cols = 10, .rows = 15 });
+        defer t.deinit(alloc);
+
+        // Command output, then a prompt in the middle of the screen with
+        // blank rows below it, as in a fresh window after a few commands.
+        for (0..10) |_| {
+            try t.printString("x");
+            t.carriageReturn();
+            try t.linefeed();
+        }
+        try t.semanticPrompt(.init(.prompt_start));
+        try t.printString("$ ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+
+        try testing.expectEqual(ScreenClear.at_prompt, clearTerminalScreen(&t, history));
+        const pages = &t.screens.active.pages;
+        if (history) {
+            // "Clear the screen and scrollback": nothing is left anywhere.
+            try testing.expectEqual(@as(usize, pages.rows), pages.total_rows);
+            const str = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+            defer alloc.free(str);
+            try testing.expectEqualStrings("", str);
+        } else {
+            // Without it ED 2 keeps the screen in scrollback, which shows
+            // the history erase above is what empties it.
+            try testing.expect(pages.total_rows > pages.rows);
+        }
+    }
 }
 
 test "shared terminal dirty helper tracks visible terminal dirtiness" {
@@ -1583,14 +1650,123 @@ test "issue149 OS scheme flip reports only the newly installed scheme" {
     defer installed.deinit();
     var replacement = try DerivedConfig.init(testing.allocator, &config, .{ .theme = .dark });
 
-    // `changeConfig` installs before `StreamHandler.changeConfig` queues the
-    // mode 2031 report, and that queued message is drained against the live
-    // config. So whatever this leaves installed is exactly what gets reported:
-    // the incoming scheme, never the outgoing one.
+    // `changeConfig` installs before it writes the mode 2031 report, which
+    // reads the live config. So whatever this leaves installed is exactly
+    // what gets reported: the incoming scheme, never the outgoing one.
     installDerivedConfig(&installed, &replacement);
 
     try testing.expectEqual(configpkg.ConditionalState.Theme.dark, installed.conditional_state.theme);
     const report = colorSchemeReportBytes(installed.conditional_state.theme);
     try testing.expectEqualStrings(colorSchemeReportBytes(.dark), report);
     try testing.expect(!std.mem.eql(u8, colorSchemeReportBytes(.light), report));
+}
+
+/// Every pty write `queueWrite` has queued so far, in order. The test loop
+/// never runs, so nothing leaves the exec write queue.
+fn issue149QueuedWrites(td: *ThreadData, out: *std.ArrayList(u8)) !void {
+    out.clearRetainingCapacity();
+    var req = td.backend.exec.write_queue.head;
+    while (req) |r| : (req = r.next) {
+        try out.appendSlice(std.testing.allocator, r.full_write_buffer.slice);
+    }
+}
+
+test "issue149 config change writes exactly one color scheme report" {
+    // `Termio.changeConfig` writes the mode 2031 report itself, from the
+    // config it has just installed (`StreamHandler.changeConfig` no longer
+    // queues one: "issue149 config change queues no color scheme report" in
+    // stream_handler.zig). So an OS light/dark flip reaches a subscriber
+    // once, as the incoming scheme, and nothing reaches a program that did
+    // not ask for mode 2031.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    // Only what `changeConfig` reaches is set up.
+    var io: Termio = undefined;
+    io.alloc = alloc;
+    io.backend = .{ .exec = undefined };
+    io.config = try DerivedConfig.init(alloc, &config, .{ .theme = .light });
+    defer io.config.deinit();
+    io.terminal = try terminalpkg.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer io.terminal.deinit(alloc);
+
+    var renderer_mutex: std.Thread.Mutex = .{};
+    var renderer_state: renderer.State = undefined;
+    renderer_state.mutex = &renderer_mutex;
+    renderer_state.terminal = &io.terminal;
+    io.renderer_state = &renderer_state;
+
+    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer termio_mailbox.deinit(alloc);
+    var rt_app: apprt.App = undefined;
+    rt_app.ui_thread_id = 0;
+    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
+    const app_queue = try AppMailbox.Queue.create(alloc);
+    defer app_queue.destroy(alloc);
+    io.terminal_stream = StreamHandler.Stream.initAlloc(alloc, .{
+        .alloc = alloc,
+        .size = undefined,
+        .terminal = &io.terminal,
+        .termio_mailbox = &termio_mailbox,
+        .surface_mailbox = .{
+            .surface = undefined,
+            .app = .{ .rt_app = &rt_app, .mailbox = app_queue },
+        },
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .default_cursor_style = .block,
+        .default_cursor_blink = true,
+        .enquiry_response = "",
+        .osc_color_report_format = .@"16-bit",
+        .clipboard_write = .allow,
+    });
+    defer io.terminal_stream.deinit();
+
+    // The loop never runs, so the write stream's handle is never used.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var td: ThreadData = .{
+        .alloc = alloc,
+        .loop = &loop,
+        .renderer_state = &renderer_state,
+        .surface_mailbox = undefined,
+        .backend = .{ .exec = .{
+            .start = undefined,
+            .write_stream = xev.Stream.initFd(undefined),
+            .process = null,
+            .read_thread = undefined,
+            .read_thread_pipe = undefined,
+            .read_thread_fd = undefined,
+            .stopping = undefined,
+            .termios_timer = undefined,
+            .write_pool = .init(alloc),
+        } },
+        .mailbox = undefined,
+    };
+    defer td.backend.exec.write_pool.deinit();
+
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(alloc);
+
+    // Mode 2031 off: a change writes nothing.
+    var dark = try DerivedConfig.init(alloc, &config, .{ .theme = .dark });
+    try io.changeConfig(&td, &dark);
+    try issue149QueuedWrites(&td, &written);
+    try testing.expectEqualStrings("", written.items);
+
+    // Mode 2031 on: each change writes one report, of the scheme it installs.
+    io.terminal.modes.set(.report_color_scheme, true);
+    var light = try DerivedConfig.init(alloc, &config, .{ .theme = .light });
+    try io.changeConfig(&td, &light);
+    try issue149QueuedWrites(&td, &written);
+    try testing.expectEqualStrings("\x1B[?997;2n", written.items);
+
+    var dark_again = try DerivedConfig.init(alloc, &config, .{ .theme = .dark });
+    try io.changeConfig(&td, &dark_again);
+    try issue149QueuedWrites(&td, &written);
+    try testing.expectEqualStrings("\x1B[?997;2n\x1B[?997;1n", written.items);
 }

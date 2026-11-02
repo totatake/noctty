@@ -5,6 +5,7 @@ const Renderer = @import("../generic.zig").Renderer(Direct3D11);
 const RenderPass = @import("RenderPass.zig");
 const Target = @import("Target.zig");
 const Health = @import("../../renderer.zig").Health;
+const log = std.log.scoped(.d3d11);
 pub const Options = struct {};
 renderer: *Renderer,
 target: *Target,
@@ -17,12 +18,12 @@ pub fn renderPass(self: *Self, attachments: []const RenderPass.Options.Attachmen
 }
 pub fn markUnhealthy(self: *Self, context: []const u8, err: anyerror) void {
     self.healthy = false;
-    std.log.scoped(.d3d11).warn("frame unhealthy context={s} err={}", .{ context, err });
+    log.warn("frame unhealthy context={s} err={}", .{ context, err });
 }
 pub fn complete(self: *const Self, _: bool) void {
     var health: Health = if (self.healthy) .healthy else .unhealthy;
     if (self.healthy) self.renderer.api.present(self.target.*) catch |err| {
-        std.log.scoped(.d3d11).err("present failed err={}", .{err});
+        log.err("present failed err={}", .{err});
         health = .unhealthy;
     };
     self.renderer.frameCompleted(health);

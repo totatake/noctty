@@ -41,7 +41,10 @@ pub fn apply(state: *model.ShellState, intent: Intent) ReduceError!Reduction {
         .transfer_subtree => |transfer| try transferSubtree(state, &reduction, transfer.source_root, transfer.target_pane, transfer.direction, transfer.ratio),
         .set_transfer_applied => |transfer| try setTransferApplied(state, &reduction, transfer.source_root, transfer.applied),
         .discard_transfer => |source_root| try discardTransfer(state, source_root),
-        .close_pane => |id| try closePane(state, &reduction, id),
+        .close_pane => |id| try removePaneLeaf(state, &reduction, id, .release),
+        .detach_pane => |id| try removePaneLeaf(state, &reduction, id, .retain),
+        .restore_pane => |restore| try restorePane(state, &reduction, restore.pane, restore.at, restore.direction),
+        .discard_detached_pane => |id| try discardDetachedPane(state, id),
         .focus_window => |id| try focusWindow(state, &reduction, id),
         .focus_tab => |id| try focusTab(state, &reduction, id),
         .focus_pane => |id| try focusPane(state, &reduction, id),
@@ -113,41 +116,90 @@ fn createTab(state: *model.ShellState, out: *Reduction, window_id: model.WindowI
 }
 
 fn splitPane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId, direction: model.Direction, ratio: f32) !void {
-    if (!(ratio > 0 and ratio < 1)) return error.InvalidRatio;
-    const pane = state.pane(pane_id) orelse return error.StaleId;
-    const tab = state.tab(pane.tab) orelse return error.StaleId;
-    if (activeWindowForTab(state, tab.id) == null) return error.StaleId;
-    const leaf_id = (findPaneNode(state, tab.id, pane_id) orelse return error.StaleId).id;
-
-    try state.panes.ensureUnusedCapacity(state.allocator, 1);
-    try state.nodes.ensureUnusedCapacity(state.allocator, 2);
+    const place = try findPaneInsert(state, pane_id, direction, ratio);
+    try reservePaneInsert(state, out);
     try state.pane_ids.reserve(state.allocator);
-    try state.node_ids.reserveMany(state.allocator, 2);
-    try out.effects.ensureUnusedCapacity(state.allocator, 3);
 
     const new_pane = state.pane_ids.acquireAssumeCapacity();
-    const old_leaf = state.node_ids.acquireAssumeCapacity();
-    const new_leaf = state.node_ids.acquireAssumeCapacity();
-    const axis: model.Axis = switch (direction) {
-        .left, .right => .horizontal,
-        .up, .down => .vertical,
-    };
-    const new_first = direction == .left or direction == .up;
-
-    state.panes.appendAssumeCapacity(.{ .id = new_pane, .tab = tab.id });
-    state.nodes.appendAssumeCapacity(.{ .id = old_leaf, .tab = tab.id, .value = .{ .pane = pane_id } });
-    state.nodes.appendAssumeCapacity(.{ .id = new_leaf, .tab = tab.id, .value = .{ .pane = new_pane } });
-    state.node(leaf_id).?.value = .{ .split = .{
-        .axis = axis,
-        .ratio = ratio,
-        .first = if (new_first) new_leaf else old_leaf,
-        .second = if (new_first) old_leaf else new_leaf,
-    } };
-    tab.focused_pane = new_pane;
+    insertPaneAssumeCapacity(state, place, new_pane);
 
     out.effects.appendAssumeCapacity(.{ .create_surface = new_pane });
     out.effects.appendAssumeCapacity(.{ .focus_surface = new_pane });
     out.effects.appendAssumeCapacity(.persist_session);
+}
+
+/// Redo of a split: the retained pane splits `at` again, as `splitPane`
+/// would split it with a new pane, and keeps its ID. The redo shows the
+/// tab it changes with focus, so the tab comes to the front of its window
+/// and the window becomes the focused one.
+fn restorePane(
+    state: *model.ShellState,
+    out: *Reduction,
+    pane_id: model.PaneId,
+    at: model.PaneId,
+    direction: model.Direction,
+) !void {
+    const place = try findPaneInsert(state, at, direction, 0.5);
+    const window = activeWindowForTab(state, place.tab.id).?;
+    const retained_index = indexOfPaneId(window.retained_panes.items, pane_id) orelse return error.StaleId;
+    try reservePaneInsert(state, out);
+
+    _ = window.retained_panes.orderedRemove(retained_index);
+    insertPaneAssumeCapacity(state, place, pane_id);
+    window.active_tab = place.tab.id;
+    state.focused_window = window.id;
+
+    out.effects.appendAssumeCapacity(.{ .attach_surface = .{ .pane = pane_id, .beside = at, .direction = direction } });
+    out.effects.appendAssumeCapacity(.{ .focus_surface = pane_id });
+    out.effects.appendAssumeCapacity(.persist_session);
+}
+
+/// Where a pane goes in when it splits `at`.
+const PaneInsert = struct {
+    tab: *model.Tab,
+    /// `at`'s leaf, which becomes the split.
+    leaf: model.NodeId,
+    at: model.PaneId,
+    direction: model.Direction,
+    ratio: f32,
+};
+
+fn findPaneInsert(state: *model.ShellState, at: model.PaneId, direction: model.Direction, ratio: f32) !PaneInsert {
+    if (!(ratio > 0 and ratio < 1)) return error.InvalidRatio;
+    const pane = state.pane(at) orelse return error.StaleId;
+    const tab = state.tab(pane.tab) orelse return error.StaleId;
+    if (activeWindowForTab(state, tab.id) == null) return error.StaleId;
+    const leaf_id = (findPaneNode(state, tab.id, at) orelse return error.StaleId).id;
+    return .{ .tab = tab, .leaf = leaf_id, .at = at, .direction = direction, .ratio = ratio };
+}
+
+/// Everything `insertPaneAssumeCapacity` and three effects need.
+fn reservePaneInsert(state: *model.ShellState, out: *Reduction) !void {
+    try state.panes.ensureUnusedCapacity(state.allocator, 1);
+    try state.nodes.ensureUnusedCapacity(state.allocator, 2);
+    try state.node_ids.reserveMany(state.allocator, 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 3);
+}
+
+fn insertPaneAssumeCapacity(state: *model.ShellState, place: PaneInsert, new_pane: model.PaneId) void {
+    const old_leaf = state.node_ids.acquireAssumeCapacity();
+    const new_leaf = state.node_ids.acquireAssumeCapacity();
+    const axis: model.Axis = switch (place.direction) {
+        .left, .right => .horizontal,
+        .up, .down => .vertical,
+    };
+    const new_first = place.direction == .left or place.direction == .up;
+
+    state.panes.appendAssumeCapacity(.{ .id = new_pane, .tab = place.tab.id });
+    state.nodes.appendAssumeCapacity(.{ .id = old_leaf, .tab = place.tab.id, .value = .{ .pane = place.at } });
+    state.nodes.appendAssumeCapacity(.{ .id = new_leaf, .tab = place.tab.id, .value = .{ .pane = new_pane } });
+    state.node(place.leaf).?.value = .{ .split = .{
+        .axis = axis,
+        .ratio = place.ratio,
+        .first = if (new_first) new_leaf else old_leaf,
+        .second = if (new_first) old_leaf else new_leaf,
+    } };
+    place.tab.focused_pane = new_pane;
 }
 
 fn transferSubtree(
@@ -259,7 +311,10 @@ fn discardTransfer(state: *model.ShellState, source_root: model.NodeId) !void {
         source_window_id = source_window.id;
         remove_window = source_window.tabs.items.len == 0 and source_window.retained_tabs.items.len == 1;
         try state.tab_ids.free.ensureUnusedCapacity(state.allocator, 1);
-        if (remove_window) try state.window_ids.free.ensureUnusedCapacity(state.allocator, 1);
+        if (remove_window) {
+            try state.window_ids.free.ensureUnusedCapacity(state.allocator, 1);
+            try state.pane_ids.free.ensureUnusedCapacity(state.allocator, source_window.retained_panes.items.len);
+        }
         _ = source_tab;
     }
 
@@ -271,6 +326,7 @@ fn discardTransfer(state: *model.ShellState, source_root: model.NodeId) !void {
         try state.tab_ids.release(state.allocator, record.source_tab);
         if (remove_window) {
             const window_id = source_window_id.?;
+            try releaseRetainedPanes(state, source_window);
             removeWindow(state, window_id);
             try state.window_ids.release(state.allocator, window_id);
         }
@@ -400,10 +456,23 @@ fn focusPane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !
     out.effects.appendAssumeCapacity(.{ .focus_surface = pane_id });
 }
 
-fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !void {
+/// What becomes of a pane that leaves its tab's tree.
+const PaneRemoval = enum {
+    /// `close_pane`: its ID is released.
+    release,
+    /// `detach_pane`: its window retains its ID for redo, and the undo
+    /// shows the tab it changes with focus, so the tab comes to the front
+    /// of its window and the window becomes the focused one.
+    retain,
+};
+
+/// The pane's parent split takes its sibling's place. The tab keeps its
+/// focused pane unless that is the pane leaving; then the first pane of
+/// the sibling takes over.
+fn removePaneLeaf(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId, removal: PaneRemoval) !void {
     const pane = state.pane(pane_id) orelse return error.StaleId;
     const tab = state.tab(pane.tab) orelse return error.StaleId;
-    if (activeWindowForTab(state, tab.id) == null) return error.StaleId;
+    const window = activeWindowForTab(state, tab.id) orelse return error.StaleId;
     if (selectors.paneCount(state, tab.id) == 1) return error.LastPane;
 
     const relation = findPaneRelation(state, tab.root, pane_id, null) orelse return error.StaleId;
@@ -417,9 +486,12 @@ fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !
     const sibling = state.node(sibling_id) orelse return error.StaleId;
     const sibling_value = sibling.value;
     const next_focus = firstPane(state, sibling_id) orelse return error.StaleId;
-    try out.effects.ensureUnusedCapacity(state.allocator, 2);
+    try out.effects.ensureUnusedCapacity(state.allocator, 3);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, 2);
-    try state.pane_ids.free.ensureUnusedCapacity(state.allocator, 1);
+    switch (removal) {
+        .release => try state.pane_ids.free.ensureUnusedCapacity(state.allocator, 1),
+        .retain => try window.retained_panes.ensureUnusedCapacity(state.allocator, 1),
+    }
 
     parent.value = sibling_value;
     removeNode(state, relation.node);
@@ -427,11 +499,32 @@ fn closePane(state: *model.ShellState, out: *Reduction, pane_id: model.PaneId) !
     removePane(state, pane_id);
     try state.node_ids.release(state.allocator, relation.node);
     try state.node_ids.release(state.allocator, sibling_id);
-    try state.pane_ids.release(state.allocator, pane_id);
     if (tab.focused_pane.eql(pane_id)) tab.focused_pane = next_focus;
+    switch (removal) {
+        .release => try state.pane_ids.release(state.allocator, pane_id),
+        .retain => {
+            window.retained_panes.appendAssumeCapacity(pane_id);
+            window.active_tab = tab.id;
+            state.focused_window = window.id;
+            out.effects.appendAssumeCapacity(.{ .detach_surface = pane_id });
+        },
+    }
 
     out.effects.appendAssumeCapacity(.{ .focus_surface = tab.focused_pane });
     out.effects.appendAssumeCapacity(.persist_session);
+}
+
+/// A pane kept for redo is in no tree, so the saved session never had it;
+/// nothing to persist.
+fn discardDetachedPane(state: *model.ShellState, pane_id: model.PaneId) !void {
+    for (state.windows.items) |*window| {
+        const index = indexOfPaneId(window.retained_panes.items, pane_id) orelse continue;
+        try state.pane_ids.free.ensureUnusedCapacity(state.allocator, 1);
+        _ = window.retained_panes.orderedRemove(index);
+        try state.pane_ids.release(state.allocator, pane_id);
+        return;
+    }
+    return error.StaleId;
 }
 
 fn closeTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId) !void {
@@ -544,8 +637,9 @@ fn discardDetachedTab(state: *model.ShellState, tab_id: model.TabId) !void {
         if (node.tab.eql(tab_id)) node_count += 1;
     }
     const remove_window = window.tabs.items.len == 0 and window.retained_tabs.items.len == 1;
+    const retained_pane_count = if (remove_window) window.retained_panes.items.len else 0;
 
-    try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count);
+    try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count + retained_pane_count);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, node_count);
     try state.tab_ids.free.ensureUnusedCapacity(state.allocator, 1);
     if (remove_window) try state.window_ids.free.ensureUnusedCapacity(state.allocator, 1);
@@ -573,6 +667,7 @@ fn discardDetachedTab(state: *model.ShellState, tab_id: model.TabId) !void {
     try state.tab_ids.release(state.allocator, tab_id);
 
     if (remove_window) {
+        try releaseRetainedPanes(state, window);
         removeWindow(state, window_id);
         try state.window_ids.release(state.allocator, window_id);
     }
@@ -590,7 +685,12 @@ fn reorderTab(state: *model.ShellState, out: *Reduction, tab_id: model.TabId, in
     out.effects.appendAssumeCapacity(.persist_session);
 }
 
-fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.WindowId) !void {
+fn closeWindow(state: *model.ShellState, out: *Reduction, window_arg: model.WindowId) !void {
+    // Read field by field before anything moves. Zig may pass `window_arg` by
+    // reference, and `closeTab` passes `tab.window`, a field of the tab this
+    // swap-removes from `state.tabs`: the slot then holds a later tab, and the
+    // wrong window closed. A `const` copy of the struct aliased it as well.
+    const window_id: model.WindowId = .{ .index = window_arg.index, .generation = window_arg.generation };
     const window = state.window(window_id) orelse return error.StaleId;
     var pane_count: usize = 0;
     var node_count: usize = 0;
@@ -601,10 +701,12 @@ fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
         };
     };
     try out.effects.ensureUnusedCapacity(state.allocator, 1);
-    try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count);
+    try state.pane_ids.free.ensureUnusedCapacity(state.allocator, pane_count + window.retained_panes.items.len);
     try state.node_ids.free.ensureUnusedCapacity(state.allocator, node_count);
     try state.tab_ids.free.ensureUnusedCapacity(state.allocator, window.tabs.items.len + window.retained_tabs.items.len);
     try state.window_ids.free.ensureUnusedCapacity(state.allocator, 1);
+
+    try releaseRetainedPanes(state, window);
 
     var tab_i = state.tabs.items.len;
     while (tab_i > 0) {
@@ -642,6 +744,11 @@ fn closeWindow(state: *model.ShellState, out: *Reduction, window_id: model.Windo
 }
 
 fn indexOfId(items: []const model.TabId, id: model.TabId) ?usize {
+    for (items, 0..) |item, index| if (item.eql(id)) return index;
+    return null;
+}
+
+fn indexOfPaneId(items: []const model.PaneId, id: model.PaneId) ?usize {
     for (items, 0..) |item, index| if (item.eql(id)) return index;
     return null;
 }
@@ -744,6 +851,13 @@ fn firstPane(state: *model.ShellState, node_id: model.NodeId) ?model.PaneId {
         .pane => |id| id,
         .split => |split| firstPane(state, split.first),
     };
+}
+
+/// A window that goes releases the panes it kept for redo. The caller has
+/// reserved `pane_ids.free` capacity for them.
+fn releaseRetainedPanes(state: *model.ShellState, window: *model.Window) !void {
+    for (window.retained_panes.items) |pane_id| try state.pane_ids.release(state.allocator, pane_id);
+    window.retained_panes.clearRetainingCapacity();
 }
 
 fn removeWindow(state: *model.ShellState, id: model.WindowId) void {
@@ -862,4 +976,54 @@ test "close active last tab preserves previous adjacent focus" {
     try std.testing.expectEqual(@as(usize, 1), window.tabs.items.len);
     try std.testing.expect(window.tabs.items[0].eql(tab_a));
     try std.testing.expect(window.active_tab.?.eql(tab_a));
+}
+
+test "closing the only tab of a window opened before another closes that window" {
+    var state = model.ShellState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const first_window = state.focused_window.?;
+    const first_tab = state.window(first_window).?.tabs.items[0];
+    reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const second_window = state.focused_window.?;
+
+    // The first window's tab is not the last one in `state.tabs`, so closing
+    // it moves the second window's tab into its slot. Before the fix that
+    // closed the second window and left the first holding a freed tab, which
+    // `validate` rejects (`MissingTab`): the caption X of the first of two
+    // windows did nothing.
+    reduction = try apply(&state, .{ .close_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    try std.testing.expect(state.window(first_window) == null);
+    try std.testing.expect(state.window(second_window) != null);
+    try std.testing.expect(state.focused_window.?.eql(second_window));
+}
+
+test "discarding the undo tab of a window opened before another removes that window" {
+    var state = model.ShellState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const first_window = state.focused_window.?;
+    const first_tab = state.window(first_window).?.tabs.items[0];
+    reduction = try apply(&state, .create_window);
+    reduction.deinit(std.testing.allocator);
+    const second_window = state.focused_window.?;
+
+    // `close_tab:this` on the first window's only tab keeps it for undo, and
+    // its expiry discards it, removing the now empty first window, which is
+    // not the last one in `state.windows`.
+    reduction = try apply(&state, .{ .detach_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    reduction = try apply(&state, .{ .discard_detached_tab = first_tab });
+    reduction.deinit(std.testing.allocator);
+    try state.validate();
+    try std.testing.expect(state.window(first_window) == null);
+    try std.testing.expect(state.window(second_window) != null);
 }

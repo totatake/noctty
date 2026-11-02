@@ -789,6 +789,17 @@ const WindowsPty = struct {
         server_process: windows.HANDLE,
         reference: windows.HANDLE,
         signal_write_mutex: std.Thread.Mutex = .{},
+
+        /// Write one whole packet to the signal pipe under the write lock.
+        /// False when the pipe is closed or the write fails or falls short.
+        fn writeSignal(self: *HandoffControl, packet: []const u8) bool {
+            self.signal_write_mutex.lock();
+            defer self.signal_write_mutex.unlock();
+            const signal = self.signal orelse return false;
+            var written: windows.DWORD = 0;
+            return windows.kernel32.WriteFile(signal, packet.ptr, @intCast(packet.len), &written, null) != 0 and
+                written == packet.len;
+        }
     };
 
     pub const HandoffHandles = struct {
@@ -1043,22 +1054,22 @@ const WindowsPty = struct {
         switch (self.control) {
             .pseudo_console => {},
             .handoff => |*handoff| {
-                handoff.signal_write_mutex.lock();
-                defer handoff.signal_write_mutex.unlock();
-                const signal = handoff.signal orelse return error.VisibilityFailed;
                 // PtySignal::ShowHideWindow (u16), then a u16 boolean.
                 const packet = [_]u8{ 1, 0, @intFromBool(visible), 0 };
-                var written: windows.DWORD = 0;
-                if (windows.kernel32.WriteFile(signal, &packet, packet.len, &written, null) == 0 or
-                    written != packet.len)
-                {
-                    return error.VisibilityFailed;
-                }
+                if (!handoff.writeSignal(&packet)) return error.VisibilityFailed;
             },
         }
     }
 
     pub const PseudoConsoleSignalError = error{SignalFailed};
+
+    /// The pseudo console this process created; null for an adopted session.
+    fn createdPseudoConsole(self: *const Pty) ?PseudoConsole {
+        return switch (self.control) {
+            .pseudo_console => |pc| pc,
+            .handoff => null,
+        };
+    }
 
     /// Whether local clears also move this backend's cursor. Undo must
     /// keep that live coordinate space rather than replay a saved cursor.
@@ -1082,10 +1093,7 @@ const WindowsPty = struct {
     /// sessions, whose console host may predate the signal: conhost ends the
     /// session on a signal it does not know (PtySignalInputThread.cpp).
     pub fn clearPseudoConsole(self: *Pty, keep_cursor_row: bool) PseudoConsoleSignalError!void {
-        const pc = switch (self.control) {
-            .pseudo_console => |pc| pc,
-            .handoff => return,
-        };
+        const pc = self.createdPseudoConsole() orelse return;
         const clear = pc.conpty.clear orelse return;
         if (clear(pc.handle, @intFromBool(keep_cursor_row)) != windows.S_OK) return error.SignalFailed;
     }
@@ -1095,10 +1103,7 @@ const WindowsPty = struct {
     /// window. Same scope as `clearPseudoConsole`; adopted sessions use
     /// `setAdoptedVisibility`.
     pub fn showPseudoConsole(self: *Pty, visible: bool) PseudoConsoleSignalError!void {
-        const pc = switch (self.control) {
-            .pseudo_console => |pc| pc,
-            .handoff => return,
-        };
+        const pc = self.createdPseudoConsole() orelse return;
         const show_hide = pc.conpty.show_hide orelse return;
         if (show_hide(pc.handle, @intFromBool(visible)) != windows.S_OK) return error.SignalFailed;
     }
@@ -1108,10 +1113,7 @@ const WindowsPty = struct {
     /// belong to the terminal (conhost sets `GWLP_HWNDPARENT`, which moves
     /// neither focus nor the foreground). Same scope as `clearPseudoConsole`.
     fn reparentPseudoConsole(self: *Pty, owner: windows.HWND) PseudoConsoleSignalError!void {
-        const pc = switch (self.control) {
-            .pseudo_console => |pc| pc,
-            .handoff => return,
-        };
+        const pc = self.createdPseudoConsole() orelse return;
         const reparent = pc.conpty.reparent orelse return;
         if (reparent(pc.handle, owner) != windows.S_OK) return error.SignalFailed;
     }
@@ -1183,16 +1185,8 @@ const WindowsPty = struct {
                 if (result != windows.S_OK) return error.ResizeFailed;
             },
             .handoff => |*handoff| {
-                handoff.signal_write_mutex.lock();
-                defer handoff.signal_write_mutex.unlock();
-                const signal = handoff.signal orelse return error.ResizeFailed;
                 const packet = encodeHandoffResize(size.ws_col, size.ws_row);
-                var written: windows.DWORD = 0;
-                if (windows.kernel32.WriteFile(signal, &packet, packet.len, &written, null) == 0 or
-                    written != packet.len)
-                {
-                    return error.ResizeFailed;
-                }
+                if (!handoff.writeSignal(&packet)) return error.ResizeFailed;
             },
         }
         self.size = size;
@@ -1205,6 +1199,23 @@ const WindowsPty = struct {
         return null;
     }
 };
+
+/// An adopted pty that holds only `signal`, for tests of the signal pipe.
+/// Its pipes are undefined, so it is never passed to `deinit`.
+fn handoffPtyForTest(signal: windows.HANDLE) WindowsPty {
+    return .{
+        .out_pipe = undefined,
+        .in_pipe = undefined,
+        .out_pipe_pty = null,
+        .in_pipe_pty = null,
+        .control = .{ .handoff = .{
+            .signal = signal,
+            .server_process = windows.INVALID_HANDLE_VALUE,
+            .reference = windows.INVALID_HANDLE_VALUE,
+        } },
+        .size = .{},
+    };
+}
 
 test "handoff release drops the marshaled pipe ends without closing them" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
@@ -1265,18 +1276,7 @@ test "handoff resize writes one exact signal packet" {
     defer _ = windows.CloseHandle(signal_read);
     defer _ = windows.CloseHandle(signal_write);
 
-    var pty: WindowsPty = .{
-        .out_pipe = undefined,
-        .in_pipe = undefined,
-        .out_pipe_pty = null,
-        .in_pipe_pty = null,
-        .control = .{ .handoff = .{
-            .signal = signal_write,
-            .server_process = windows.INVALID_HANDLE_VALUE,
-            .reference = windows.INVALID_HANDLE_VALUE,
-        } },
-        .size = .{},
-    };
+    var pty = handoffPtyForTest(signal_write);
     try pty.setSize(.{ .ws_col = 80, .ws_row = 24 });
 
     var packet: [6]u8 = undefined;
@@ -1294,18 +1294,7 @@ test "handoff visibility writes exact boolean packets and fails after signal clo
     try std.testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
     defer _ = windows.CloseHandle(signal_read);
 
-    var pty: WindowsPty = .{
-        .out_pipe = undefined,
-        .in_pipe = undefined,
-        .out_pipe_pty = null,
-        .in_pipe_pty = null,
-        .control = .{ .handoff = .{
-            .signal = signal_write,
-            .server_process = windows.INVALID_HANDLE_VALUE,
-            .reference = windows.INVALID_HANDLE_VALUE,
-        } },
-        .size = .{},
-    };
+    var pty = handoffPtyForTest(signal_write);
     defer pty.closeAdoptedSignal();
 
     try pty.setAdoptedVisibility(true);
@@ -1335,18 +1324,7 @@ test "handoff visibility reports a broken signal receiver" {
     _ = windows.CloseHandle(signal_read);
     defer _ = windows.CloseHandle(signal_write);
 
-    var pty: WindowsPty = .{
-        .out_pipe = undefined,
-        .in_pipe = undefined,
-        .out_pipe_pty = null,
-        .in_pipe_pty = null,
-        .control = .{ .handoff = .{
-            .signal = signal_write,
-            .server_process = windows.INVALID_HANDLE_VALUE,
-            .reference = windows.INVALID_HANDLE_VALUE,
-        } },
-        .size = .{},
-    };
+    var pty = handoffPtyForTest(signal_write);
     try std.testing.expectError(error.VisibilityFailed, pty.setAdoptedVisibility(true));
 }
 
@@ -1381,18 +1359,7 @@ test "handoff visibility resize and close share the signal lock" {
         var signal_write: windows.HANDLE = undefined;
         try std.testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
         defer _ = windows.CloseHandle(signal_read);
-        var pty: WindowsPty = .{
-            .out_pipe = undefined,
-            .in_pipe = undefined,
-            .out_pipe_pty = null,
-            .in_pipe_pty = null,
-            .control = .{ .handoff = .{
-                .signal = signal_write,
-                .server_process = windows.INVALID_HANDLE_VALUE,
-                .reference = windows.INVALID_HANDLE_VALUE,
-            } },
-            .size = .{},
-        };
+        var pty = handoffPtyForTest(signal_write);
         defer pty.closeAdoptedSignal();
         var worker: Worker = .{ .pty = &pty, .operation = operation };
         var thread: ?std.Thread = null;
@@ -1414,28 +1381,29 @@ test "handoff visibility resize and close share the signal lock" {
     }
 }
 
+/// The caller's `NOCTTY_CONPTY`, if set, for `restoreConPtyEnvForTest`.
+fn saveConPtyEnvForTest(alloc: std.mem.Allocator) !?[:0]u8 {
+    const raw = std.process.getEnvVarOwned(alloc, "NOCTTY_CONPTY") catch return null;
+    defer alloc.free(raw);
+    return try alloc.dupeZ(u8, raw);
+}
+
+fn restoreConPtyEnvForTest(original: ?[:0]const u8) void {
+    WindowsConPty.resetForTest();
+    if (original) |value| {
+        _ = internal_os.setenv("NOCTTY_CONPTY", value);
+    } else {
+        _ = internal_os.unsetenv("NOCTTY_CONPTY");
+    }
+}
+
 test "Windows ConPTY resolver selects inbox and default auto backends" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    const original_raw = std.process.getEnvVarOwned(
-        testing.allocator,
-        "NOCTTY_CONPTY",
-    ) catch null;
-    defer if (original_raw) |value| testing.allocator.free(value);
-    const original = if (original_raw) |value|
-        try testing.allocator.dupeZ(u8, value)
-    else
-        null;
+    const original = try saveConPtyEnvForTest(testing.allocator);
     defer if (original) |value| testing.allocator.free(value);
-    defer {
-        WindowsConPty.resetForTest();
-        if (original) |value| {
-            _ = internal_os.setenv("NOCTTY_CONPTY", value);
-        } else {
-            _ = internal_os.unsetenv("NOCTTY_CONPTY");
-        }
-    }
+    defer restoreConPtyEnvForTest(original);
 
     WindowsConPty.resetForTest();
     try testing.expectEqual(@as(c_int, 0), internal_os.setenv("NOCTTY_CONPTY", "inbox"));
@@ -1490,24 +1458,9 @@ test "Windows ConPTY demotion never outruns a live bundled pseudo console" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    const original_raw = std.process.getEnvVarOwned(
-        testing.allocator,
-        "NOCTTY_CONPTY",
-    ) catch null;
-    defer if (original_raw) |value| testing.allocator.free(value);
-    const original = if (original_raw) |value|
-        try testing.allocator.dupeZ(u8, value)
-    else
-        null;
+    const original = try saveConPtyEnvForTest(testing.allocator);
     defer if (original) |value| testing.allocator.free(value);
-    defer {
-        WindowsConPty.resetForTest();
-        if (original) |value| {
-            _ = internal_os.setenv("NOCTTY_CONPTY", value);
-        } else {
-            _ = internal_os.unsetenv("NOCTTY_CONPTY");
-        }
-    }
+    defer restoreConPtyEnvForTest(original);
 
     // A creation attempt with an injected outcome: the in-box backend always
     // succeeds, the bundled backend succeeds only for the designated winner.
@@ -1633,24 +1586,9 @@ test "Windows ConPTY live bundled count follows real pseudo console open and clo
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    const original_raw = std.process.getEnvVarOwned(
-        testing.allocator,
-        "NOCTTY_CONPTY",
-    ) catch null;
-    defer if (original_raw) |value| testing.allocator.free(value);
-    const original = if (original_raw) |value|
-        try testing.allocator.dupeZ(u8, value)
-    else
-        null;
+    const original = try saveConPtyEnvForTest(testing.allocator);
     defer if (original) |value| testing.allocator.free(value);
-    defer {
-        WindowsConPty.resetForTest();
-        if (original) |value| {
-            _ = internal_os.setenv("NOCTTY_CONPTY", value);
-        } else {
-            _ = internal_os.unsetenv("NOCTTY_CONPTY");
-        }
-    }
+    defer restoreConPtyEnvForTest(original);
 
     // The fake bundled backend creates real pseudo consoles through kernel32
     // while reporting as bundled, so `open` and `deinit` exercise the exact
@@ -1749,22 +1687,11 @@ const RecordingConPty = struct {
     }
 };
 
-fn restoreConPtyEnvForTest(original: ?[:0]const u8) void {
-    WindowsConPty.resetForTest();
-    if (original) |value| {
-        _ = internal_os.setenv("NOCTTY_CONPTY", value);
-    } else {
-        _ = internal_os.unsetenv("NOCTTY_CONPTY");
-    }
-}
-
 test "Windows ConPTY measures text the terminal's way, on the bundled backend only" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    const original_raw = std.process.getEnvVarOwned(testing.allocator, "NOCTTY_CONPTY") catch null;
-    defer if (original_raw) |value| testing.allocator.free(value);
-    const original = if (original_raw) |value| try testing.allocator.dupeZ(u8, value) else null;
+    const original = try saveConPtyEnvForTest(testing.allocator);
     defer if (original) |value| testing.allocator.free(value);
     defer restoreConPtyEnvForTest(original);
 
@@ -1795,9 +1722,7 @@ test "Windows ConPTY optional exports reach the creating backend and are skipped
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    const original_raw = std.process.getEnvVarOwned(testing.allocator, "NOCTTY_CONPTY") catch null;
-    defer if (original_raw) |value| testing.allocator.free(value);
-    const original = if (original_raw) |value| try testing.allocator.dupeZ(u8, value) else null;
+    const original = try saveConPtyEnvForTest(testing.allocator);
     defer if (original) |value| testing.allocator.free(value);
     defer restoreConPtyEnvForTest(original);
 
@@ -1870,18 +1795,7 @@ test "Windows ConPTY optional exports reach the creating backend and are skipped
     var signal_write: windows.HANDLE = undefined;
     try testing.expect(windows.exp.kernel32.CreatePipe(&signal_read, &signal_write, null, 0) != 0);
     defer _ = windows.CloseHandle(signal_read);
-    var adopted: WindowsPty = .{
-        .out_pipe = undefined,
-        .in_pipe = undefined,
-        .out_pipe_pty = null,
-        .in_pipe_pty = null,
-        .control = .{ .handoff = .{
-            .signal = signal_write,
-            .server_process = windows.INVALID_HANDLE_VALUE,
-            .reference = windows.INVALID_HANDLE_VALUE,
-        } },
-        .size = .{},
-    };
+    var adopted = handoffPtyForTest(signal_write);
     defer adopted.closeAdoptedSignal();
     try testing.expect(!adopted.hasSynchronizedClear());
     try adopted.clearPseudoConsole(true);

@@ -4,6 +4,11 @@ param(
     [string] $Architecture = $null
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'package-scoop.ps1'
+try {
+
+
 # Contract for the generated Scoop manifest. Today that is the pre_uninstall
 # hook: Scoop deletes the folder a portable default-terminal registration
 # points into, so the hook has to unregister it, on uninstall only, only for a
@@ -147,4 +152,8 @@ finally {
     if (Test-Path -LiteralPath $scratchRoot) {
         Remove-Item -LiteralPath $scratchRoot -Recurse -Force
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

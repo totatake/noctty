@@ -5,6 +5,11 @@ param(
     [int] $TimeoutSeconds = 10
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'vt-probe-win32-conformance.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -134,3 +139,7 @@ if ($Runtime) {
 
 $mode = if ($Runtime) { 'runtime' } else { 'metadata' }
 Write-Host "vt-probe Win32 conformance validation: PASS (mode=$mode, stdout=$stdoutPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

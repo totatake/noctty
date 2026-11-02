@@ -74,8 +74,7 @@ fn initPortableRootCache() void {
 /// Return the process-wide cached portable root, if portable mode was enabled
 /// beside the executable. The caller owns the returned path.
 pub fn portableRoot(alloc: Allocator) !?[]u8 {
-    portable_root_once.call();
-    if (!portable_root_cache.present) return null;
+    if (!portableModeActive()) return null;
     return try alloc.dupe(u8, portable_root_cache.path[0..portable_root_cache.len]);
 }
 

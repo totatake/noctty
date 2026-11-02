@@ -73,9 +73,24 @@ Invoke-ContractTable -Contracts @(
         Content = {
             $siteDeployWorkflowText
         }
-        Pattern = '(?ms)^on:\s+push:\s+branches:\s+- main\s+release:\s+types:\s+- published\s+workflow_dispatch:\s*$'
+        Pattern = '(?ms)^on:\s+push:\s+branches:\s+- main\s+release:\s+types:\s+- published\s+workflow_run:\s+workflows:\s+- Release\s+types:\s+- completed\s+workflow_dispatch:\s*$'
         Kind = 'Text'
-        Description = 'site deployment catches every main advance plus published releases and manual dispatch'
+        Description = 'site deployment catches every main advance, published releases, every completed Release run and manual dispatch'
+    }
+    @{
+        File = $releaseWorkflow
+        Content = {
+            $releaseWorkflowText
+        }
+        Pattern = '\Aname: Release\r?\n'
+        Kind = 'Text'
+        Description = 'the workflow_run trigger names the release workflow by its exact name'
+    }
+    @{
+        File = $siteDeployWorkflow
+        Pattern = 'github\.event\.workflow_run'
+        Kind = 'WorkflowAbsent'
+        Description = 'a completed Release run deploys the default branch, never the triggering run''s commit or artifacts'
     }
     @{
         File = $siteDeployWorkflow
@@ -108,22 +123,49 @@ Invoke-ContractTable -Contracts @(
         Description = 'site deployment is protected by the production environment'
     }
     @{
-        File = "$siteDeployWorkflow :: deploy"
+        File = "$siteDeployWorkflow :: release-copy"
         Content = {
-            (Get-YamlJobText -Content $siteDeployWorkflowText -Name 'deploy' -Source $siteDeployWorkflow)
+            (Get-YamlJobText -Content $siteDeployWorkflowText -Name 'release-copy' -Source $siteDeployWorkflow)
         }
         Pattern = "(?m)^\s+if: github\.event_name != 'release' \|\| github\.event\.release\.prerelease == false\s*$"
         Kind = 'Text'
         Description = 'stable site publication ignores prerelease events'
     }
     @{
+        File = "$siteDeployWorkflow :: release-copy"
+        Content = {
+            (Get-YamlJobText -Content $siteDeployWorkflowText -Name 'release-copy' -Source $siteDeployWorkflow)
+        }
+        Pattern = '(?ms)^\s+outputs:\s+published: \$\{\{ steps\.published\.outputs\.published \}\}\s*$'
+        Kind = 'Text'
+        Description = 'the release-copy job publishes its hold decision as a job output'
+    }
+    @{
+        File = "$siteDeployWorkflow :: deploy"
+        Content = {
+            (Get-YamlJobText -Content $siteDeployWorkflowText -Name 'deploy' -Source $siteDeployWorkflow)
+        }
+        Pattern = "(?ms)\A  deploy:\s+name: Canary, verify, and publish\s+needs: release-copy\s+if: needs\.release-copy\.outputs\.published != 'false'\s*$"
+        Kind = 'Text'
+        Description = 'only an explicit hold of an unpublished release copy skips canary and production; anything else reaches the release copy check'
+    }
+    @{
+        File = "$siteDeployWorkflow :: release-copy checkout"
+        Content = {
+            (Get-YamlStepBlock -Content $siteDeployWorkflowText -Name 'Checkout the deployment README' -Source $siteDeployWorkflow)
+        }
+        Pattern = '(?ms)uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd.*?ref: \$\{\{ \(github\.event_name == ''release'' \|\| github\.event_name == ''workflow_run''\) && github\.event\.repository\.default_branch \|\| github\.sha \}\}.*?persist-credentials: false.*?sparse-checkout: README\.md.*?sparse-checkout-cone-mode: false'
+        Kind = 'Text'
+        Description = 'the hold reads the README of the commit the deploy job checks out'
+    }
+    @{
         File = "$siteDeployWorkflow :: checkout"
         Content = {
             (Get-YamlStepBlock -Content $siteDeployWorkflowText -Name 'Checkout exact event commit' -Source $siteDeployWorkflow)
         }
-        Pattern = '(?ms)uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd.*?ref: \$\{\{ github\.event_name == ''release'' && github\.event\.repository\.default_branch \|\| github\.sha \}\}.*?persist-credentials: false'
+        Pattern = '(?ms)uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd.*?ref: \$\{\{ \(github\.event_name == ''release'' \|\| github\.event_name == ''workflow_run''\) && github\.event\.repository\.default_branch \|\| github\.sha \}\}.*?persist-credentials: false'
         Kind = 'Text'
-        Description = 'site checkout uses exact event commits for pushes and current main for release publication'
+        Description = 'site checkout uses exact event commits for pushes and current main for release publication and Release completion'
     }
     @{
         File = "$siteDeployWorkflow :: source"
@@ -135,20 +177,233 @@ Invoke-ContractTable -Contracts @(
         Description = 'site deployment fails closed before recording the full resolved source SHA'
     }
     @{
-        File = "$siteDeployWorkflow :: site validation"
+        File = "$siteDeployWorkflow :: release copy validation"
         Content = {
-            (Get-YamlStepBlock -Content $siteDeployWorkflowText -Name 'Validate committed site bundle and copy' -Source $siteDeployWorkflow)
+            (Get-YamlStepBlock -Content $siteDeployWorkflowText -Name 'Release copy matches the latest published release' -Source $siteDeployWorkflow)
         }
-        Pattern = '(?ms)GH_TOKEN:.*?github\.token.*?RELEASE_TAG:.*?github\.event\.release\.tag_name.*?check-site-copy\.ps1.*?node scripts/build-site-assets\.mjs --check.*?get-site-header-contract\.ps1.*?GITHUB_EVENT_NAME -eq ''release''.*?RELEASE_TAG -cnotmatch ''\^v\(\?<version>\\d\+\\\.\\d\+\\\.\\d\+\)\$''.*?check-release-copy\.ps1.*?-ExpectedVersion \$Matches\.version.*?-CheckRemoteLatest.*?else \{.*?check-release-copy\.ps1 -CheckRemoteLatest.*?LASTEXITCODE'
+        Pattern = '(?ms)GH_TOKEN:.*?github\.token.*?RELEASE_TAG:.*?github\.event\.release\.tag_name.*?GITHUB_EVENT_NAME -eq ''release''.*?RELEASE_TAG -cnotmatch ''\^v\(\?<version>\\d\+\\\.\\d\+\\\.\\d\+\)\$''.*?check-release-copy\.ps1.*?-ExpectedVersion \$Matches\.version.*?-CheckRemoteLatest.*?else \{.*?check-release-copy\.ps1 -CheckRemoteLatest'
         Kind = 'Text'
-        Description = 'site copy is checked before the deterministic asset gate and release copy binds to the published semver tag'
+        Description = 'release copy binds to the published semver tag and to the latest GitHub release'
     }
 )
+
+# The validation steps and the release-copy hold run here the way the Actions
+# runner runs a `shell: pwsh` step (workflow syntax, "Exit codes and error
+# action preference"): the run text between `$ErrorActionPreference = 'stop'`
+# and `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+# in a new `pwsh -command ". '<file>'"` (here also -NoProfile -NonInteractive),
+# steps in order, the first failing step ending the job. Main used to run check-site-copy.ps1 and then
+# `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` in one step; that script
+# runs no native command, so `exit $null` ended the step successfully and the
+# asset, header and release copy checks never ran (Deploy Site runs
+# 38876447022, 39116392990, 39216341596 and 39420319164).
+function Get-SiteWorkflowStepScript {
+    param(
+        [Parameter(Mandatory)] [string] $Step,
+        [Parameter(Mandatory)] [string] $Source
+    )
+
+    if ($Step -notmatch '(?m)^        shell: pwsh[ \t]*\r?$' -or
+        $Step -match '(?m)^        (?:if|continue-on-error):') {
+        throw "Expected an unconditional pwsh step: $Source"
+    }
+    if ($Step -match '(?m)^        run:[ \t]*\|') {
+        return Get-YamlLiteralRunScript -Content $Step -Source $Source
+    }
+    $line = [regex]::Match($Step, '(?m)^        run:[ \t]+(?<command>\S[^\r\n]*?)[ \t]*\r?$')
+    if (-not $line.Success) { throw "Workflow step has no run command: $Source" }
+    $line.Groups['command'].Value
+}
+function Invoke-SiteWorkflowStep {
+    param(
+        [Parameter(Mandatory)] [string] $Script,
+        [Parameter(Mandatory)] [string] $WorkingDirectory,
+        [Parameter(Mandatory)] [hashtable] $Environment
+    )
+
+    $stepFile = Join-Path $WorkingDirectory 'step.ps1'
+    [IO.File]::WriteAllText(
+        $stepFile,
+        "`$ErrorActionPreference = 'stop'`n$Script`nif ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit `$LASTEXITCODE }`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $savedEnvironment = @{}
+    foreach ($name in $Environment.Keys) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        foreach ($name in $Environment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name])
+        }
+        $stepCommand = ". '$($stepFile.Replace("'", "''"))'"
+        $stepOutput = & ([Environment]::ProcessPath) -NoProfile -NonInteractive -Command $stepCommand 2>&1 | Out-String
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $stepOutput }
+    }
+    finally {
+        Pop-Location
+        foreach ($name in $savedEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+        }
+    }
+}
+
+$deployJobText = Get-YamlJobText -Content $siteDeployWorkflowText -Name 'deploy' -Source $siteDeployWorkflow
+$deployStepNames = @([regex]::Matches($deployJobText, '(?m)^      - name:[ \t]+(?<name>[^\r\n]+?)[ \t]*\r?$') |
+    ForEach-Object { $_.Groups['name'].Value })
+$firstValidationStep = [Array]::IndexOf($deployStepNames, 'Resolve exact deployment commit') + 1
+$payloadStep = [Array]::IndexOf($deployStepNames, 'Build deterministic deploy payload twice')
+if ($firstValidationStep -lt 1 -or $payloadStep -le $firstValidationStep) {
+    throw 'Deploy Site validation steps must sit between the source SHA and the payload build.'
+}
+$siteValidationSteps = @(
+    foreach ($siteStepName in $deployStepNames[$firstValidationStep..($payloadStep - 1)]) {
+        [pscustomobject]@{
+            Name = $siteStepName
+            Script = Get-SiteWorkflowStepScript `
+                -Step (Get-YamlStepBlock -Content $deployJobText -Name $siteStepName -Source $siteDeployWorkflow) `
+                -Source "$siteDeployWorkflow :: $siteStepName"
+        }
+    }
+)
+$releaseCopyStep = Get-YamlStepBlock `
+    -Content $siteDeployWorkflowText `
+    -Name 'Compare the release copy with the latest published release' `
+    -Source $siteDeployWorkflow
+if ($releaseCopyStep -notmatch '(?m)^        id: published[ \t]*\r?$') {
+    throw 'The release-copy comparison must be step published, whose output the deploy job reads.'
+}
+$releaseCopyScript = Get-SiteWorkflowStepScript -Step $releaseCopyStep -Source "$siteDeployWorkflow :: release-copy"
+
+# The apostrophe in the name stands for a TEMP under a profile such as
+# C:\Users\O'Brien, so every run exercises the step command's quoting.
+$siteStepFixtureRoot = [IO.Path]::GetFullPath((Join-Path (
+    [IO.Path]::GetTempPath()
+) "noctty-site-step's-contract-$PID-$([Guid]::NewGuid().ToString('N'))"))
+if (-not $siteStepFixtureRoot.StartsWith(
+        [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw "Refusing unsafe site step fixture path: $siteStepFixtureRoot"
+}
+try {
+    [IO.Directory]::CreateDirectory((Join-Path $siteStepFixtureRoot 'scripts')) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $siteStepFixtureRoot 'bin')) | Out-Null
+    $siteStepLog = Join-Path $siteStepFixtureRoot 'calls.log'
+    $siteStepOutput = Join-Path $siteStepFixtureRoot 'output.txt'
+    $siteStepSummary = Join-Path $siteStepFixtureRoot 'summary.md'
+    # Each check stub logs its call and fails on request by `exit 1` or by a
+    # terminating error, as the real checks do; a passing stub leaves
+    # $LASTEXITCODE alone, as check-site-copy.ps1 does.
+    $siteChecks = @('check-site-copy', 'build-site-assets', 'get-site-header-contract', 'check-release-copy')
+    foreach ($siteCheckName in @('check-site-copy', 'get-site-header-contract', 'check-release-copy')) {
+        [IO.File]::WriteAllText((Join-Path $siteStepFixtureRoot "scripts\$siteCheckName.ps1"), @"
+Add-Content -LiteralPath `$env:NOCTTY_SITE_FIXTURE_LOG -Value ('$siteCheckName ' + (`$args -join ' ')).TrimEnd()
+if (`$env:NOCTTY_SITE_FIXTURE_FAIL -ceq '$siteCheckName') {
+    if (`$env:NOCTTY_SITE_FIXTURE_MODE -ceq 'throw') { throw 'site check fixture failure' }
+    exit 1
+}
+"@)
+    }
+    [IO.File]::WriteAllText((Join-Path $siteStepFixtureRoot 'scripts\build-site-assets.mjs'), @'
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.NOCTTY_SITE_FIXTURE_LOG, `build-site-assets ${process.argv.slice(2).join(" ")}`.trimEnd() + "\n");
+if (process.env.NOCTTY_SITE_FIXTURE_FAIL === "build-site-assets") process.exit(1);
+'@)
+    # gh answers the latest-release query with NOCTTY_SITE_FIXTURE_TAG.
+    [IO.File]::WriteAllText(
+        (Join-Path $siteStepFixtureRoot 'bin\gh.cmd'),
+        "@>>`"%NOCTTY_SITE_FIXTURE_LOG%`" echo(gh %*`r`n@echo(%NOCTTY_SITE_FIXTURE_TAG%`r`n@exit /b %NOCTTY_SITE_FIXTURE_GH_EXIT%`r`n"
+    )
+
+    $allChecks = @('check-site-copy', 'build-site-assets --check', 'get-site-header-contract', 'check-release-copy -CheckRemoteLatest')
+    $siteCheckCases = @(
+        @{ GITHUB_EVENT_NAME = 'push'; Pass = $true; Calls = $allChecks }
+        @{ GITHUB_EVENT_NAME = 'workflow_run'; Pass = $true; Calls = $allChecks }
+        @{ GITHUB_EVENT_NAME = 'release'; RELEASE_TAG = 'v1.2.3'; Pass = $true; Calls = $allChecks[0..2] + 'check-release-copy -ExpectedVersion 1.2.3 -CheckRemoteLatest' }
+        @{ GITHUB_EVENT_NAME = 'release'; RELEASE_TAG = 'v1.2.3-rc1'; Pass = $false; Calls = $allChecks[0..2] }
+        foreach ($siteCheckIndex in 0..3) {
+            foreach ($siteFailMode in @('exit', 'throw')) {
+                if ($siteChecks[$siteCheckIndex] -ceq 'build-site-assets' -and $siteFailMode -ceq 'throw') { continue }
+                @{ GITHUB_EVENT_NAME = 'push'; NOCTTY_SITE_FIXTURE_FAIL = $siteChecks[$siteCheckIndex]; NOCTTY_SITE_FIXTURE_MODE = $siteFailMode; Pass = $false; Calls = $allChecks[0..$siteCheckIndex] }
+            }
+        }
+    )
+    foreach ($siteCase in $siteCheckCases) {
+        Remove-Item -LiteralPath $siteStepLog -ErrorAction Ignore
+        $siteEnvironment = @{ NOCTTY_SITE_FIXTURE_LOG = $siteStepLog }
+        foreach ($siteEnvName in @('GITHUB_EVENT_NAME', 'RELEASE_TAG', 'NOCTTY_SITE_FIXTURE_FAIL', 'NOCTTY_SITE_FIXTURE_MODE')) {
+            $siteEnvironment[$siteEnvName] = $siteCase[$siteEnvName]
+        }
+        $siteJobResult = 'passed'
+        foreach ($siteStep in $siteValidationSteps) {
+            $siteStepResult = Invoke-SiteWorkflowStep -Script $siteStep.Script -WorkingDirectory $siteStepFixtureRoot -Environment $siteEnvironment
+            if ($siteStepResult.ExitCode -ne 0) {
+                $siteJobResult = "failed at '$($siteStep.Name)' (exit $($siteStepResult.ExitCode)): $($siteStepResult.Output.Trim())"
+                break
+            }
+        }
+        $siteCalls = @(Get-Content -LiteralPath $siteStepLog -ErrorAction Ignore)
+        $siteCaseName = "$($siteCase.GITHUB_EVENT_NAME) $($siteCase.RELEASE_TAG) $($siteCase.NOCTTY_SITE_FIXTURE_FAIL) $($siteCase.NOCTTY_SITE_FIXTURE_MODE)".Trim() -replace '\s+', ' '
+        if (($siteJobResult -ceq 'passed') -ne $siteCase.Pass -or ($siteCalls -join "`n") -cne ($siteCase.Calls -join "`n")) {
+            throw "Deploy Site validation ($siteCaseName) must $(if ($siteCase.Pass) { 'pass' } else { 'fail' }) after running [$($siteCase.Calls -join '; ')]; it $siteJobResult after running [$($siteCalls -join '; ')]."
+        }
+    }
+
+    $releaseCopyCases = @(
+        @{ Copy = '1.3.134'; Tag = 'v1.3.133'; Published = 'false' }
+        @{ Copy = '1.3.134'; Tag = 'v1.3.134'; Published = 'true' }
+        @{ Copy = '1.3.133'; Tag = 'v1.3.134'; Published = 'true' }
+        @{ Copy = '1.3.10'; Tag = 'v1.3.9'; Published = 'false' }
+        @{ Copy = '1.3.134'; Tag = 'v1.3.133'; GhExit = 1 }
+        @{ Copy = '1.3.134'; Tag = 'nightly' }
+        @{ Tag = 'v1.3.134' }
+    )
+    foreach ($siteCase in $releaseCopyCases) {
+        Remove-Item -LiteralPath $siteStepLog, $siteStepOutput, $siteStepSummary -ErrorAction Ignore
+        [IO.File]::WriteAllText((Join-Path $siteStepFixtureRoot 'README.md'), $(if ($siteCase.Copy) {
+            "Latest stable release: [noctty $($siteCase.Copy)](https://github.com/amanthanvi/noctty/releases/tag/v$($siteCase.Copy)), published 2026-10-20.`n"
+        } else {
+            "No release link.`n"
+        }))
+        $siteStepResult = Invoke-SiteWorkflowStep -Script $releaseCopyScript -WorkingDirectory $siteStepFixtureRoot -Environment @{
+            PATH = (Join-Path $siteStepFixtureRoot 'bin') + [IO.Path]::PathSeparator + $env:PATH
+            GITHUB_OUTPUT = $siteStepOutput
+            GITHUB_STEP_SUMMARY = $siteStepSummary
+            GH_TOKEN = 'site-fixture-token'
+            NOCTTY_SITE_FIXTURE_LOG = $siteStepLog
+            NOCTTY_SITE_FIXTURE_TAG = $siteCase.Tag
+            NOCTTY_SITE_FIXTURE_GH_EXIT = [int]$siteCase.GhExit
+        }
+        $siteOutputLines = @(Get-Content -LiteralPath $siteStepOutput -ErrorAction Ignore)
+        $siteCaseName = "README v$($siteCase.Copy), latest release $($siteCase.Tag), gh exit $([int]$siteCase.GhExit)"
+        if ($null -eq $siteCase.Published) {
+            if ($siteStepResult.ExitCode -eq 0 -or $siteOutputLines.Count -ne 0) {
+                throw "The release-copy hold ($siteCaseName) must fail without a decision; it exited $($siteStepResult.ExitCode) with [$($siteOutputLines -join '; ')]."
+            }
+            continue
+        }
+        $siteCalls = @(Get-Content -LiteralPath $siteStepLog -ErrorAction Ignore)
+        $siteHeld = $siteCase.Published -ceq 'false'
+        if ($siteStepResult.ExitCode -ne 0 -or
+            ($siteOutputLines -join "`n") -cne "published=$($siteCase.Published)" -or
+            ($siteCalls -join "`n") -cne 'gh release view --repo amanthanvi/noctty --json tagName --jq .tagName' -or
+            $siteHeld -ne ($siteStepResult.Output -match '(?m)^::notice title=Site deploy held::README\.md names v') -or
+            $siteHeld -ne ([IO.File]::Exists($siteStepSummary) -and [IO.File]::ReadAllText($siteStepSummary) -match '### Site deploy held')) {
+            throw "The release-copy hold ($siteCaseName) must query only amanthanvi/noctty's latest release, write published=$($siteCase.Published), and explain a hold, and only a hold, in a notice and the job summary; it exited $($siteStepResult.ExitCode) with [$($siteOutputLines -join '; ')] after [$($siteCalls -join '; ')]: $($siteStepResult.Output.Trim())"
+        }
+    }
+}
+finally {
+    if ([IO.Directory]::Exists($siteStepFixtureRoot)) {
+        [IO.Directory]::Delete($siteStepFixtureRoot, $true)
+    }
+}
 $siteActionUses = [regex]::Matches(
     $siteDeployWorkflowText,
     '(?m)^\s*uses:\s+(?<action>[^\s@]+)@(?<ref>[^\s#]+)'
 )
-if ($siteActionUses.Count -ne 4 -or
+if ($siteActionUses.Count -ne 5 -or
     @($siteActionUses | Where-Object {
         $_.Groups['ref'].Value -cnotmatch '^[0-9a-f]{40}$'
     }).Count -ne 0) {
@@ -814,7 +1069,7 @@ Invoke-ContractTable -Contracts @(
         Content = {
             $siteReadmeText
         }
-        Pattern = '(?ms)Direct Upload.*?every\s+push to `main`.*?pull requests do not deploy.*?zone-owned `www` redirect\s+is preflighted.*?does not automatically roll back.*?zone level.*?workflow verifies the zone-level 301.*?deployment-only scripts require PowerShell 7\.3 or newer.*?outside the Windows PowerShell 5\.1 harness compatibility scope'
+        Pattern = '(?ms)Direct Upload.*?every\s+push to `main`.*?when a Release run completes.*?pull requests do not\s+deploy.*?newer than the latest GitHub release.*?holds the deploy.*?`GITHUB_TOKEN`\s+starts no workflow run.*?zone-owned `www` redirect\s+is preflighted.*?does not automatically roll back.*?zone level.*?workflow verifies the zone-level 301.*?deployment-only scripts require PowerShell 7\.3 or newer.*?outside the Windows PowerShell 5\.1 harness compatibility scope'
         Kind = 'Text'
         Description = 'site operations document deployment triggers, Direct Upload scope, runtime floor, and the zone-owned redirect'
     }
@@ -1317,14 +1572,18 @@ try {
         }
     }
     $expectedPayloadAssets = @(
-        'assets/app-window.webp'
         'assets/favicon.svg'
+        'assets/fonts/OFL-Geist.txt'
         'assets/fonts/OFL-JetBrainsMono.txt'
-        'assets/fonts/OFL-SpaceGrotesk.txt'
+        'assets/fonts/geist.woff2'
         'assets/fonts/jetbrains-mono.woff2'
-        'assets/fonts/space-grotesk.woff2'
-        'assets/hero-sky.webp'
         'assets/noctty-social.jpg'
+        'assets/shot-palette-dark.webp'
+        'assets/shot-palette-light.webp'
+        'assets/shot-restored-dark.webp'
+        'assets/shot-restored-light.webp'
+        'assets/shot-settings-dark.webp'
+        'assets/shot-settings-light.webp'
     )
     $payloadAssetPaths = @($manifestPaths | Where-Object { $_ -like 'assets/*' })
     if ($payloadAssetPaths.Count -ne $expectedPayloadAssets.Count -or

@@ -17,11 +17,13 @@ param(
     [Parameter(Mandatory)] [string] $Bin,
     [Parameter(Mandatory)] [string] $Run,
     [switch] $Driver,
+    [string] $DesktopName,
     [ValidateRange(1,1800)] [int] $DriverTimeoutSeconds = 300,
     [string] $ExpectedStartupHash,
     [string] $ExpectedStartupModified
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hidden-win11-local-lib.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -30,18 +32,7 @@ using System.Text;
 public static class Qt {
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
     public class State { public Rect Rect; public uint Dpi; public bool Visible,Iconic,Zoomed,Topmost; }
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct Startup {
-        public int cb; public string reserved,desktop,title;
-        public int x,y,cx,cy,charsX,charsY,fill,flags; public short show,reservedBytes;
-        public IntPtr reservedPointer,input,output,error;
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo { public IntPtr process,thread; public int pid,tid; }
-    public delegate bool EnumWindow(IntPtr h, IntPtr p);
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
-    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumWindow cb, IntPtr p);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out Rect r);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
@@ -53,68 +44,6 @@ public static class Qt {
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int ht,uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int show);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr dev,IntPtr mode,int flags,uint access,IntPtr sa);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h,uint ms);
-    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h,out uint code);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr a,string name);
-    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
-    [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
-    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process,uint code);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job,uint code);
-    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job,int type,out JobAccounting accounting,uint size,IntPtr returned);
-    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
-        public long userTime,kernelTime,periodUserTime,periodKernelTime;
-        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long processTime,jobTime; public uint flags;
-        public UIntPtr minWorking,maxWorking; public uint activeProcesses;
-        public UIntPtr affinity; public uint priority,scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes; }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public IoCounters io;
-        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
-    }
-    public static IntPtr CreateOwnedJob() {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job==IntPtr.Zero) throw new Exception("CreateJobObject failed");
-        var limits=new JobLimits(); limits.basic.flags=0x2000; // KILL_ON_JOB_CLOSE
-        if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf<JobLimits>())) {
-            CloseHandle(job); throw new Exception("SetInformationJobObject failed");
-        }
-        return job;
-    }
-    public static uint StopOwnedJob(IntPtr job) {
-        try {
-            if(!TerminateJobObject(job,1)) throw new Exception("Terminate owned job failed");
-            var deadline=DateTime.UtcNow.AddSeconds(5);
-            do {
-                JobAccounting accounting;
-                if(!QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf<JobAccounting>(),IntPtr.Zero))
-                    throw new Exception("Query owned job failed");
-                if(accounting.activeProcesses==0) return accounting.totalProcesses;
-                System.Threading.Thread.Sleep(10);
-            } while(DateTime.UtcNow<deadline);
-            throw new Exception("Owned job cleanup exceeded five seconds");
-        } finally { CloseHandle(job); }
-    }
-    static string Class(IntPtr h) { var s=new StringBuilder(128); GetClassNameW(h,s,128); return s.ToString(); }
-    public static IntPtr[] Hosts(int pid) {
-        var list=new List<IntPtr>(); EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id);
-            if(id==pid && Class(h)=="noctty.win32.host") list.Add(h); return true;
-        },IntPtr.Zero); return list.ToArray();
-    }
-    // Every terminal pane of a host, in the order Windows enumerates them.
-    public static IntPtr[] Surfaces(IntPtr host) {
-        var list=new List<IntPtr>();
-        EnumChildWindows(host,(c,p)=> { if(Class(c)=="noctty.win32") list.Add(c); return true; },IntPtr.Zero);
-        return list.ToArray();
-    }
     public static bool Alive(IntPtr h) { return IsWindow(h); }
     public static Rect PrimaryWork() {
         Rect r; if(!SystemParametersInfoW(0x30,0,out r,0)) throw new Exception("SPI_GETWORKAREA failed"); return r;
@@ -138,73 +67,12 @@ public static class Qt {
         if(!PostMessageW(surface,0x100,new IntPtr(key),new IntPtr(1))) throw new Exception("Key-down post failed");
         if(!PostMessageW(surface,0x101,new IntPtr(key),new IntPtr(0xC0000001L))) throw new Exception("Key-up post failed");
     }
-    public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job) {
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
-        // Assign the suspended driver before it can spawn children. The job
-        // owns only this launch and its descendants, including terminal shells.
-        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08004004,IntPtr.Zero,cwd,ref si,out pi))
-            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
-        if(!AssignProcessToJobObject(job,pi.process)||ResumeThread(pi.thread)==0xFFFFFFFF) {
-            TerminateProcess(pi.process,1); CloseHandle(pi.thread); CloseHandle(pi.process);
-            throw new Exception("Assign/resume owned driver failed");
-        }
-        return pi;
-    }
 }
 '@
-function Startup-Fingerprint {
-    $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
-}
-function Copy-Portable([string] $Source, [string] $Destination) {
-    [void](New-Item -ItemType Directory -Path $Destination)
-    Get-ChildItem -LiteralPath $Source -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Destination }
-    $share = Join-Path (Split-Path -Parent $Source) 'share'
-    if (Test-Path -LiteralPath $share) { Copy-Item -LiteralPath $share -Destination (Join-Path (Split-Path -Parent $Destination) 'share') -Recurse }
-    Set-Content -LiteralPath (Join-Path $Destination 'noctty.portable') -Value '' -NoNewline
-}
 if (-not $Driver) {
-    $Bin = (Resolve-Path -LiteralPath $Bin).Path
-    $Run = [IO.Path]::GetFullPath($Run)
-    if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
-    if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Source Bin must contain noctty.exe.' }
-    $before = Startup-Fingerprint
-    if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
-    [void](New-Item -ItemType Directory -Path $Run)
-    Copy-Portable $Bin (Join-Path $Run 'source\bin')
-    foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
-    $desktopName = 'noctty-qt-' + [guid]::NewGuid().ToString('N')
-    $desktop = [Qt]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
-    if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
-    $oldLocal=$env:LOCALAPPDATA; $oldRoaming=$env:APPDATA
-    $pi=$null; $job=[IntPtr]::Zero
-    try {
-        $job=[Qt]::CreateOwnedJob()
-        $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
-        $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run
-        $pi=[Qt]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
-        Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
-        $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
-        while ([Qt]::WaitForSingleObject($pi.process,1000) -eq 258) {
-            if([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $DriverTimeoutSeconds seconds; owned process job will be closed." }
-        }
-        [uint32]$code=0; [void][Qt]::GetExitCodeProcess($pi.process,[ref]$code)
-    } finally {
-        $env:LOCALAPPDATA=$oldLocal; $env:APPDATA=$oldRoaming
-        $cleanupError=$null; $ownedProcessCount=0
-        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[Qt]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
-        if($pi) { [void][Qt]::CloseHandle($pi.thread); [void][Qt]::CloseHandle($pi.process) }
-        [void][Qt]::CloseDesktop($desktop)
-        $after=Startup-Fingerprint
-        $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
-        if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
-        if($cleanupError) { throw $cleanupError }
-    }
-    if($code -ne 0) { throw "Hidden driver failed with exit $code; inspect sanitized results in $Run." }
-    Write-Host 'Hidden quick terminal identity: PASS'
+    Invoke-LocalHiddenDriver -Script $PSCommandPath -Bin $Bin -Run $Run -TimeoutSeconds $DriverTimeoutSeconds `
+        -ExpectedStartupHash $ExpectedStartupHash -ExpectedStartupModified $ExpectedStartupModified `
+        -DesktopPrefix 'noctty-qt-' -Label 'Hidden quick terminal identity' -PassDesktopName
     exit
 }
 
@@ -213,28 +81,16 @@ if (-not $Driver) {
 $script:checks=[Collections.Generic.List[object]]::new()
 $script:samples=[Collections.Generic.List[object]]::new()
 $script:processes=[Collections.Generic.List[object]]::new()
-function Check([string]$Name,[bool]$Passed,$Expected,$Actual) {
-    $script:checks.Add(@{ Name=$Name; Passed=$Passed; Expected=$Expected; Actual=$Actual })
-}
-function Rect-Array($r) { return @($r.Left,$r.Top,$r.Right,$r.Bottom) }
-function Rect-Same($a,$b,[int]$Tolerance=2) {
-    return [Math]::Abs($a.Left-$b.Left) -le $Tolerance -and [Math]::Abs($a.Top-$b.Top) -le $Tolerance -and [Math]::Abs($a.Right-$b.Right) -le $Tolerance -and [Math]::Abs($a.Bottom-$b.Bottom) -le $Tolerance
-}
 function Sample([string]$Name,$h) { $s=[Qt]::Read($h); $script:samples.Add(@{Name=$Name; State=$s}); return $s }
-function Wait-Until([scriptblock]$Predicate,[int]$Seconds=10) {
-    $deadline=[datetime]::UtcNow.AddSeconds($Seconds)
-    do { if(& $Predicate) { return $true }; Start-Sleep -Milliseconds 50 } while([datetime]::UtcNow -lt $deadline)
-    return [bool](& $Predicate)
-}
 # The pane that is on screen in `$h`, or any pane when none is.
 function Pane($h) {
-    $all=@([Qt]::Surfaces($h)); $shown=@($all|Where-Object {[Qt]::Read($_).Visible})
+    $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {[Qt]::Read($_).Visible})
     if($shown.Count) { return $shown[0] }
     if($all.Count) { return $all[0] }
     throw 'Host has no pane.'
 }
 function Press($pane,[int]$Key,[int]$SettleMs=700) { [Qt]::Key($pane,$Key); Start-Sleep -Milliseconds $SettleMs }
-function Other-Hosts($case,$known) { return @([Qt]::Hosts($case.Process.Id)|Where-Object {$known -notcontains $_ -and @([Qt]::Surfaces($_)).Count -gt 0}) }
+function Other-Hosts($case,$known) { return @([HiddenLocal]::Hosts($case.Process.Id)|Where-Object {$known -notcontains $_ -and @([HiddenLocal]::Surfaces($_)).Count -gt 0}) }
 function Launch-Case([string]$Name,[string]$Extra='') {
     $dir=Join-Path $Run "$Name\bin"; Copy-Portable $Bin $dir
     $config=Join-Path $dir 'identity.ghostty'
@@ -242,11 +98,17 @@ function Launch-Case([string]$Name,[string]$Extra='') {
       'keybind = f10=toggle_quick_terminal','keybind = f9=new_split:right','keybind = f8=close_surface','keybind = f7=close_tab:this','keybind = f6=toggle_visibility','keybind = f5=new_window',
       'quick-terminal-screen = main','quick-terminal-autohide = false','quick-terminal-animation-duration = 0','quick-terminal-size = 25%', $Extra) | Set-Content -LiteralPath $config
     $exe=Join-Path $dir 'noctty.exe'
-    $p=Start-Process -FilePath $exe -ArgumentList @("--config-file=`"$config`"") -WorkingDirectory $dir -WindowStyle Hidden -PassThru
+    # An explicit lpDesktop: a child that a private-desktop driver starts with a null desktop can
+    # land on the interactive desktop. The Process object holds its own handle before the launch
+    # handles close, so it stays this launch's process.
+    $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$config),$dir,"WinSta0\$DesktopName")
+    try { $p=[Diagnostics.Process]::GetProcessById($pi.pid); [void]$p.Handle }
+    finally { [void][HiddenLocal]::CloseHandle($pi.thread); [void][HiddenLocal]::CloseHandle($pi.process) }
     $script:processes.Add(@{Case=$Name;Pid=$p.Id;StartTime=$p.StartTime.ToUniversalTime().ToString('o');Executable=$p.ProcessName})
     $deadline=[datetime]::UtcNow.AddSeconds(15)
     do {
-        $hosts=@([Qt]::Hosts($p.Id))
+        $hosts=@([HiddenLocal]::Hosts($p.Id))
+        if($hosts.Count -and [HiddenLocal]::WindowDesktop($hosts[0]) -ne $DesktopName) { Close-Case @{Process=$p}; throw "Case $Name window is not on the private desktop." }
         $ready=$false
         $ledger=Join-Path $dir 'startup-attempts.json'
         if(Test-Path -LiteralPath $ledger) {
@@ -255,7 +117,7 @@ function Launch-Case([string]$Name,[string]$Extra='') {
                 $ready=$attempts.Count -gt 0 -and $attempts[-1].phase -eq 'ready' -and $null -ne $attempts[-1].ready_at_unix_ms
             } catch { } # A concurrent ledger write may be incomplete; retry within the deadline.
         }
-        if($ready -and $hosts.Count -and @([Qt]::Surfaces($hosts[0])).Count -gt 0) {
+        if($ready -and $hosts.Count -and @([HiddenLocal]::Surfaces($hosts[0])).Count -gt 0) {
             [void][Qt]::ShowWindow($hosts[0],4)
             Start-Sleep -Milliseconds 400
             return @{Process=$p; Host=$hosts[0]}
@@ -266,7 +128,7 @@ function Launch-Case([string]$Name,[string]$Extra='') {
     throw "Window startup failed for case $Name."
 }
 function Close-Case($case) {
-    foreach($h in [Qt]::Hosts($case.Process.Id)) { [void][Qt]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
+    foreach($h in [HiddenLocal]::Hosts($case.Process.Id)) { [void][Qt]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
     if(-not $case.Process.WaitForExit(5000)) {
         $p=Get-Process -Id $case.Process.Id -ErrorAction Stop
         if($p.StartTime -eq $case.Process.StartTime -and $p.Path -eq $case.Process.Path) { Stop-Process -Id $p.Id -Force }
@@ -308,19 +170,19 @@ try {
 
         $original=Pane $qt
         Press $original 120 1200               # new_split:right inside the quick terminal
-        Check 'split opened inside the quick terminal' (@([Qt]::Surfaces($qt)).Count -eq 2) 2 @([Qt]::Surfaces($qt)).Count
+        Check 'split opened inside the quick terminal' (@([HiddenLocal]::Surfaces($qt)).Count -eq 2) 2 @([HiddenLocal]::Surfaces($qt)).Count
         Press $original 119 1200               # close_surface: the pane the window was created with
         Check 'original pane closed' (-not [Qt]::Alive($original)) $true ([Qt]::Alive($original))
-        Check 'quick terminal still has a pane' (@([Qt]::Surfaces($qt)).Count -eq 1) 1 @([Qt]::Surfaces($qt)).Count
+        Check 'quick terminal still has a pane' (@([HiddenLocal]::Surfaces($qt)).Count -eq 1) 1 @([HiddenLocal]::Surfaces($qt)).Count
         Check 'quick terminal host survived' ([Qt]::Alive($qt)) $true ([Qt]::Alive($qt))
         $remaining=Pane $qt
         [void](Sample 'qt-before-toggle' $qt)
 
         Press $remaining 121 1500              # toggle_quick_terminal: hide
-        $hostsNow=@([Qt]::Hosts($case.Process.Id))
+        $hostsNow=@([HiddenLocal]::Hosts($case.Process.Id))
         Check 'toggle hides the quick terminal, no second one is made' ($hostsNow.Count -eq 2 -and -not ([Qt]::Read($qt)).Visible) 'two hosts, quick terminal hidden' @{Hosts=$hostsNow.Count; Visible=([Qt]::Read($qt)).Visible}
         Press $remaining 121 1500              # toggle_quick_terminal: show
-        $hostsNow=@([Qt]::Hosts($case.Process.Id))
+        $hostsNow=@([HiddenLocal]::Hosts($case.Process.Id))
         Check 'toggle shows the same quick terminal' ($hostsNow.Count -eq 2 -and ([Qt]::Read($qt)).Visible) 'two hosts, quick terminal visible' @{Hosts=$hostsNow.Count; Visible=([Qt]::Read($qt)).Visible}
     } finally { Close-Case $case }
 
@@ -336,18 +198,18 @@ try {
         if($qtHosts.Count -eq 1) {
             $qt=$qtHosts[0]; $known=@($main,$qt)
             Start-Sleep -Milliseconds 600
-            $detached=@([Qt]::Surfaces($qt))
+            $detached=@([HiddenLocal]::Surfaces($qt))
             Press $detached[0] 118 1200        # close_tab:this
-            $livePanes=@([Qt]::Surfaces($qt)|Where-Object {[Qt]::Read($_).Visible})
+            $livePanes=@([HiddenLocal]::Surfaces($qt)|Where-Object {[Qt]::Read($_).Visible})
             Check 'host kept with no live pane' ([Qt]::Alive($qt) -and $livePanes.Count -eq 0) 'host alive, no visible pane' @{Alive=[Qt]::Alive($qt); VisiblePanes=$livePanes.Count}
             Press (Pane $main) 121 1500        # toggle_quick_terminal
-            Check 'toggle dismissed the empty window' (-not ([Qt]::Read($qt)).Visible -and @([Qt]::Hosts($case.Process.Id)).Count -eq 2) 'hidden, two hosts' @{Visible=([Qt]::Read($qt)).Visible; Hosts=@([Qt]::Hosts($case.Process.Id)).Count}
+            Check 'toggle dismissed the empty window' (-not ([Qt]::Read($qt)).Visible -and @([HiddenLocal]::Hosts($case.Process.Id)).Count -eq 2) 'hidden, two hosts' @{Visible=([Qt]::Read($qt)).Visible; Hosts=@([HiddenLocal]::Hosts($case.Process.Id)).Count}
             Press (Pane $main) 121 2000        # toggle_quick_terminal
-            $panes=@([Qt]::Surfaces($qt)); $fresh=@($panes|Where-Object {$detached -notcontains $_})
+            $panes=@([HiddenLocal]::Surfaces($qt)); $fresh=@($panes|Where-Object {$detached -notcontains $_})
             $live=@($panes|Where-Object {[Qt]::Read($_).Visible})
             Check 'toggle opened a fresh tab, not the detached surface' ($fresh.Count -eq 1 -and $live.Count -eq 1 -and $live[0] -eq $fresh[0] -and ([Qt]::Read($qt)).Visible) 'one new visible pane, window visible' @{Fresh=$fresh.Count; Live=$live.Count; Visible=([Qt]::Read($qt)).Visible}
             Check 'the fresh tab floats' ([Qt]::Read($qt)).Topmost $true ([Qt]::Read($qt)).Topmost
-            Check 'still one quick terminal' (@([Qt]::Hosts($case.Process.Id)).Count -eq 2) 2 @([Qt]::Hosts($case.Process.Id)).Count
+            Check 'still one quick terminal' (@([HiddenLocal]::Hosts($case.Process.Id)).Count -eq 2) 2 @([HiddenLocal]::Hosts($case.Process.Id)).Count
         }
     } finally { Close-Case $case }
 

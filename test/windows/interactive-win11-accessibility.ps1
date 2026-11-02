@@ -8,6 +8,11 @@ param(
     [int] $IdleSoakSeconds = 60
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-accessibility.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Recurring cadence for accessibility, focus, and window-state polls.
 $script:ACCESSIBILITY_POLL_MS = 100
@@ -2131,6 +2136,166 @@ function Wait-AccessibilitySettingsProbe(
     }
 }
 
+# Every config key the build knows, from the Sublime/bat syntax it ships beside its exe
+# (share\bat\syntaxes\ghostty.sublime-syntax): src/extra/sublime.zig writes it at build time from
+# Config's fields, leaving out the internal ones, which is the set of keys All settings lists.
+function Get-AccessibilityConfigKeys {
+    param([Parameter(Mandatory)] [string] $ExePath)
+    $syntax = Join-Path (Split-Path -Parent (Split-Path -Parent $ExePath)) 'share\bat\syntaxes\ghostty.sublime-syntax'
+    if (-not (Test-Path -LiteralPath $syntax)) { throw "The build ships no config key list at '$syntax'." }
+    $match = [regex]::Match([System.IO.File]::ReadAllText($syntax), '- match: ''\\b\(([^)]*)\)\\b''\s*\r?\n\s*scope: keyword\.other\.ghostty')
+    if (-not $match.Success) { throw "'$syntax' holds no keyword list." }
+    return [string[]]@($match.Groups[1].Value.Split('|'))
+}
+
+# The All settings page's list, read live: a List named "All settings" with HelpText, one
+# ListItem per config key in $ExpectedKeys (`Get-AccessibilityConfigKeys`), each named
+# "key, value" and none twice, and, once a row takes the focus through UIA (SetFocus), that row
+# selected, holding the keyboard focus and carrying HelpText. Self-contained, so it can be run on
+# its own against a Settings window showing the page.
+function Test-AccessibilityAllSettingsList {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Automation.AutomationElement] $SettingsElement,
+        [Parameter(Mandatory)] [string[]] $ExpectedKeys
+    )
+    $element = [System.Windows.Automation.AutomationElement]
+    $listCondition = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($element::ControlTypeProperty, [System.Windows.Automation.ControlType]::List)),
+        (New-Object System.Windows.Automation.PropertyCondition($element::NameProperty, 'All settings'))
+    )
+    $list = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ($null -eq $list -and [DateTime]::UtcNow -lt $deadline) {
+        $list = $SettingsElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $listCondition)
+        if ($null -eq $list) { Start-Sleep -Milliseconds 100 }
+    }
+    if ($null -eq $list) { throw "Settings 'All settings' page exposes no List named 'All settings'." }
+    $listHelp = [string]$list.GetCurrentPropertyValue($element::HelpTextProperty)
+    if ([string]::IsNullOrWhiteSpace($listHelp)) { throw 'The All settings List has no HelpText.' }
+    $itemCondition = New-Object System.Windows.Automation.PropertyCondition($element::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
+    $items = @($list.FindAll([System.Windows.Automation.TreeScope]::Children, $itemCondition))
+    if ($items.Count -ne $ExpectedKeys.Count) { throw "The All settings List exposes $($items.Count) ListItems; the build has $($ExpectedKeys.Count) config keys." }
+    $badNames = @($items | Where-Object { $_.Current.Name -notmatch '^_?[a-z][a-z0-9-]*, .+$' } | ForEach-Object { $_.Current.Name })
+    if ($badNames.Count -ne 0) { throw "All settings ListItems not named 'key, value': $($badNames[0..([Math]::Min(2, $badNames.Count - 1))] -join ' | ')." }
+    # Each key once, and exactly the build's keys.
+    $expected = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($key in $ExpectedKeys) { [void]$expected.Add($key) }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $duplicates = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $items) {
+        $name = $item.Current.Name
+        $key = $name.Substring(0, $name.IndexOf(', '))
+        if (-not $seen.Add($key)) { $duplicates.Add($key) }
+    }
+    if ($duplicates.Count -ne 0) { throw "All settings lists these keys more than once: $($duplicates -join ', ')." }
+    $missing = @($ExpectedKeys | Where-Object { -not $seen.Contains($_) })
+    $extra = @($seen | Where-Object { -not $expected.Contains($_) })
+    if ($missing.Count -ne 0 -or $extra.Count -ne 0) { throw "All settings keys differ from the build's: not listed: $($missing -join ', '); listed but not the build's: $($extra -join ', ')." }
+    $row = $items[1]
+    $row.SetFocus()
+    $selection = $null
+    [void]$row.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not ($row.Current.HasKeyboardFocus -and $null -ne $selection -and $selection.Current.IsSelected) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $row.Current.HasKeyboardFocus) { throw "All settings ListItem '$($row.Current.Name)' did not take the keyboard focus through UIA SetFocus." }
+    if ($null -eq $selection -or -not $selection.Current.IsSelected) { throw "All settings ListItem '$($row.Current.Name)' took the focus but is not selected." }
+    $rowHelp = [string]$row.GetCurrentPropertyValue($element::HelpTextProperty)
+    if ([string]::IsNullOrWhiteSpace($rowHelp)) { throw "All settings ListItem '$($row.Current.Name)' has no HelpText." }
+    return [ordered]@{
+        list_help_chars = $listHelp.Length
+        list_items = $items.Count
+        expected_keys = $ExpectedKeys.Count
+        focused_item = $row.Current.Name
+        focused_item_help_chars = $rowHelp.Length
+    }
+}
+
+# Every binding the build's defaults have, as `noctty.com +list-keybinds --default --plain` prints
+# them: one `keybind = keys=action` line each, a chain's later actions on `chain=` lines of their
+# own. The harness's launch adds no binding, so these are the bindings in effect.
+function Get-AccessibilityDefaultKeybinds {
+    param([Parameter(Mandatory)] [string] $ExePath)
+    $cli = Join-Path (Split-Path -Parent $ExePath) 'noctty.com'
+    if (-not (Test-Path -LiteralPath $cli)) { throw "The build has no CLI at '$cli'." }
+    $lines = @(& $cli +list-keybinds --default --plain)
+    if ($LASTEXITCODE -ne 0) { throw "'$cli +list-keybinds --default --plain' exited with $LASTEXITCODE." }
+    $entries = @($lines | Where-Object { $_ -match '^keybind = ' -and $_ -notmatch '^keybind = chain=' } | ForEach-Object { $_.Substring('keybind = '.Length) })
+    if ($entries.Count -eq 0) { throw "'$cli +list-keybinds --default --plain' printed no binding." }
+    return [string[]]$entries
+}
+
+# The Keybindings page's list, read live: a List named "Key bindings" with HelpText, one ListItem
+# per binding in $ExpectedBindings (`Get-AccessibilityDefaultKeybinds`, each `keys=action`), named
+# "keys, action" and none twice, and a row that takes the focus through UIA selected, focused and
+# carrying HelpText. A row's keys carry the binding's flags (`performable:` and the like), which
+# the CLI's lines leave out, and a chain's row its later actions after ", then ", so both are
+# taken off before comparing. Self-contained, as Test-AccessibilityAllSettingsList is.
+function Test-AccessibilityKeybindList {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Automation.AutomationElement] $SettingsElement,
+        [Parameter(Mandatory)] [string[]] $ExpectedBindings
+    )
+    $element = [System.Windows.Automation.AutomationElement]
+    $listCondition = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($element::ControlTypeProperty, [System.Windows.Automation.ControlType]::List)),
+        (New-Object System.Windows.Automation.PropertyCondition($element::NameProperty, 'Key bindings'))
+    )
+    $list = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ($null -eq $list -and [DateTime]::UtcNow -lt $deadline) {
+        $list = $SettingsElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $listCondition)
+        if ($null -eq $list) { Start-Sleep -Milliseconds 100 }
+    }
+    if ($null -eq $list) { throw "Settings 'Keybindings' page exposes no List named 'Key bindings'." }
+    $listHelp = [string]$list.GetCurrentPropertyValue($element::HelpTextProperty)
+    if ([string]::IsNullOrWhiteSpace($listHelp)) { throw 'The Key bindings List has no HelpText.' }
+    $itemCondition = New-Object System.Windows.Automation.PropertyCondition($element::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
+    $items = @($list.FindAll([System.Windows.Automation.TreeScope]::Children, $itemCondition))
+    if ($items.Count -ne $ExpectedBindings.Count) { throw "The Key bindings List exposes $($items.Count) ListItems; the build's defaults have $($ExpectedBindings.Count) bindings." }
+    $expected = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($binding in $ExpectedBindings) { [void]$expected.Add($binding) }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $duplicates = New-Object 'System.Collections.Generic.List[string]'
+    $badNames = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $items) {
+        $name = $item.Current.Name
+        $split = $name.IndexOf(', ')
+        if ($split -le 0 -or $split + 2 -ge $name.Length) { $badNames.Add($name); continue }
+        $keys = $name.Substring(0, $split) -replace '^([^/]*/)?(?:(?:global|all|unconsumed|performable):)+', '$1'
+        $actions = $name.Substring($split + 2)
+        $chain = $actions.IndexOf(', then ')
+        $first = if ($chain -ge 0) { $actions.Substring(0, $chain) } else { $actions }
+        $binding = "$keys=$first"
+        if (-not $seen.Add($binding)) { $duplicates.Add($binding) }
+    }
+    if ($badNames.Count -ne 0) { throw "Key bindings ListItems not named 'keys, action': $($badNames[0..([Math]::Min(2, $badNames.Count - 1))] -join ' | ')." }
+    if ($duplicates.Count -ne 0) { throw "Key bindings lists these more than once: $($duplicates -join ', ')." }
+    $missing = @($ExpectedBindings | Where-Object { -not $seen.Contains($_) })
+    $extra = @($seen | Where-Object { -not $expected.Contains($_) })
+    if ($missing.Count -ne 0 -or $extra.Count -ne 0) { throw "Key bindings differ from the build's defaults: not listed: $($missing -join ', '); listed but not the defaults': $($extra -join ', ')." }
+    $row = $items[1]
+    $row.SetFocus()
+    $selection = $null
+    [void]$row.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not ($row.Current.HasKeyboardFocus -and $null -ne $selection -and $selection.Current.IsSelected) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $row.Current.HasKeyboardFocus) { throw "Key bindings ListItem '$($row.Current.Name)' did not take the keyboard focus through UIA SetFocus." }
+    if ($null -eq $selection -or -not $selection.Current.IsSelected) { throw "Key bindings ListItem '$($row.Current.Name)' took the focus but is not selected." }
+    $rowHelp = [string]$row.GetCurrentPropertyValue($element::HelpTextProperty)
+    if ([string]::IsNullOrWhiteSpace($rowHelp)) { throw "Key bindings ListItem '$($row.Current.Name)' has no HelpText." }
+    return [ordered]@{
+        list_help_chars = $listHelp.Length
+        list_items = $items.Count
+        expected_bindings = $ExpectedBindings.Count
+        focused_item = $row.Current.Name
+        focused_item_help_chars = $rowHelp.Length
+    }
+}
+
 function Open-AccessibilitySettingsProbe {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process] $Process,
@@ -2138,7 +2303,7 @@ function Open-AccessibilitySettingsProbe {
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
-    $sectionNames = @('Appearance', 'Terminal', 'Shell', 'Privacy', 'Updates', 'Keybindings', 'Advanced')
+    $sectionNames = @('Appearance', 'Terminal', 'Shell', 'Privacy', 'Updates', 'Keybindings', 'Advanced', 'All settings')
     $sentForCurrentNoWindowState = $false
     $lastWindows = @()
     $lastHwnd = [IntPtr]::Zero
@@ -2628,7 +2793,8 @@ function Invoke-AccessibilityHighContrastProof(
                 'Privacy',
                 'Updates',
                 'Keybindings',
-                'Advanced'
+                'Advanced',
+                'All settings'
             )
             $sections = @($root.FindAll(
                 [System.Windows.Automation.TreeScope]::Descendants,
@@ -3471,6 +3637,17 @@ $nocttyBeforeIdentities = @($machineProcesses | Where-Object ProcessName -eq 'no
 
 $harness = Initialize-InteractiveWin11Sandbox -RepoRoot $repoRoot -SandboxName 'accessibility' -ResetState:$ResetState
 $layout = $harness.Layout
+# The commands this harness types are cmd syntax (`%TEMP%\wgh*.cmd`), so the terminal must run cmd.exe.
+# Since #443 the default shell is pwsh when installed, where `%TEMP%` is not expanded and the launcher
+# never runs ("Timed out waiting for terminal marker launcher output" in release evidence 39164175922).
+$accessibilityLaunchArguments = @(Get-InteractiveWin11LaunchArguments -Layout $layout)
+# Settings shows a Reset button beside each field whose value in effect differs
+# from its default (D26 9.2, #583), and a command-line value counts. Pinning
+# cmd.exe changes Default command, so its page has one control more. The seeded
+# `window-theme = system` follows Windows like the default, so it adds none.
+$settingsLaunchChangedFields = @(
+    if (@($accessibilityLaunchArguments | Where-Object { $_ -like '--command=*' }).Count -gt 0) { 'Default command' }
+)
 $exe = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
 if ((Get-InteractiveWin11LaunchAction -ExePath $exe -Rebuild:$Rebuild -BuildInputs (Get-InteractiveWin11DefaultBuildInputs -RepoRoot $repoRoot)) -eq 'build') {
     Invoke-InteractiveWin11Build -RepoRoot $repoRoot
@@ -3588,7 +3765,7 @@ $inactiveTabEvidence = $null
 $evidence = $null
 $runFailure = $null
 $cleanupFailures = [System.Collections.Generic.List[string]]::new()
-$process = Start-Process -FilePath $exe -ArgumentList @(Get-InteractiveWin11LaunchArguments -Layout $layout) `
+$process = Start-Process -FilePath $exe -ArgumentList $accessibilityLaunchArguments `
     -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
 try {
@@ -5475,7 +5652,10 @@ try {
             throw "Settings cycle $settingsCycle root name is '$($settingsElement.Current.Name)'; expected 'noctty settings'."
         }
         $settingsClientRect = [NocttyAccessibilityNative]::ClientRectOnScreen($settingsHwnd)
-        $settingsSectionNames = @('Appearance', 'Terminal', 'Shell', 'Privacy', 'Updates', 'Keybindings', 'Advanced')
+        $settingsSectionNames = @('Appearance', 'Terminal', 'Shell', 'Privacy', 'Updates', 'Keybindings', 'Advanced', 'All settings')
+        # Each page's own controls, then the header's search field and the action bar,
+        # which every page shows. The loop below adds the Reset buttons this launch
+        # puts beside the fields it changes.
         $settingsExpectedControls = [ordered]@{
             Appearance = @(
                 @{ Name = 'Font family fallbacks'; Type = [System.Windows.Automation.ControlType]::Edit },
@@ -5487,8 +5667,8 @@ try {
                 @{ Name = 'Window padding X'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Window padding Y'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Window padding balance'; Type = [System.Windows.Automation.ControlType]::ComboBox },
-                @{ Name = 'Follow Windows accent color'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Background blur (not supported on Windows)'; Type = [System.Windows.Automation.ControlType]::CheckBox },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
@@ -5497,12 +5677,15 @@ try {
                 @{ Name = 'Close confirmation'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Copy on select'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Clipboard trimming'; Type = [System.Windows.Automation.ControlType]::CheckBox },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Shell = @(
                 @{ Name = 'Default command'; Type = [System.Windows.Automation.ControlType]::Edit },
+                @{ Name = 'Default profile'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Shell integration'; Type = [System.Windows.Automation.ControlType]::ComboBox },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
@@ -5514,25 +5697,45 @@ try {
                 @{ Name = 'Terminal notifications'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Clipboard-copy notification'; Type = [System.Windows.Automation.ControlType]::CheckBox },
                 @{ Name = 'Config-reload notification'; Type = [System.Windows.Automation.ControlType]::CheckBox },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Updates = @(
                 @{ Name = 'Auto-update mode'; Type = [System.Windows.Automation.ControlType]::ComboBox },
                 @{ Name = 'Auto-update channel'; Type = [System.Windows.Automation.ControlType]::ComboBox },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Keybindings = @(
                 @{ Name = 'Keybind configuration'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
             Advanced = @(
                 @{ Name = 'Full config editor'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
                 @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
                 @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
             )
+            # One list of every key, whose rows are ListItems, not controls of
+            # the kinds counted here.
+            'All settings' = @(
+                @{ Name = 'Search settings'; Type = [System.Windows.Automation.ControlType]::Edit },
+                @{ Name = 'Save'; Type = [System.Windows.Automation.ControlType]::Button },
+                @{ Name = 'Discard changes'; Type = [System.Windows.Automation.ControlType]::Button }
+            )
+        }
+        foreach ($changedField in $settingsLaunchChangedFields) {
+            $changedFieldSections = @($settingsExpectedControls.Keys | Where-Object {
+                @($settingsExpectedControls[$_] | Where-Object { $_.Name -eq $changedField }).Count -gt 0
+            })
+            if ($changedFieldSections.Count -ne 1) {
+                throw "Settings field '$changedField', changed by this launch, is on $($changedFieldSections.Count) pages of the expected list; expected one."
+            }
+            $settingsExpectedControls[$changedFieldSections[0]] += , @{ Name = "Reset $changedField"; Type = [System.Windows.Automation.ControlType]::Button }
         }
         Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description "Settings cycle $settingsCycle section UIA tree" -Condition {
             $script:settingsElementsProbe = @($settingsElement.FindAll(
@@ -5816,12 +6019,21 @@ try {
                 throw "Settings section '$sectionName' exposes $($interactiveSettingsControls.Count) visible content controls; expected $($expectedControls.Count). Observed: $($observedControls -join ', ')."
             }
             $settingsNamedTextTotal += $namedSettingsText.Count
+            # Its rows are ListItems, which the control counts above leave out.
+            $allSettingsList = if ($sectionName -eq 'All settings') {
+                Test-AccessibilityAllSettingsList -SettingsElement $settingsElement -ExpectedKeys (Get-AccessibilityConfigKeys -ExePath $exe)
+            } else { $null }
+            $keybindList = if ($sectionName -eq 'Keybindings') {
+                Test-AccessibilityKeybindList -SettingsElement $settingsElement -ExpectedBindings (Get-AccessibilityDefaultKeybinds -ExePath $exe)
+            } else { $null }
             $settingsSectionEvidence += [ordered]@{
                 name = $sectionName
                 selected = $true
                 visible_named_text = $namedSettingsText.Count
                 visible_content_controls = $interactiveSettingsControls.Count
                 pages = $settingsPages
+                all_settings_list = $allSettingsList
+                keybind_list = $keybindList
             }
         }
         $selectedBeforeFocus = @($sectionButtons | Where-Object {
@@ -6203,6 +6415,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$ownerProbeClass"
+        '--command=cmd.exe'
     )
     $ownerProbeProcess = Start-Process -FilePath $exe -ArgumentList $ownerProbeArguments `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $ownerProbeStdout -RedirectStandardError $ownerProbeStderr -PassThru
@@ -6520,6 +6733,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveProbeClass"
+        '--command=cmd.exe'
     )
     $saveProbeProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -6595,6 +6809,7 @@ try {
         Get-InteractiveWin11ContainmentArguments
         '--single-instance=false'
         "--class=$saveVerifyClass"
+        '--command=cmd.exe'
     )
     $saveVerifyProcess = Start-AccessibilityProcessWithEnvironment `
         -FilePath $exe `
@@ -7153,7 +7368,7 @@ try {
 
     $relaunchStdout = Join-Path $layout.Logs 'interactive-win11-accessibility-relaunch-stdout.log'
     $relaunchStderr = Join-Path $layout.Logs 'interactive-win11-accessibility-relaunch-stderr.log'
-    $relaunchProcess = Start-Process -FilePath $exe -ArgumentList @(Get-InteractiveWin11LaunchArguments -Layout $layout) `
+    $relaunchProcess = Start-Process -FilePath $exe -ArgumentList $accessibilityLaunchArguments `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $relaunchStdout -RedirectStandardError $relaunchStderr -PassThru
     Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds($TimeoutSeconds)) -Description 'relaunch main HWND' -Condition {
         $relaunchProcess.Refresh()
@@ -7384,3 +7599,7 @@ if ($failureMessages.Count -gt 0) {
 }
 
 Write-Host "interactive Win11 accessibility: PASS ($artifact)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

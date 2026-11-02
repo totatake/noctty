@@ -778,7 +778,15 @@ pub const PageListFormatter = struct {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         const tl: PageList.Pin = self.top_left orelse self.list.getTopLeft(.screen);
-        const br: PageList.Pin = self.bottom_right orelse self.list.getBottomRight(.screen).?;
+        var br: PageList.Pin = self.bottom_right orelse self.list.getBottomRight(.screen).?;
+
+        // If the end is a spacer head, move it onto the wrapped wide char,
+        // which may be on another page.
+        if (self.opts.unwrap and !self.rectangle and
+            br.rowAndCell().cell.wide == .spacer_head)
+        {
+            br = br.rightWrap(1) orelse br;
+        }
 
         // If we keep track of pins, we'll need this.
         var point_map: std.ArrayList(Coordinate) = .empty;
@@ -790,7 +798,7 @@ pub const PageListFormatter = struct {
             assert(chunk.start < chunk.end);
             assert(chunk.end > 0);
 
-            var formatter: PageFormatter = .init(&chunk.node.data, self.opts);
+            var formatter: PageFormatter = .init(chunk.node.page(), self.opts);
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
@@ -939,37 +947,14 @@ pub const PageFormatter = struct {
         const start_x: size.CellCountInt = self.start_x;
         if (start_x >= self.page.size.cols) return .{ .rows = blank_rows, .cells = blank_cells };
         const end_x_unclamped: size.CellCountInt = self.end_x orelse self.page.size.cols - 1;
-        var end_x = @min(end_x_unclamped, self.page.size.cols - 1);
+        const end_x = @min(end_x_unclamped, self.page.size.cols - 1);
 
         // Setup our starting row and perform some validation for overflows.
         const start_y: size.CellCountInt = self.start_y;
         if (start_y >= self.page.size.rows) return .{ .rows = blank_rows, .cells = blank_cells };
         const end_y_unclamped: size.CellCountInt = self.end_y orelse self.page.size.rows - 1;
         if (start_y > end_y_unclamped) return .{ .rows = blank_rows, .cells = blank_cells };
-        var end_y = @min(end_y_unclamped, self.page.size.rows - 1);
-
-        // Edge case: if our end x/y falls on a spacer head AND we're unwrapping,
-        // then we move the x/y to the start of the next row (if available).
-        if (self.opts.unwrap and !self.rectangle) {
-            const final_row = self.page.getRow(end_y);
-            const cells = self.page.getCells(final_row);
-            switch (cells[end_x].wide) {
-                .spacer_head => {
-                    // Move to next row if available
-                    //
-                    // TODO: if unavailable, we should add to our trailing state
-                    //
-                    // so the pagelist formatter can be aware and maybe add
-                    // another page
-                    if (end_y < self.page.size.rows - 1) {
-                        end_y += 1;
-                        end_x = 0;
-                    }
-                },
-
-                else => {},
-            }
-        }
+        const end_y = @min(end_y_unclamped, self.page.size.rows - 1);
 
         // If we only have a single row, validate that start_x <= end_x
         if (start_y == end_y and start_x > end_x) {
@@ -1406,6 +1391,9 @@ pub const PageFormatter = struct {
                     closing.len,
                 );
             }
+            // Closing the div creates a newline in the output
+            // so make sure to create one less newline
+            if (blank_rows >= 1) blank_rows -= 1;
         }
 
         return .{ .rows = blank_rows, .cells = blank_cells };
@@ -1662,7 +1650,7 @@ test "Page plain single line" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     // Test our point map.
@@ -1709,7 +1697,7 @@ test "Page plain single line soft-wrapped unwrapped" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{
         .emit = .plain,
         .unwrap = true,
@@ -1779,7 +1767,7 @@ test "Page plain single wide char" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     // Test our point map.
@@ -1870,7 +1858,7 @@ test "Page plain single wide char soft-wrapped unwrapped" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
     formatter.opts.unwrap = true;
 
@@ -1888,30 +1876,6 @@ test "Page plain single wide char soft-wrapped unwrapped" {
         try testing.expectEqualStrings("1A⚡", output);
         try testing.expectEqual(@as(usize, page.size.rows - 1), state.rows);
         try testing.expectEqual(@as(usize, page.size.cols - 2), state.cells);
-
-        // Verify our point map
-        try testing.expectEqual(output.len, point_map.items.len);
-        for (2..output.len) |i| try testing.expectEqual(
-            Coordinate{ .x = 0, .y = 1 },
-            point_map.items[i],
-        );
-    }
-
-    // Full string (ending on spacer head)
-    {
-        builder.clearRetainingCapacity();
-        point_map.clearRetainingCapacity();
-
-        formatter.end_x = 2;
-        formatter.end_y = 0;
-        defer {
-            formatter.end_x = null;
-            formatter.end_y = null;
-        }
-
-        _ = try formatter.formatWithState(&builder.writer);
-        const output = builder.writer.buffered();
-        try testing.expectEqualStrings("1A⚡", output);
 
         // Verify our point map
         try testing.expectEqual(output.len, point_map.items.len);
@@ -1987,7 +1951,7 @@ test "Page plain multiline" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2038,7 +2002,7 @@ test "Page plain multiline rectangle" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 1;
     formatter.end_x = 3;
@@ -2092,7 +2056,7 @@ test "Page plain multi blank lines" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2145,7 +2109,7 @@ test "Page plain trailing blank lines" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2198,7 +2162,7 @@ test "Page plain trailing whitespace" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2251,7 +2215,7 @@ test "Page plain trailing whitespace no trim" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{
         .emit = .plain,
         .trim = false,
@@ -2305,7 +2269,7 @@ test "Page plain with prior trailing state rows" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
     formatter.trailing_state = .{ .rows = 2, .cells = 0 };
 
@@ -2351,7 +2315,7 @@ test "Page plain with prior trailing state cells no wrapped line" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
     formatter.trailing_state = .{ .rows = 0, .cells = 3 };
 
@@ -2396,7 +2360,7 @@ test "Page plain with prior trailing state cells with wrap continuation" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Surgically modify the first row to be a wrap continuation
     const row = page.getRow(0);
@@ -2450,7 +2414,7 @@ test "Page plain soft-wrapped without unwrap" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2499,7 +2463,7 @@ test "Page plain soft-wrapped with unwrap" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .plain, .unwrap = true });
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2547,7 +2511,7 @@ test "Page plain soft-wrapped 3 lines without unwrap" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2601,7 +2565,7 @@ test "Page plain soft-wrapped 3 lines with unwrap" {
     try testing.expect(pages.pages.first != null);
     try testing.expect(pages.pages.first == pages.pages.last);
 
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .plain, .unwrap = true });
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -2650,7 +2614,7 @@ test "Page plain start_y subset" {
     s.nextSlice("hello\r\nworld\r\ntest");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 1;
@@ -2697,7 +2661,7 @@ test "Page plain end_y subset" {
     s.nextSlice("hello\r\nworld\r\ntest");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.end_y = 1;
@@ -2744,7 +2708,7 @@ test "Page plain start_y and end_y range" {
     s.nextSlice("hello\r\nworld\r\ntest\r\nfoo");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 1;
@@ -2792,7 +2756,7 @@ test "Page plain start_y out of bounds" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 30;
@@ -2830,7 +2794,7 @@ test "Page plain end_y greater than rows" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.end_y = 30;
@@ -2873,7 +2837,7 @@ test "Page plain end_y less than start_y" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 5;
@@ -2912,7 +2876,7 @@ test "Page plain start_x on first row only" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 6;
@@ -2954,7 +2918,7 @@ test "Page plain end_x on last row only" {
     s.nextSlice("first line\r\nsecond line\r\nthird line");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.end_y = 2;
@@ -3007,7 +2971,7 @@ test "Page plain start_x and end_x multiline" {
     s.nextSlice("hello world\r\ntest case\r\nfoo bar");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 6;
@@ -3064,7 +3028,7 @@ test "Page plain start_x out of bounds" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 100;
@@ -3102,7 +3066,7 @@ test "Page plain end_x greater than cols" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.end_x = 100;
@@ -3144,7 +3108,7 @@ test "Page plain end_x less than start_x single row" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 10;
@@ -3184,7 +3148,7 @@ test "Page plain start_y non-zero ignores trailing state" {
     s.nextSlice("hello\r\nworld");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 1;
@@ -3228,7 +3192,7 @@ test "Page plain start_x non-zero ignores trailing state" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_x = 6;
@@ -3272,7 +3236,7 @@ test "Page plain start_y and start_x zero uses trailing state" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .plain);
     formatter.start_y = 0;
@@ -3324,7 +3288,7 @@ test "Page plain single line with styling" {
     try testing.expect(pages.pages.first == pages.pages.last);
 
     // Create the formatter
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .plain);
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -3365,7 +3329,7 @@ test "Page VT single line plain text" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3404,7 +3368,7 @@ test "Page VT single line with bold" {
     s.nextSlice("\x1b[1mhello\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3450,7 +3414,7 @@ test "Page VT multiple styles" {
     s.nextSlice("\x1b[1mhello \x1b[3mworld\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3485,7 +3449,7 @@ test "Page VT with foreground color" {
     s.nextSlice("\x1b[31mred\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3531,7 +3495,7 @@ test "Page VT with background and foreground colors" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .{
         .emit = .vt,
@@ -3568,7 +3532,7 @@ test "Page VT multi-line with styles" {
     s.nextSlice("\x1b[1mfirst\x1b[0m\r\n\x1b[3msecond\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3605,7 +3569,7 @@ test "Page VT duplicate style not emitted twice" {
     s.nextSlice("\x1b[1mhel\x1b[1mlo\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
 
@@ -3674,7 +3638,7 @@ test "PageList plain spanning two pages" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_rows = pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
 
     // Fill the first page almost completely
     for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
@@ -3747,7 +3711,7 @@ test "PageList soft-wrapped line spanning two pages without unwrap" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_rows = pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
 
     // Fill the first page with soft-wrapped content
     for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
@@ -3811,7 +3775,7 @@ test "PageList soft-wrapped line spanning two pages with unwrap" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_rows = pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
 
     // Fill the first page with soft-wrapped content
     for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
@@ -3855,6 +3819,65 @@ test "PageList soft-wrapped line spanning two pages with unwrap" {
     }
 }
 
+test "PageList selection ending on spacer head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_]bool{ false, true }) |across_pages| {
+        var t = try Terminal.init(alloc, .{ .cols = 3, .rows = 3 });
+        defer t.deinit(alloc);
+
+        var s = t.vtStream();
+        defer s.deinit();
+
+        const pages = &t.screens.active.pages;
+        const first_node = pages.pages.first.?;
+        const y = if (across_pages) first_node.capacity().rows - 1 else 0;
+        for (0..y) |_| s.nextSlice("\r\n");
+        s.nextSlice("1A⚡Z");
+
+        const start: Pin = .{ .node = first_node, .x = 0, .y = y };
+        const end: Pin = .{ .node = first_node, .x = 2, .y = y };
+        var glyph = end.down(1).?;
+        glyph.x = 0;
+        try testing.expectEqual(across_pages, glyph.node != first_node);
+
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var pin_map: std.ArrayList(Pin) = .empty;
+        defer pin_map.deinit(alloc);
+
+        var formatter: PageListFormatter = .init(pages, .{ .emit = .plain, .unwrap = true });
+        formatter.bottom_right = end;
+        formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+
+        for ([_]bool{ true, false }) |only_glyph| {
+            builder.clearRetainingCapacity();
+            pin_map.clearRetainingCapacity();
+            formatter.top_left = if (only_glyph) end else start;
+            try formatter.format(&builder.writer);
+            const output = builder.writer.buffered();
+            try testing.expectEqualStrings(if (only_glyph) "⚡" else "1A⚡", output);
+            try testing.expectEqual(output.len, pin_map.items.len);
+            for (output.len - "⚡".len..output.len) |i| {
+                try testing.expectEqual(glyph, pin_map.items[i]);
+            }
+        }
+
+        // Neither wrapped output nor rectangle selections extend the end.
+        for ([_]struct { unwrap: bool, rectangle: bool }{
+            .{ .unwrap = false, .rectangle = false },
+            .{ .unwrap = true, .rectangle = true },
+        }) |case| {
+            builder.clearRetainingCapacity();
+            formatter.opts.unwrap = case.unwrap;
+            formatter.rectangle = case.rectangle;
+            try formatter.format(&builder.writer);
+            try testing.expectEqualStrings("1A", builder.writer.buffered());
+        }
+    }
+}
+
 test "PageList VT spanning two pages" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -3872,7 +3895,7 @@ test "PageList VT spanning two pages" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_rows = pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
 
     // Fill the first page almost completely
     for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
@@ -3978,7 +4001,7 @@ test "PageList plain with x offset spanning two pages" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_rows = pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
 
     // Fill first page almost completely
     for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
@@ -4000,7 +4023,7 @@ test "PageList plain with x offset spanning two pages" {
     defer pin_map.deinit(alloc);
 
     var formatter: PageListFormatter = .init(pages, .plain);
-    formatter.top_left = .{ .node = first_node, .y = first_node.data.size.rows - 1, .x = 6 };
+    formatter.top_left = .{ .node = first_node, .y = first_node.rows() - 1, .x = 6 };
     formatter.bottom_right = .{ .node = last_node, .y = 1, .x = 2 };
     formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
 
@@ -5344,7 +5367,7 @@ test "Page html with multiple styles" {
     s.nextSlice("\x1b[1mbold\x1b[3mitalic\x1b[0mnormal");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5379,7 +5402,7 @@ test "Page html plain text" {
     s.nextSlice("hello, world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5412,7 +5435,7 @@ test "Page html with colors" {
     s.nextSlice("\x1b[31;44mcolored");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5482,7 +5505,7 @@ test "Page html with background and foreground colors" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{
         .emit = .html,
         .background = .{ .r = 0x12, .g = 0x34, .b = 0x56 },
@@ -5517,7 +5540,7 @@ test "Page html with escaping" {
     s.nextSlice("<tag>&\"'text");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -5588,7 +5611,7 @@ test "Page html with unicode as numeric entities" {
     s.nextSlice("╰─ ❯");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5598,6 +5621,42 @@ test "Page html with unicode as numeric entities" {
     // ╰ = U+2570 = 9584, ─ = U+2500 = 9472, ❯ = U+276F = 10095
     try testing.expectEqualStrings(
         "<div style=\"font-family: monospace; white-space: pre;\">&#9584;&#9472; &#10095;</div>",
+        output,
+    );
+}
+
+test "Page html trailing blank lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("hello\r\nworld\r\n\r\n");
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.pages.first != null);
+    try testing.expect(pages.pages.first == pages.pages.last);
+
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .{ .emit = .html });
+
+    const state = try formatter.formatWithState(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // The closing div behaves as a newline
+    try testing.expectEqual(@as(usize, page.size.rows - 2), state.rows);
+    try testing.expectEqualStrings(
+        "<div style=\"font-family: monospace; white-space: pre;\">hello\nworld</div>",
         output,
     );
 }
@@ -5621,7 +5680,7 @@ test "Page html ascii characters unchanged" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5653,7 +5712,7 @@ test "Page html mixed ascii and unicode" {
     s.nextSlice("test ╰─❯ ok");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -5687,7 +5746,7 @@ test "Page VT with palette option emits RGB" {
     s.nextSlice("\x1b[31mred");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Without palette option - should emit palette index
     {
@@ -5731,7 +5790,7 @@ test "Page html with palette option emits RGB" {
     s.nextSlice("\x1b[31mred");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Without palette option - should emit CSS variable
     {
@@ -5784,7 +5843,7 @@ test "Page VT style reset properly closes styles" {
     s.nextSlice("\x1b[1mbold\x1b[0mnormal");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     builder.clearRetainingCapacity();
     var formatter: PageFormatter = .init(page, .vt);
@@ -5814,7 +5873,7 @@ test "Page codepoint_map single replacement" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'o' with 'x'
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -5873,7 +5932,7 @@ test "Page codepoint_map conflicting replacement prefers last" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'o' with 'x', then with 'y' - should prefer last
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -5915,7 +5974,7 @@ test "Page codepoint_map replace with string" {
     s.nextSlice("hello");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'o' with a multi-byte string
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -5971,7 +6030,7 @@ test "Page codepoint_map range replacement" {
     s.nextSlice("abcdefg");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'b' through 'e' with 'X'
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -6009,7 +6068,7 @@ test "Page codepoint_map multiple ranges" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'a'-'m' with 'A' and 'n'-'z' with 'Z'
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -6053,7 +6112,7 @@ test "Page codepoint_map unicode replacement" {
     s.nextSlice("hello ⚡ world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace lightning bolt with fire emoji
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -6118,7 +6177,7 @@ test "Page codepoint_map with styled formats" {
     s.nextSlice("\x1b[31mred text\x1b[0m");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Replace 'e' with 'X' in styled text
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -6159,7 +6218,7 @@ test "Page codepoint_map empty map" {
     s.nextSlice("hello world");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     // Empty map should not change anything
     var map: std.MultiArrayList(CodepointMap) = .{};
@@ -6201,7 +6260,7 @@ test "Page VT background color on trailing blank cells" {
     s.nextSlice("\x1b[0m\r\nline2");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
 
     var formatter: PageFormatter = .init(page, .vt);
     formatter.opts.trim = false; // Don't trim so we can see the trailing behavior
@@ -6248,7 +6307,7 @@ test "Page HTML with hyperlinks" {
     s.nextSlice("\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -6283,7 +6342,7 @@ test "Page HTML with multiple hyperlinks" {
     s.nextSlice("\x1b]8;;https://second.com\x1b\\second\x1b]8;;\x1b\\");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -6319,7 +6378,7 @@ test "Page HTML with hyperlink escaping" {
     s.nextSlice("\x1b]8;;https://example.com?a=1&b=2\x1b\\link\x1b]8;;\x1b\\");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -6353,7 +6412,7 @@ test "Page HTML with styled hyperlink" {
     s.nextSlice("\x1b]8;;https://example.com\x1b\\\x1b[1mbold link\x1b[0m\x1b]8;;\x1b\\");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -6388,7 +6447,7 @@ test "Page HTML hyperlink closes style before anchor" {
     s.nextSlice("\x1b]8;;https://example.com\x1b\\\x1b[1mbold\x1b[0m plain");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     try formatter.format(&builder.writer);
@@ -6422,7 +6481,7 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
     s.nextSlice("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ normal");
 
     const pages = &t.screens.active.pages;
-    const page = &pages.pages.last.?.data;
+    const page = pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
 
     var point_map: std.ArrayList(Coordinate) = .empty;
@@ -6483,7 +6542,7 @@ test "Page HTML keeps the text of a hyperlink whose scheme is not allowed" {
         s.nextSlice(uri);
         s.nextSlice("\x1b\\\x1b[1mlink\x1b[0m\x1b]8;;\x1b\\ plain");
 
-        const page = &t.screens.active.pages.pages.last.?.data;
+        const page = t.screens.active.pages.pages.last.?.page();
         var formatter: PageFormatter = .init(page, .{ .emit = .html });
         var point_map: std.ArrayList(Coordinate) = .empty;
         defer point_map.deinit(alloc);
@@ -6530,7 +6589,7 @@ test "Page HTML anchors web, mail and ftp links in any letter case" {
         s.nextSlice(uri);
         s.nextSlice("\x1b\\link\x1b]8;;\x1b\\");
 
-        const page = &t.screens.active.pages.pages.last.?.data;
+        const page = t.screens.active.pages.pages.last.?.page();
         var formatter: PageFormatter = .init(page, .{ .emit = .html });
         try formatter.format(&builder.writer);
 
@@ -6561,7 +6620,7 @@ test "Page HTML switches from a dropped link to an allowed one" {
     s.nextSlice("\x1b]8;;javascript:x\x1b\\bad\x1b]8;;https://ok.example\x1b\\good\x1b]8;;\x1b\\");
     s.nextSlice(" \x1b]8;;https://ok.example\x1b\\good\x1b]8;;file://h/x\x1b\\bad\x1b]8;;\x1b\\");
 
-    const page = &t.screens.active.pages.pages.last.?.data;
+    const page = t.screens.active.pages.pages.last.?.page();
     var formatter: PageFormatter = .init(page, .{ .emit = .html });
     try formatter.format(&builder.writer);
 

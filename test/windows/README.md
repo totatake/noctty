@@ -270,20 +270,23 @@ progress.
 Interactive Win11 validation for native progress state changes. It
 launches `noctty` inside the repo-local Win11 sandbox, emits raw
 OSC `9;4` state transitions for `set`, `pause`, `error`,
-`indeterminate`, and `remove`, captures the `noctty` window via
-screenshots for each state, and fails if:
+`indeterminate`, and `remove`, takes a screenshot of the `noctty` window
+for each state, and fails if:
 
 - the runtime logs `taskbar progress init failed`,
   `taskbar progress sync failed`, or a crash
-- the runtime never logs one of the expected taskbar progress sync
-  states (`set`, `pause`, `error`, `indeterminate`, `remove`)
+- noctty exits, or the payload does not reach one of the states before
+  the timeout
 
-The script reports whether captured `set`/`remove` and `pause`/`error`
-window images differ, and does the same for bottom-of-screen strips.
-These image comparisons are diagnostic only: hosted desktop environments
-do not always expose the rendered shell surface or Explorer taskbar to
-screen capture, and bottom-strip captures can include unrelated desktop
-content.
+The script reports whether the `set`/`remove` and `pause`/`error`
+screenshots differ (`unknown` when one was not saved). The comparison is
+diagnostic only: hosted desktop environments do not always expose the
+rendered window to screen capture. The screenshots go through the same
+gate as the pixel diagnostic (see the interactive job below), so a state
+whose screenshot would show anything but noctty logs why and saves none.
+The harness takes no capture of the taskbar: a strip of the bottom of the
+screen showed whatever the user had pinned and running there and was
+never evidence of taskbar rendering.
 
 Run with:
 
@@ -295,8 +298,11 @@ powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-progress.ps1 -R
 
 Interactive Win11 validation for custom post-processing shaders. It builds
 with `-Dcustom-shaders=true`, loads a deterministic solid-magenta ShaderToy
-fixture, captures the terminal surface child window, and fails unless the
-dominant sampled surface color is magenta.
+fixture, takes a screenshot of the terminal surface child window (through the
+screenshot gate), and fails unless the dominant sampled surface color is
+magenta. With `NOCTTY_INTERACTIVE_MEASURE_AUMID=1`
+(the release job), `-Rebuild` rebuilds the measurement generation instead, which
+always carries custom shaders.
 
 Run with:
 
@@ -314,7 +320,8 @@ seconds, per the render trace's `last_swap_process_output_bytes`, and the
 animation keeps presenting at the paced rate. The bug it guards against is
 timing-dependent, so one run on a regressed build can still pass.
 It needs an executable built with custom shaders, for example the one
-`interactive-win11-shaders.ps1 -Rebuild` leaves behind.
+`interactive-win11-shaders.ps1 -Rebuild` leaves behind, or the measurement
+build in the release job.
 
 Run with:
 
@@ -328,7 +335,9 @@ Interactive Win11 validation for resize repaint coverage. It launches
 `noctty` with a light terminal background, synthesizes a live resize
 growth, exits the resize loop, captures the settled enlarged window, and fails
 if the newly exposed right or bottom content bands are mostly near-black or
-unpainted neutral gray.
+unpainted neutral gray. Each capture is clipped to noctty's client area inset
+by the corner radius, and the band check reads it in memory; it is saved to
+the logs only through the screenshot gate (see the interactive job below).
 
 Run with:
 
@@ -351,12 +360,48 @@ the real profile, and it redirects PSReadLine's history (which ignores
 Scenarios marked `Expect = 'desync'` are known bugs: they pass while they
 still differ and fail once they stop, so the fix removes the mark. `-Scenario`
 runs a subset and `-ListScenarios` lists them. Missing optional programs
-(`pwsh.exe`, Git for Windows' `vim.exe`) skip their scenarios. The headless
-counterpart is `src/terminal/resize_replay.zig`.
+(`pwsh.exe`, Git for Windows' `vim.exe`) skip their scenarios, and so does the
+Clink scenario without `-Clink <extracted portable Clink>\clink_x64.exe`; that
+folder is copied into the sandbox and injected into cmd with a profile of its
+own (an empty `.inputrc`, an empty `--scripts` folder, `clink.autostart = nul`
+so no `clink_start.cmd` runs, and every inherited `CLINK_*` override removed). It is also skipped while script folders are
+registered with `clink installscripts`, which would load into it. Every cmd
+scenario starts `cmd.exe /d` with `CLINK_NOAUTORUN=1`, so a Clink installed for
+AutoRun stays out. The headless counterpart is
+`src/terminal/resize_replay.zig`.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-conpty-sync.ps1 -ResetState
 ```
+
+`.github/workflows/conpty-sync.yml` runs it with `-NoBuild -RequireAll` and the
+portable Clink 1.9.34 `test.yml` checks (same checksum) on a
+hosted `windows-2025` runner (x64 only) for pushes to `main` and for pull
+requests that touch the build inputs or the harness; it is not a required check.
+It is not part of the interactive composite. The composite is dispatch-only, so
+it never sees a pull request, and in measurement mode the harness asserts the
+measurement build's `noctty.exe` but stages `zig-out\bin` (the product build, or
+nothing), so it would test the wrong binary until that is changed.
+
+On the runner the step sets `NOCTTY_INTERACTIVE_WIN11_CONPTY_SYNC_BOOTSTRAPPED=1`
+and runs the harness under `powershell.exe`. The sentinel skips the relaunch
+through `scripts\dev-windows.cmd` that the harness otherwise makes, which
+`-NoBuild` does not need: it builds nothing. `-NoBuild` needs a build of this checkout in
+`zig-out`. `-RequireAll` fails a scenario that is skipped because `pwsh.exe` or
+vim is missing, which otherwise counts as a pass. The job uploads the scenarios'
+text evidence (before, after and marker rows, `inner.log`, the results JSON) and
+no screenshots.
+
+Each step of a scenario's start logs a line (launched, host window, shell, first
+prompt), and when the inner half has not finished within `-TimeoutSeconds` the
+outer half prints a diagnostics block before it ends the run: the inner
+process's tree with thread states and wait reasons, and the hidden desktop's
+windows with Windows' hung flag (no command lines, titles or environment). That
+block is how a hang in this harness was traced to its cause: the walk that finds
+the shell under noctty followed `ParentProcessId` without noticing that Windows
+reuses process numbers, found a cycle and spun at 100% CPU.
+`flagship/contracts/Contracts.97-ConptySync.ps1` drives that walk, and the dump
+reader's retry, with synthetic input.
 
 ## interactive-win11-ime-candidate.ps1
 
@@ -401,7 +446,10 @@ Validates Universal Palette theme preview, Escape rollback, Enter commit and
 config persistence, plus suppression of theme preview while Windows High
 Contrast is active. High Contrast mutation is opt-in with
 `-ExerciseHighContrast`; the harness serializes that phase and restores the
-original system setting in `finally`.
+original system setting in `finally`. Before its first screen-pixel check it
+proves that a fresh process presents the Dracula background (two attempts),
+because the accessibility harness turns High Contrast off just before it in the
+release job.
 
 Run with:
 
@@ -419,7 +467,9 @@ screenshots, and verifies default colors, bundled `Cobalt2`, explicit overrides
 after the theme, live config reload, new-tab and new-split inheritance. The
 configured payload paints independent bands for the default foreground and
 palette index 1. `-MinimumDpi 144` makes a high-DPI run mandatory when that
-desktop is available.
+desktop is available. Its config sets `unfocused-split-opacity = 1`: the
+new-split phase reads both panes for the exact colors, and the pane that loses
+focus to the new split would otherwise be dimmed.
 
 Run with:
 
@@ -471,13 +521,57 @@ AUMID in the real `%APPDATA%`, which redirection does not move) unless
 `-AllowProductAumid` says the machine is an ephemeral runner. Results are in
 `profile-matrix-results.json`.
 
+The driver has no console, so it writes `profile-steps.jsonl`: one line as each
+step starts (detecting a profile, copying a case, the launch, the process-tree
+query, the prompt and typing, the close, reading the saved session, a forced
+stop, the results). After a stall the last line names the step. The query, `Get-Descendants`
+in `hidden-win11-lib.ps1`, has a 15 s deadline, and its walk keeps a child only
+if the child is not older than its parent, and visits each process once:
+Windows reuses process numbers, so a stale `ParentProcessId` can point at a
+newer process, even one below it, and a walk without those rules found a cycle
+in another harness and never returned. `flagship/contracts/Contracts.96-HiddenHarnesses.ps1`
+drives the walk, and the same rule in `hidden-win11-default-shell.ps1`'s
+`Find-Shell`, with a recycled-number process table.
+
+## hidden-win11-list-profiles.ps1
+
+Runs `noctty.com +list-profiles` from a portable copy on a hidden desktop and
+checks the profile list it prints: the profiles of a fixture configuration (two
+`profile-order` entries first, one `profile-hidden` entry last), the detected
+shells and SSH hosts after them, the fields of each line, `--plain` equal to the
+redirected default, `--format=json` equal in order to the text, a bad argument
+exiting 1 with nothing on stdout, and none of the fixture's command line,
+variable or working directory in any output, as text or as the decimal or hex
+list of numbers a byte string prints as. One run has `GHOSTTY_LOG=stderr`, which
+switches the log that actions turn off back on, with a default profile and an
+explicit `working-directory = home` so the log line that names the command is
+reached: its stderr must say how big the command was (`<2 args, 32 bytes>`) and
+not what it was. A last run has a `theme = light:A,dark:B` whose files hide different shells, and must list
+the one for the scheme Windows reports for apps (read from the registry, never written). The fixture's `PATH` holds no
+`wsl.exe`, so discovery never starts WSL, and its Visual Studio profiles are
+off, so the result does not depend on the machine. The aligned table needs a
+console and is covered by the unit tests. A CLI action returns before the app
+creates a window, an AppUserModelID or a jump list, so any build works. The
+harness proves the real `startup-attempts.json`, the PowerShell history files'
+metadata and the clipboard sequence number did not change.
+
+```powershell
+pwsh -NoProfile -File .\hidden-win11-list-profiles.ps1 -Bin <dir with noctty.exe and noctty.com> -Run <new dir>
+```
+
+Results are in `results.json` and `checks.txt`; the output of each run is in
+`<name>.out.txt` and `<name>.err.txt`.
+
 ## hidden-win11-embedding-idle.ps1
 
 Ephemeral-runner lifecycle of `noctty.exe -Embedding`, the process Windows starts to hand
 over a delegated console. It starts one with nothing to hand over, with
 `LOCALAPPDATA` and the portable folder holding seeded `session-state.json`,
 `palette-mru.txt`, `update-state.json`, `jump-list-recents.json`,
-`startup-attempts.json` and `config.ghostty`, and checks that it opens no window,
+`startup-attempts.json` and `config.ghostty`, and checks that it opens no window
+(other than the never-shown `noctty.win32.lifecycle` window every noctty process
+makes so that Restart Manager can ask it to close, and the default IME windows
+Windows gives its thread for it, all of which must stay hidden),
 exits by itself after its five-second idle timer with code 0, leaves every seeded
 file byte-identical, quarantines nothing and does not touch the console
 delegation values. `-NegativeControl` starts an ordinary instance instead and
@@ -487,6 +581,11 @@ The workflow also runs that negative control with `-Renderer d3d11-warp` so
 an ordinary instance can open a window on the GPU-less runner.
 The harness refuses to start when the user's `DelegationTerminal` selects noctty:
 the measurement AUMID does not isolate the session's live COM handoff class.
+That check, `Assert-EmbeddingDelegationSafe`, has one copy,
+`hidden-win11-embedding-guard.ps1`, which both `hidden-win11-lib.ps1` and
+`hidden-win11-local-lib.ps1` dot-source, so `hidden-win11-restart-manager.ps1`'s
+`embedding-idle` case refuses the same way. Contracts.96 pins the function and
+both harnesses' calls with mutation controls.
 
 ```powershell
 pwsh -NoProfile -File .\hidden-win11-embedding-idle.ps1 -Bin <dir with noctty.exe> -Run <new dir>
@@ -527,6 +626,91 @@ prove the absence of a window whose whole lifetime falls between samples.
 No external broker journey is exercised; keep bundled and in-box ConPTY
 desktop evidence separate. The Server 2022 run is not a Windows 10 desktop pass.
 
+## hidden-win11-local-lib.ps1
+
+Shared by the hidden-desktop harnesses that run on a developer machine
+(`hidden-win11-docked-search.ps1`, `-single-tab-close`, `-dpi-geometry`,
+`-quick-terminal-identity`, `-session-restore`, `-default-shell`,
+`-restore-quarantine`, `-app-delivery`, `-restart-manager` and `-list-profiles`); each dot-sources it and still runs on
+its own. It holds the private desktop, the owned kill-on-close job, the two
+explicit-desktop launches (`Launch` for the driver, `Spawn` for a case),
+`Invoke-LocalHiddenDriver` (the outer half: run the harness again as its driver
+on a new private desktop with LOCALAPPDATA and APPDATA redirected into the run
+directory, then check the real `startup-attempts.json`, PowerShell history
+metadata, and, where the harness asks, the clipboard sequence number), the
+small helpers those harnesses had copied, and, from `hidden-win11-embedding-guard.ps1`,
+the `-Embedding` delegation guard.
+
+## PowerShell history isolation
+
+`scripts/windows-harness-history.ps1` resolves the real history paths through
+Windows known folders and compares only existence, size and UTC mtime. Interactive
+entry points start the guard before launching and assert it in `finally`; the
+composite also guards the whole batch. A change fails with the harness name,
+including when another check already failed. The guard never opens or hashes
+history. Maintainer activity during a run can also trip it and must be attributed
+before another launch.
+
+Shell-independent panes use `--command=cmd.exe`. An explicit `-e` selects only
+the first pane, so additional tabs and splits still need the cmd default.
+Only fixtures that test a configured `command` opt out of the shared pin.
+Tests that need interactive
+PowerShell configure PSReadLine before the first read, using a run-local
+`HistorySavePath` and/or `HistorySaveStyle SaveNothing`. Redirecting `APPDATA`
+alone does not isolate PSReadLine. Seeded prediction tests retain their scratch
+history with `SaveAtExit`. `harness-history-guard.ps1` checks the guard against
+scratch metadata changes and real PSReadLine writes on a private desktop;
+the negative control must reject the scratch write and the isolated control
+must leave its scratch history unchanged.
+
+The interactive composite builds exact clean `HEAD` in a generation under
+`.sandbox/interactive-measure/<HEAD>`, with only the recorded measurement AUMID
+patch applied to extracted source. It suppresses product registration writes and
+uses `.measure` for process and jump-list identity. The explicit product toast
+notifier and command-finish policy stay unchanged. Source/build receipts bind
+the source archive, patch and both executable hashes; the composite retains and
+rechecks them. This is measurement-build evidence, with registration repair and
+installed cold-start activation outside its coverage. Each child retains its
+own redirected config directories. See [history-inventory.md](history-inventory.md)
+for the shell and guard used by each harness. The measurement build carries
+custom shaders (`-Dcustom-shaders=true`, as releases do) and its receipt binds
+the exact build arguments.
+
+`interactive-win11-job.ps1` is the Test workflow's `windows-interactive` job:
+the composite, then the shader, shader-pacing, accessibility, palette-theme and
+session-restore leaves, all with `NOCTTY_INTERACTIVE_MEASURE_AUMID=1`, so every
+launch uses the composite's measurement build and none rewrites the product
+jump list (the Shell keeps one per AUMID in the real profile, which a redirected
+`APPDATA` does not move). One state guard spans the whole job: a change to the
+product jump list, the real `startup-attempts.json` or the clipboard sequence
+fails it, and its receipts go to `flagship/artifacts/interactive-win11/job-state`.
+
+When a screen-pixel wait (`Get-StatefulPixel` inside `Wait-InteractiveWin11Until`)
+times out, the harness writes `pixel-diagnostic-*.json` to its sandbox `logs`
+folder, which the job uploads: the window under each of the 16 sample points
+(handle, class, process name; never a title) and the color read there, the
+foreground window, whether noctty's window was hung, cloaked, minimized, hidden
+or see-through, the input idle time, the windows above it that overlap the
+rect, and a screenshot of the sampled rect. The screenshot is taken only while
+noctty's window is shown, uncloaked, not minimized and opaque, every sample
+point lies on a noctty window, and no window of another process above it
+overlaps the rect (unless DWM says that window is cloaked); it is clipped to
+noctty's client area inset by the corner radius, and written only if the same
+check still holds right after the capture (`Get-StatefulScreenshotDecision`).
+Otherwise the report says why it was withheld. The 16 single-pixel colors are
+recorded either way, so a sample point on another application's window records
+that window's color at that point.
+
+Every other screenshot the job uploads (progress, resize, shaders) is saved
+through the same gate, `Save-StatefulScreenCapture` in
+`interactive-win11-stateful-lib.ps1`. A verification contract fails when a
+harness, script or workflow uses `CopyFromScreen` for more than one pixel
+outside it, and when any harness but resize asks it for the in-memory image
+(`-PassThru`, which is not gated). The only other files allowed a capture are
+`interactive-win11-shell-command-live.ps1`, which keeps its captures in the
+sandbox `temp` folder that no workflow uploads, and the maintainer's opt-in
+`renderer/Invoke-VisibleD3D11Check.ps1`.
+
 ## ..\..\scripts\check-test-skips.ps1
 
 Budget for the Zig tests that skip themselves. `zig build test` reports only a
@@ -558,6 +742,41 @@ Run with:
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File ..\..\scripts\interactive-win11.ps1 -ResetState
 ```
+
+## interactive-win11-stale-modes.ps1
+
+Checks that cmd and PowerShell recover Enter and Ctrl+C after a program leaves
+Kitty keyboard or modifyOtherKeys modes enabled, on normal exit and exact-PID
+termination. `-Scenario Modes` uses hidden desktops and never accesses the
+clipboard. Use a measurement-AUMID build on a shared machine; the harness copies
+it into fresh portable directories, redirects AppData, and uses a unique class.
+
+```powershell
+pwsh -NoProfile -File test/windows/interactive-win11-stale-modes.ps1 `
+    -ExePath <measurement-build>/zig-out/bin/noctty.exe -Scenario Modes `
+    -Shells cmd -ExerciseInheritedCtrlCIgnore
+```
+
+`-ExerciseInheritedCtrlCIgnore` starts the hidden worker with
+`CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C through an inheritable Windows
+process attribute. The hidden controller explicitly enables Ctrl+C with
+`SetConsoleCtrlHandler(NULL, FALSE)` before launching noctty. Registering the
+fixture's `Console.CancelKeyPress` handler alone does not clear that attribute.
+Without the controller reset, the cmd regression times out at
+`31-exit.ctrl.interrupted`; a native input observer confirmed that the Ctrl+C
+record still reaches ConPTY's input in this condition.
+Removing the controller reset must fail this invocation. The fixture itself
+never clears the attribute, so it can still detect an ignore flag introduced by
+the product's own launch path.
+
+See Microsoft's [SetConsoleCtrlHandler documentation](https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler)
+for the inherited attribute and [start command reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/start)
+for `/b`'s corresponding Ctrl+C behavior.
+
+The inherited-ignore exercise requires `Modes` or `All`; `Paste` alone is rejected.
+The ordinary invocation omits the regression switch. `-Shells cmd` restricts it
+to cmd; the default tests both shells. `-Scenario Paste` and `All` additionally
+use a private window station because desktops on WinSta0 share the clipboard.
 
 ## Style
 

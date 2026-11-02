@@ -5,7 +5,7 @@ x64 and ARM64. The default renderer needs a GPU driver with OpenGL 4.3 or
 newer; where there is none, noctty draws text with its Direct3D 11 renderer
 (beta) instead (see [the Windows guide](windows.md#starting-without-opengl)).
 
-## Install with WinGet or Scoop
+## Install with WinGet, Scoop or Chocolatey
 
 ```powershell
 winget install --id AmanThanvi.noctty -e
@@ -19,11 +19,19 @@ scoop bucket add noctty https://github.com/amanthanvi/scoop-noctty
 scoop install noctty/noctty
 ```
 
+The Chocolatey package runs the same installer as WinGet. chocolatey.org
+reviews each version before listing it, so a new release can reach it after the
+other channels:
+
+```powershell
+choco install noctty
+```
+
 Then skip to [First launch](#first-launch).
 
 ## Install by hand
 
-The current stable release is `1.3.133`. Every release ships these files for
+The current stable release is `1.3.135`. Every release ships these files for
 `<arch>` = `x64` and `arm64`:
 
 | File                                                    | What it is                        |
@@ -104,6 +112,17 @@ name Windows registers as `Legacy (Typographic)`, for example
 `JetBrainsMono NFM (JetBrainsMono Nerd Font Mono)`; `font-family` accepts
 either name.
 
+A character your fonts lack is drawn from the font Windows picks for its
+script. For Arabic that is Segoe UI, a proportional UI font, so the letters sit
+unevenly in the cell grid. `noctty +show-face --string="مرحبا"` names the face
+each character comes from. To draw a script from a monospace font that has it,
+map its Unicode blocks to that family; the Cascadia Code release on GitHub
+includes Arabic, but the older copy that ships with Windows does not:
+
+```ini
+font-codepoint-map = U+0600-U+06FF,U+0750-U+077F,U+08A0-U+08FF,U+FB50-U+FDFF,U+FE70-U+FEFF=Cascadia Code NF
+```
+
 Save, then press `Ctrl+Shift+,` to reload without restarting.
 `noctty +show-config --default --docs | more` lists every option with its
 docs, including the keybind grammar.
@@ -135,6 +154,8 @@ Pane focus on `Alt+Arrow` is Windows-specific.
 | Close tab                   | `Ctrl+Shift+W`                      |
 | Undo / redo                 | `Ctrl+Shift+Z` / `Ctrl+Shift+Y`     |
 | Next / previous tab         | `Ctrl+Tab` / `Ctrl+Shift+Tab`       |
+| Go to tab 1-8               | `Alt+1` through `Alt+8`              |
+| Go to last tab              | `Alt+9`                             |
 | Split pane right            | `Ctrl+Shift+\`                      |
 | Split pane down             | `Ctrl+Shift+E`                      |
 | Move between panes          | `Alt+Arrow`                         |

@@ -153,7 +153,7 @@ fn sendButtonClicked(hwnd: com.HWND) com.HRESULT {
 
 /// Shape-of-life contract callers implement so the provider can ask
 /// the owning widget for its current live text. Decouples the
-/// provider from `Host` (which lives in `win32.zig` and would pull a
+/// provider from `Host` (which lives in `win32/host.zig` and would pull a
 /// cycle into this module).
 pub const PaletteListState = struct {
     ctx: *anyopaque,
@@ -175,6 +175,20 @@ pub const PaletteListState = struct {
     /// Optional screen-space bounds for widgets whose rows are not arranged
     /// as one contiguous vertical list (for example, terminal hint chips).
     row_bounds: ?*const fn (ctx: *anyopaque, index: usize) ?PaletteListRowBounds = null,
+    /// The list's `HelpText`: how to use it, read when it takes the focus.
+    help_text: []const u8 = "",
+    /// A row's `HelpText`, written into `buf` (what the row documents).
+    row_help: ?*const fn (ctx: *anyopaque, index: usize, buf: []u8) []const u8 = null,
+    /// A row's read-only Value (the Value pattern), written into `buf`, or
+    /// null for a row without one: what the row shows, read on request. A
+    /// row's Name, HelpText and the events the list raises do not carry it.
+    row_value: ?*const fn (ctx: *anyopaque, index: usize, buf: []u8) ?[]const u8 = null,
+    /// The keyboard focus is on the selected row while the list has it, as in
+    /// a native list box: the fragment root answers it for `GetFocus`, and a
+    /// selection change while the list is focused is a focus change too. For
+    /// a list that takes the keyboard focus itself; a palette whose focus
+    /// stays in its query field leaves this off.
+    focus_selected_row: bool = false,
     use_com_threading: bool = false,
 };
 
@@ -260,42 +274,23 @@ pub const TerminalViewportGeometry = struct {
 };
 
 pub const PaletteListProvider = struct {
-    const Object = object.ComObject(PaletteListProvider, queryObject, releaseObject);
+    const Object = object.ComObject(PaletteListProvider, query, object.destroyOnLastRelease(PaletteListProvider));
 
-    fn queryObject(self: *PaletteListProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *PaletteListProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
         {
             out.* = @ptrCast(&self.base);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
+        } else if (iidEqual(iid, &com.IID_IRawElementProviderFragmentRoot)) {
             out.* = @ptrCast(&self.fragment_root);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
+        } else if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) {
             out.* = @ptrCast(&self.fragment);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        if (iidEqual(iid, &com.IID_ISelectionProvider)) {
+        } else if (iidEqual(iid, &com.IID_ISelectionProvider)) {
             out.* = @ptrCast(&self.selection_iface);
-            _ = self.refcount.fetchAdd(1, .monotonic);
-            return com.S_OK;
-        }
-        return com.E_NOINTERFACE;
-    }
-
-    fn releaseObject(self: *PaletteListProvider) u32 {
-        const prev = self.refcount.fetchSub(1, .acq_rel);
-        if (prev == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return prev - 1;
+        } else return com.E_NOINTERFACE;
+        _ = self.refcount.fetchAdd(1, .monotonic);
+        return com.S_OK;
     }
 
     base: com.IRawElementProviderSimple,
@@ -393,6 +388,25 @@ pub const PaletteListProvider = struct {
         const row = self.createRow(index) orelse return;
         defer _ = PaletteRowProvider.Release(&row.base);
         events.raiseSelectionItemSelected(&row.base);
+        if (self.focusOnRows()) events.raiseFocusChanged(&row.base);
+    }
+
+    /// Whether the keyboard focus is on the selected row now
+    /// (`PaletteListState.focus_selected_row`).
+    fn focusOnRows(self: *const PaletteListProvider) bool {
+        if (!self.isAvailable() or !self.state.focus_selected_row) return false;
+        const callback = self.state.focused orelse return false;
+        return callback(self.state.ctx);
+    }
+
+    /// The list took the keyboard focus: with the focus on its rows, the
+    /// selected row is what a reader announces.
+    pub fn raiseFocusOnSelectedRow(self: *PaletteListProvider) void {
+        if (com.UiaClientsAreListening() == 0 or !self.focusOnRows()) return;
+        const index = self.selectedIndex() orelse return events.raiseFocusChanged(&self.base);
+        const row = self.createRow(index) orelse return;
+        defer _ = PaletteRowProvider.Release(&row.base);
+        events.raiseFocusChanged(&row.base);
     }
 
     /// Publish removal while the provider and its row fragments are still
@@ -442,8 +456,21 @@ pub const PaletteListProvider = struct {
     }
 
     fn rowId(self: *const PaletteListProvider, index: usize) u64 {
+        // A detached list has no rows (`rowCount`), so no id is compared.
+        if (!self.isAvailable()) return index + 1;
         const callback = self.state.row_id orelse return index + 1;
         return callback(self.state.ctx, index);
+    }
+
+    /// Whether row `index` has a Value (`PaletteListState.row_value`). Asked
+    /// once, when the row's provider is made: what interfaces a row answers
+    /// for is then its own, and a client that holds the row after the owner
+    /// went never makes it call back (`PaletteRowProvider.has_value`).
+    fn rowHasValue(self: *const PaletteListProvider, index: usize) bool {
+        if (!self.isAvailable()) return false;
+        const callback = self.state.row_value orelse return false;
+        var buf: [row_help_capacity]u8 = undefined;
+        return callback(self.state.ctx, index, &buf) != null;
     }
 
     fn geometry(self: *const PaletteListProvider) ?PaletteListGeometry {
@@ -627,7 +654,12 @@ pub const PaletteListProvider = struct {
                     callback(self.state.ctx)
                 else
                     false;
-                out.* = com.VARIANT.fromBool(focused);
+                // With the focus on its rows, the selected row has it.
+                out.* = com.VARIANT.fromBool(focused and !(self.state.focus_selected_row and self.selectedIndex() != null));
+            },
+            constants.UIA_HelpTextPropertyId => if (self.state.help_text.len != 0) {
+                const bstr = allocBstrFromUtf8(self.alloc, self.state.help_text) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
             },
             else => {},
         }
@@ -665,6 +697,7 @@ pub const PaletteListProvider = struct {
     ) callconv(.winapi) com.HRESULT {
         const self = fromFragment(self_fragment);
         out.* = null;
+        if (!self.isAvailable()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         const count = self.rowCount();
         if (count == 0) return com.S_OK;
         const index = switch (direction) {
@@ -768,10 +801,14 @@ pub const PaletteListProvider = struct {
             callback(self.state.ctx)
         else
             false;
-        if (focused) {
-            _ = FragmentAddRef(&self.fragment);
-            out.* = &self.fragment;
-        }
+        if (!focused) return com.S_OK;
+        if (self.state.focus_selected_row) if (self.selectedIndex()) |index| {
+            const row = self.createRow(index) orelse return com.E_OUTOFMEMORY;
+            out.* = &row.fragment;
+            return com.S_OK;
+        };
+        _ = FragmentAddRef(&self.fragment);
+        out.* = &self.fragment;
         return com.S_OK;
     }
 };
@@ -785,6 +822,11 @@ fn validPaletteBounds(bounds: com.UiaRect) bool {
         bounds.height > 0;
 }
 
+/// The most of a row's help text a client gets (`PaletteListState.row_help`).
+const row_help_capacity = 16 * 1024;
+/// `SetFocus` the window: inside `PaletteRowProvider` the name is its method.
+const focusWindow = SetFocus;
+
 const PaletteRowProvider = struct {
     const Object = object.ComObject(PaletteRowProvider, query, release);
 
@@ -792,11 +834,16 @@ const PaletteRowProvider = struct {
     fragment: com.IRawElementProviderFragment,
     selection_item: com.ISelectionItemProvider,
     invoke_item: com.IInvokeProvider,
+    value_item: com.IValueProvider,
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
     parent: *PaletteListProvider,
     index: usize,
     id: u64,
+    /// Whether the row has a Value pattern, asked when it was made
+    /// (`PaletteListProvider.rowHasValue`): `QueryInterface` and
+    /// `GetPatternProvider` read this, never the owner.
+    has_value: bool,
 
     const simple_vtbl: com.IRawElementProviderSimpleVtbl = .{
         .QueryInterface = QueryInterface,
@@ -834,6 +881,14 @@ const PaletteRowProvider = struct {
         .Release = InvokeRelease,
         .Invoke = Invoke,
     };
+    const value_vtbl: com.IValueProviderVtbl = .{
+        .QueryInterface = ValueQueryInterface,
+        .AddRef = ValueAddRef,
+        .Release = ValueRelease,
+        .SetValue = SetValue,
+        .get_Value = GetValue,
+        .get_IsReadOnly = GetIsReadOnly,
+    };
 
     fn create(alloc: std.mem.Allocator, parent: *PaletteListProvider, index: usize, id: u64) !*PaletteRowProvider {
         const self = try alloc.create(PaletteRowProvider);
@@ -843,11 +898,13 @@ const PaletteRowProvider = struct {
             .fragment = .{ .vtbl = &fragment_vtbl },
             .selection_item = .{ .vtbl = &selection_vtbl },
             .invoke_item = .{ .vtbl = &invoke_vtbl },
+            .value_item = .{ .vtbl = &value_vtbl },
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .parent = parent,
             .index = index,
             .id = id,
+            .has_value = parent.rowHasValue(index),
         };
         return self;
     }
@@ -864,15 +921,40 @@ const PaletteRowProvider = struct {
     fn fromInvoke(p: *com.IInvokeProvider) *PaletteRowProvider {
         return @fieldParentPtr("invoke_item", p);
     }
-    fn available(self: *const PaletteRowProvider) bool {
-        return self.parent.isAvailable() and
-            self.index < self.parent.rowCount() and
-            self.parent.rowId(self.index) == self.id;
+    fn fromValue(p: *com.IValueProvider) *PaletteRowProvider {
+        return @fieldParentPtr("value_item", p);
+    }
+    /// The row's Value (`PaletteListState.row_value`), as a fresh BSTR; null
+    /// when the row has none, or for lack of memory (`missing` says which).
+    fn valueBstr(self: *PaletteRowProvider, missing: *bool) com.BSTR {
+        missing.* = true;
+        if (!self.parent.isAvailable()) return null;
+        const callback = self.parent.state.row_value orelse return null;
+        var buf: [row_help_capacity]u8 = undefined;
+        const text = callback(self.parent.state.ctx, self.index, &buf) orelse return null;
+        missing.* = false;
+        return allocBstrFromUtf8(self.alloc, text);
+    }
+    /// Whether the row's item is still in the list, found by its id: the
+    /// RuntimeId names the item, so a row the list moved (a rebuild sorted
+    /// another item in before it, a search changed what is shown) is found
+    /// where it is now and stays that item, and one whose item is gone is
+    /// not available. `index` follows it. Lists with positional ids behave as
+    /// before: their id at another index is another item.
+    fn available(self: *PaletteRowProvider) bool {
+        if (!self.parent.isAvailable()) return false;
+        const count = self.parent.rowCount();
+        if (self.index < count and self.parent.rowId(self.index) == self.id) return true;
+        for (0..count) |index| if (self.parent.rowId(index) == self.id) {
+            self.index = index;
+            return true;
+        };
+        return false;
     }
 
     fn query(self: *PaletteRowProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
-        if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) out.* = @ptrCast(&self.base) else if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) out.* = @ptrCast(&self.fragment) else if (iidEqual(iid, &com.IID_ISelectionItemProvider)) out.* = @ptrCast(&self.selection_item) else if (self.parent.state.invoke_row != null and iidEqual(iid, &com.IID_IInvokeProvider)) out.* = @ptrCast(&self.invoke_item) else return com.E_NOINTERFACE;
+        if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) out.* = @ptrCast(&self.base) else if (iidEqual(iid, &com.IID_IRawElementProviderFragment)) out.* = @ptrCast(&self.fragment) else if (iidEqual(iid, &com.IID_ISelectionItemProvider)) out.* = @ptrCast(&self.selection_item) else if (self.parent.state.invoke_row != null and iidEqual(iid, &com.IID_IInvokeProvider)) out.* = @ptrCast(&self.invoke_item) else if (iidEqual(iid, &com.IID_IValueProvider) and self.has_value) out.* = @ptrCast(&self.value_item) else return com.E_NOINTERFACE;
         _ = self.refcount.fetchAdd(1, .monotonic);
         return com.S_OK;
     }
@@ -880,6 +962,7 @@ const PaletteRowProvider = struct {
     const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
     const SelectionQueryInterface = Object.Interface("selection_item").QueryInterface;
     const InvokeQueryInterface = Object.Interface("invoke_item").QueryInterface;
+    const ValueQueryInterface = Object.Interface("value_item").QueryInterface;
     fn addRef(self: *PaletteRowProvider) u32 {
         return self.refcount.fetchAdd(1, .monotonic) + 1;
     }
@@ -887,6 +970,7 @@ const PaletteRowProvider = struct {
     const FragmentAddRef = Object.Interface("fragment").AddRef;
     const SelectionAddRef = Object.Interface("selection_item").AddRef;
     const InvokeAddRef = Object.Interface("invoke_item").AddRef;
+    const ValueAddRef = Object.Interface("value_item").AddRef;
     fn release(self: *PaletteRowProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
@@ -900,6 +984,7 @@ const PaletteRowProvider = struct {
     const FragmentRelease = Object.Interface("fragment").Release;
     const SelectionRelease = Object.Interface("selection_item").Release;
     const InvokeRelease = Object.Interface("invoke_item").Release;
+    const ValueRelease = Object.Interface("value_item").Release;
     fn getProviderOptions(p: *com.IRawElementProviderSimple, out: *i32) callconv(.winapi) com.HRESULT {
         const self = fromBase(p);
         out.* = com.ProviderOptions_ServerSideProvider |
@@ -915,6 +1000,9 @@ const PaletteRowProvider = struct {
             _ = self.addRef();
         } else if (pattern == constants.UIA_InvokePatternId and self.parent.state.invoke_row != null) {
             out.* = @ptrCast(&self.invoke_item);
+            _ = self.addRef();
+        } else if (pattern == constants.UIA_ValuePatternId and self.has_value) {
+            out.* = @ptrCast(&self.value_item);
             _ = self.addRef();
         }
         return com.S_OK;
@@ -934,16 +1022,52 @@ const PaletteRowProvider = struct {
                 ) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
+            constants.UIA_HelpTextPropertyId => if (self.parent.state.row_help) |callback| {
+                var buf: [row_help_capacity]u8 = undefined;
+                const bstr = allocBstrFromUtf8(self.alloc, callback(self.parent.state.ctx, self.index, &buf)) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_HasKeyboardFocusPropertyId => out.* = com.VARIANT.fromBool(self.parent.focusOnRows() and self.parent.selectedIndex() == self.index),
+            constants.UIA_IsKeyboardFocusablePropertyId => out.* = com.VARIANT.fromBool(self.parent.state.focus_selected_row),
             constants.UIA_SelectionItemIsSelectedPropertyId => out.* = com.VARIANT.fromBool(self.parent.selectedIndex() == self.index),
             constants.UIA_IsOffscreenPropertyId => out.* = com.VARIANT.fromBool(self.parent.rowBounds(self.index) == null),
             constants.UIA_IsControlElementPropertyId, constants.UIA_IsContentElementPropertyId => out.* = com.VARIANT.fromBool(true),
             constants.UIA_IsEnabledPropertyId => out.* = com.VARIANT.fromBool(self.parent.rowEnabled(self.index)),
+            constants.UIA_ValueValuePropertyId => {
+                var missing = true;
+                const bstr = self.valueBstr(&missing);
+                if (bstr) |value| out.* = com.VARIANT.fromBstr(value) else if (!missing) return com.E_OUTOFMEMORY;
+            },
+            constants.UIA_ValueIsReadOnlyPropertyId => if (self.has_value) {
+                out.* = com.VARIANT.fromBool(true);
+            },
             else => {},
         }
         return com.S_OK;
     }
     fn getHostRawElementProvider(_: *com.IRawElementProviderSimple, out: *?*com.IRawElementProviderSimple) callconv(.winapi) com.HRESULT {
         out.* = null;
+        return com.S_OK;
+    }
+    /// A row's Value is read-only: what it shows is changed elsewhere (the
+    /// Profiles page's text field).
+    fn SetValue(p: *com.IValueProvider, _: ?[*:0]const u16) callconv(.winapi) com.HRESULT {
+        const self = fromValue(p);
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        return com.UIA_E_ELEMENTNOTENABLED;
+    }
+    fn GetValue(p: *com.IValueProvider, out: *com.BSTR) callconv(.winapi) com.HRESULT {
+        const self = fromValue(p);
+        out.* = null;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        var missing = true;
+        out.* = self.valueBstr(&missing) orelse return if (missing) com.UIA_E_INVALIDOPERATION else com.E_OUTOFMEMORY;
+        return com.S_OK;
+    }
+    fn GetIsReadOnly(p: *com.IValueProvider, out: *com.BOOL) callconv(.winapi) com.HRESULT {
+        const self = fromValue(p);
+        out.* = 1;
+        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         return com.S_OK;
     }
     fn Navigate(p: *com.IRawElementProviderFragment, direction: i32, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
@@ -990,7 +1114,13 @@ const PaletteRowProvider = struct {
         const self = fromFragment(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (!self.parent.rowEnabled(self.index)) return com.UIA_E_ELEMENTNOTENABLED;
-        return com.E_NOTIMPL;
+        if (!self.parent.state.focus_selected_row) return com.E_NOTIMPL;
+        // The focus is on the selected row: select it and focus the list. A
+        // list that did not take the focus (going away, or disabled) says so.
+        const hr = self.select();
+        if (hr != com.S_OK) return hr;
+        _ = focusWindow(self.parent.hwnd);
+        return if (hwndHasKeyboardFocus(self.parent.hwnd)) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
     fn GetFragmentRoot(p: *com.IRawElementProviderFragment, out: *?*com.IRawElementProviderFragmentRoot) callconv(.winapi) com.HRESULT {
         const self = fromFragment(p);
@@ -1053,20 +1183,20 @@ const PaletteRowProvider = struct {
     }
 };
 
-pub const settings_section_count = 7;
+pub const settings_section_count = 9;
 
 /// Stable provider for native STATIC controls that this custom settings
 /// window otherwise exposes as generic Panes through the system bridge.
 pub const SettingsControlProvider = struct {
-    const Object = object.ComObject(SettingsControlProvider, queryObject, releaseObject);
+    const Object = object.ComObject(SettingsControlProvider, query, release);
 
-    fn queryObject(self: *SettingsControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *SettingsControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
         {
             out.* = @ptrCast(&self.base);
-        } else if ((self.role == .edit or self.role == .combo_box) and iidEqual(iid, &com.IID_IValueProvider)) {
+        } else if (self.role.hasValue() and iidEqual(iid, &com.IID_IValueProvider)) {
             out.* = @ptrCast(&self.value_iface);
         } else if (self.role == .button and iidEqual(iid, &com.IID_IInvokeProvider)) {
             out.* = @ptrCast(&self.invoke_iface);
@@ -1079,7 +1209,7 @@ pub const SettingsControlProvider = struct {
         return com.S_OK;
     }
 
-    fn releaseObject(self: *SettingsControlProvider) u32 {
+    fn release(self: *SettingsControlProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
             if (self.labeled_by) |label| _ = label.vtbl.Release(label);
@@ -1104,6 +1234,11 @@ pub const SettingsControlProvider = struct {
         /// so its children read as children of the window, as they did
         /// before the viewport existed.
         layout_pane,
+
+        /// Edits and combo boxes expose `IValueProvider`.
+        fn hasValue(self: Role) bool {
+            return self == .edit or self == .combo_box;
+        }
     };
 
     base: com.IRawElementProviderSimple,
@@ -1120,6 +1255,8 @@ pub const SettingsControlProvider = struct {
     hwnd: com.HWND,
     role: Role,
     name: ?[]const u8,
+    /// Static descriptor text; assigned before publishing the provider.
+    help_text: []const u8 = "",
     /// The element that names this one (`UIA_LabeledByPropertyId`). Holds
     /// a reference, released with this provider.
     labeled_by: ?*com.IRawElementProviderSimple = null,
@@ -1129,6 +1266,12 @@ pub const SettingsControlProvider = struct {
     /// The field holds a value Settings will not accept
     /// (`UIA_IsDataValidForFormPropertyId`).
     data_invalid: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The field's value differs from its default, which the form marks
+    /// beside it; said as the field's `ItemStatus`, so the mark is not only
+    /// drawn.
+    changed_from_default: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub const changed_from_default_status = "Changed from the default";
 
     const vtbl: com.IRawElementProviderSimpleVtbl = .{
         .QueryInterface = QueryInterface,
@@ -1189,6 +1332,8 @@ pub const SettingsControlProvider = struct {
     const CB_SHOWDROPDOWN: u32 = 0x014F;
     const CB_GETDROPPEDSTATE: u32 = 0x0157;
     const CB_FINDSTRINGEXACT: u32 = 0x0158;
+    const BN_CLICKED: u16 = 0;
+    const CBN_SELCHANGE: u16 = 1;
 
     pub fn create(
         alloc: std.mem.Allocator,
@@ -1212,7 +1357,7 @@ pub const SettingsControlProvider = struct {
             .disconnected = std.atomic.Value(bool).init(false),
             .viewport_fully_clipped = std.atomic.Value(bool).init(false),
         };
-        if (role == .check_box) self.last_toggle = @intCast(SendMessageW(hwnd, BM_GETCHECK, 0, 0));
+        if (role == .check_box) self.last_toggle = self.toggleState();
         if (role == .combo_box) self.last_selection = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
         return self;
     }
@@ -1260,6 +1405,17 @@ pub const SettingsControlProvider = struct {
             com.VARIANT.fromBool(invalid),
             com.VARIANT.fromBool(!invalid),
         );
+    }
+
+    /// Say whether the field differs from its default; a change is announced
+    /// as a new `ItemStatus`.
+    pub fn setChangedFromDefault(self: *SettingsControlProvider, changed: bool) void {
+        if (self.changed_from_default.swap(changed, .acq_rel) == changed or !self.available()) return;
+        events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ItemStatusPropertyId);
+    }
+
+    fn isField(self: *const SettingsControlProvider) bool {
+        return self.role == .edit or self.role == .combo_box or self.role == .check_box;
     }
 
     fn isText(self: *const SettingsControlProvider) bool {
@@ -1331,23 +1487,18 @@ pub const SettingsControlProvider = struct {
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.isText()) return com.S_OK;
-        if ((self.role == .edit or self.role == .combo_box) and pattern_id == constants.UIA_ValuePatternId) {
-            out.* = @ptrCast(&self.value_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .button and pattern_id == constants.UIA_InvokePatternId) {
-            out.* = @ptrCast(&self.invoke_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .check_box and pattern_id == constants.UIA_TogglePatternId) {
-            out.* = @ptrCast(&self.toggle_iface);
-            _ = AddRef(&self.base);
-            return com.S_OK;
-        }
-        if (self.role == .combo_box and pattern_id == constants.UIA_ExpandCollapsePatternId) {
-            out.* = @ptrCast(&self.expand_iface);
+        const pattern: ?*com.IUnknown = if (self.role.hasValue() and pattern_id == constants.UIA_ValuePatternId)
+            @ptrCast(&self.value_iface)
+        else if (self.role == .button and pattern_id == constants.UIA_InvokePatternId)
+            @ptrCast(&self.invoke_iface)
+        else if (self.role == .check_box and pattern_id == constants.UIA_TogglePatternId)
+            @ptrCast(&self.toggle_iface)
+        else if (self.role == .combo_box and pattern_id == constants.UIA_ExpandCollapsePatternId)
+            @ptrCast(&self.expand_iface)
+        else
+            null;
+        if (pattern) |provider| {
+            out.* = provider;
             _ = AddRef(&self.base);
             return com.S_OK;
         }
@@ -1388,18 +1539,27 @@ pub const SettingsControlProvider = struct {
                     out.* = com.VARIANT.fromBstr(bstr);
                 }
             },
-            constants.UIA_ValueValuePropertyId => if (self.role == .edit or self.role == .combo_box) {
+            constants.UIA_HelpTextPropertyId => if (self.help_text.len != 0) {
+                const bstr = allocBstrFromUtf8(self.alloc, self.help_text) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_ItemStatusPropertyId => if (self.isField()) {
+                const status = if (self.changed_from_default.load(.acquire)) changed_from_default_status else "";
+                const bstr = allocBstrFromUtf8(self.alloc, status) orelse return com.E_OUTOFMEMORY;
+                out.* = com.VARIANT.fromBstr(bstr);
+            },
+            constants.UIA_ValueValuePropertyId => if (self.role.hasValue()) {
                 const value = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(value);
             },
-            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role == .edit or self.role == .combo_box) {
+            constants.UIA_ValueIsReadOnlyPropertyId => if (self.role.hasValue()) {
                 out.* = com.VARIANT.fromBool(self.readOnly());
             },
             constants.UIA_ToggleToggleStatePropertyId => if (self.role == .check_box) {
-                out.* = com.VARIANT.fromI4(@intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0)));
+                out.* = com.VARIANT.fromI4(self.toggleState());
             },
             constants.UIA_ExpandCollapseExpandCollapseStatePropertyId => if (self.role == .combo_box) {
-                out.* = com.VARIANT.fromI4(@intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0));
+                out.* = com.VARIANT.fromI4(self.expandCollapseState());
             },
             constants.UIA_LabeledByPropertyId => if (self.labeled_by) |label| {
                 _ = label.vtbl.AddRef(label);
@@ -1445,7 +1605,7 @@ pub const SettingsControlProvider = struct {
 
     fn setValuePrecondition(provider_available: bool, role: Role, enabled: bool) com.HRESULT {
         if (!provider_available) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (role != .edit and role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         if (!enabled) return com.UIA_E_ELEMENTNOTENABLED;
         return com.S_OK;
     }
@@ -1505,7 +1665,7 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!self.role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         out.* = self.allocValueBstr() orelse return com.E_OUTOFMEMORY;
         return com.S_OK;
     }
@@ -1517,7 +1677,7 @@ pub const SettingsControlProvider = struct {
         const self = fromValue(p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        if (self.role != .edit and self.role != .combo_box) return com.UIA_E_INVALIDOPERATION;
+        if (!self.role.hasValue()) return com.UIA_E_INVALIDOPERATION;
         out.* = @intFromBool(self.readOnly());
         return com.S_OK;
     }
@@ -1560,9 +1720,23 @@ pub const SettingsControlProvider = struct {
                 return com.S_OK;
             },
         }
-        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))), @bitCast(@intFromPtr(self.hwnd)));
+        self.notifyParent(parent, BN_CLICKED);
         self.syncNativeState(.observe);
         return com.S_OK;
+    }
+
+    /// Send the parent the WM_COMMAND notification the native control sends.
+    fn notifyParent(self: *SettingsControlProvider, parent: com.HWND, code: u16) void {
+        const control_id: usize = @intCast(GetDlgCtrlID(self.hwnd));
+        _ = SendMessageW(parent, WM_COMMAND, control_id | (@as(usize, code) << 16), @bitCast(@intFromPtr(self.hwnd)));
+    }
+
+    fn toggleState(self: *const SettingsControlProvider) i32 {
+        return @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+    }
+
+    fn expandCollapseState(self: *const SettingsControlProvider) i32 {
+        return @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
     }
 
     fn Toggle(p: *com.IToggleProvider) callconv(.winapi) com.HRESULT {
@@ -1573,7 +1747,7 @@ pub const SettingsControlProvider = struct {
         const self: *SettingsControlProvider = @fieldParentPtr("toggle_iface", p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        out.* = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+        out.* = self.toggleState();
         return com.S_OK;
     }
     fn Expand(p: *com.IExpandCollapseProvider) callconv(.winapi) com.HRESULT {
@@ -1588,7 +1762,7 @@ pub const SettingsControlProvider = struct {
         const self: *SettingsControlProvider = @fieldParentPtr("expand_iface", p);
         out.* = 0;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        out.* = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+        out.* = self.expandCollapseState();
         return com.S_OK;
     }
 
@@ -1597,12 +1771,12 @@ pub const SettingsControlProvider = struct {
     pub fn syncNativeState(self: *SettingsControlProvider, selection_sync: SelectionSync) void {
         if (!self.available()) return;
         if (self.role == .check_box) {
-            const next: i32 = @intCast(SendMessageW(self.hwnd, BM_GETCHECK, 0, 0));
+            const next = self.toggleState();
             const old = self.last_toggle;
             self.last_toggle = next;
             if (old != next) events.raisePropertyChanged(&self.base, constants.UIA_ToggleToggleStatePropertyId, com.VARIANT.fromI4(old), com.VARIANT.fromI4(next));
         } else if (self.role == .combo_box) {
-            const expanded: i32 = @intFromBool(SendMessageW(self.hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+            const expanded = self.expandCollapseState();
             const old_expanded = self.last_expanded;
             self.last_expanded = expanded;
             if (expanded != old_expanded) events.raisePropertyChanged(&self.base, constants.UIA_ExpandCollapseExpandCollapseStatePropertyId, com.VARIANT.fromI4(old_expanded), com.VARIANT.fromI4(expanded));
@@ -1618,13 +1792,19 @@ pub const SettingsControlProvider = struct {
                 // Settings draft together, using the same parent handler.
                 // Update the cache first: the handler may refresh controls.
                 if (selection_sync == .explicit_selection) {
-                    if (GetParent(self.hwnd)) |parent| {
-                        _ = SendMessageW(parent, WM_COMMAND, @as(usize, @intCast(GetDlgCtrlID(self.hwnd))) | (@as(usize, 1) << 16), @bitCast(@intFromPtr(self.hwnd)));
-                    }
+                    if (GetParent(self.hwnd)) |parent| self.notifyParent(parent, CBN_SELCHANGE);
                 }
                 events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ValueValuePropertyId);
             }
         }
+    }
+
+    /// A combo's rows were rebuilt and its selected row kept its index but
+    /// not its text (Settings' Default profile dropdown relabels a profile):
+    /// announce the new Value. `syncNativeState` compares indexes only.
+    pub fn valueTextChanged(self: *SettingsControlProvider) void {
+        if (!self.available() or self.role != .combo_box) return;
+        events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ValueValuePropertyId);
     }
 
     fn getHostRawElementProvider(
@@ -1653,16 +1833,7 @@ pub fn returnSettingsControlProvider(
 /// The section providers retain this object; it only borrows their pointers while
 /// attached, so teardown cannot form a COM reference cycle.
 pub const SettingsSectionGroupProvider = struct {
-    const Object = object.ComObject(SettingsSectionGroupProvider, queryInterface, releaseObject);
-
-    fn releaseObject(self: *SettingsSectionGroupProvider) u32 {
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
-    }
+    const Object = object.ComObject(SettingsSectionGroupProvider, query, object.destroyOnLastRelease(SettingsSectionGroupProvider));
 
     base: com.IRawElementProviderSimple,
     selection_iface: com.ISelectionProvider,
@@ -1752,7 +1923,7 @@ pub const SettingsSectionGroupProvider = struct {
         return !self.detached.load(.acquire) and IsWindow(self.hwnd) != 0;
     }
 
-    fn queryInterface(
+    fn query(
         self: *SettingsSectionGroupProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -1919,9 +2090,9 @@ pub const SettingsSectionMarker = enum(u8) {
 /// The system UIA bridge reports these push-like BUTTON HWNDs as generic Panes,
 /// so Narrator otherwise loses both their radio role and selection semantics.
 pub const SettingsSectionProvider = struct {
-    const Object = object.ComObject(SettingsSectionProvider, queryInterface, releaseObject);
+    const Object = object.ComObject(SettingsSectionProvider, query, release);
 
-    fn releaseObject(self: *SettingsSectionProvider) u32 {
+    fn release(self: *SettingsSectionProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
             _ = SettingsSectionGroupProvider.Release(&self.container.base);
@@ -1942,6 +2113,11 @@ pub const SettingsSectionProvider = struct {
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
     marker: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SettingsSectionMarker.none)),
+    /// How many rows the Settings search found on this section's page, or
+    /// `no_search` while nothing is searched for.
+    search_count: std.atomic.Value(i32) = std.atomic.Value(i32).init(no_search),
+
+    const no_search: i32 = -1;
 
     const simple_vtbl: com.IRawElementProviderSimpleVtbl = .{
         .QueryInterface = QueryInterface,
@@ -2019,6 +2195,28 @@ pub const SettingsSectionProvider = struct {
         events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ItemStatusPropertyId);
     }
 
+    /// Say how many settings the search found on the section's page, or with
+    /// null that nothing is searched for; also part of `ItemStatus`.
+    pub fn setSearchCount(self: *SettingsSectionProvider, count: ?u16) void {
+        const value: i32 = if (count) |found| found else no_search;
+        if (self.search_count.swap(value, .acq_rel) == value) return;
+        if (!self.available()) return;
+        events.raiseCurrentStringPropertyChanged(&self.base, constants.UIA_ItemStatusPropertyId);
+    }
+
+    /// `ItemStatus`: what the section holds, then what the search found on it.
+    pub fn itemStatus(self: *const SettingsSectionProvider, buf: []u8) []const u8 {
+        const marker = self.markerState().itemStatus();
+        const count = self.search_count.load(.acquire);
+        if (count == no_search) return marker;
+        const separator: []const u8 = if (marker.len == 0) "" else ", ";
+        return switch (count) {
+            0 => std.fmt.bufPrint(buf, "{s}{s}no settings found", .{ marker, separator }),
+            1 => std.fmt.bufPrint(buf, "{s}{s}1 setting found", .{ marker, separator }),
+            else => std.fmt.bufPrint(buf, "{s}{s}{d} settings found", .{ marker, separator, count }),
+        } catch marker;
+    }
+
     pub fn raiseFocusChanged(self: *SettingsSectionProvider) void {
         if (!self.available()) return;
         events.raiseFocusChanged(&self.base);
@@ -2036,7 +2234,7 @@ pub const SettingsSectionProvider = struct {
         return !self.detached.load(.acquire) and IsWindow(self.hwnd) != 0;
     }
 
-    fn queryInterface(
+    fn query(
         self: *SettingsSectionProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -2099,7 +2297,8 @@ pub const SettingsSectionProvider = struct {
                 out.* = com.VARIANT.fromBstr(bstr);
             },
             constants.UIA_ItemStatusPropertyId => {
-                const bstr = allocBstrFromUtf8(self.alloc, self.markerState().itemStatus()) orelse return com.E_OUTOFMEMORY;
+                var status_buf: [96]u8 = undefined;
+                const bstr = allocBstrFromUtf8(self.alloc, self.itemStatus(&status_buf)) orelse return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
             constants.UIA_FrameworkIdPropertyId => return object.frameworkId(out),
@@ -2249,9 +2448,9 @@ pub const ChromeRangeValue = struct {
 /// creation; live names, selection, toggles, and scrollbar values are queried
 /// from their owner only while the provider remains attached.
 pub const ChromeControlProvider = struct {
-    const Object = object.ComObject(ChromeControlProvider, queryObject, releaseObject);
+    const Object = object.ComObject(ChromeControlProvider, query, object.destroyOnLastRelease(ChromeControlProvider));
 
-    fn queryObject(self: *ChromeControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *ChromeControlProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or iidEqual(iid, &com.IID_IRawElementProviderSimple)) {
             out.* = @ptrCast(&self.base);
@@ -2272,15 +2471,6 @@ pub const ChromeControlProvider = struct {
         } else return com.E_NOINTERFACE;
         _ = AddRef(&self.base);
         return com.S_OK;
-    }
-
-    fn releaseObject(self: *ChromeControlProvider) u32 {
-        const previous = self.refcount.fetchSub(1, .acq_rel);
-        if (previous == 1) {
-            self.alloc.destroy(self);
-            return 0;
-        }
-        return previous - 1;
     }
 
     base: com.IRawElementProviderSimple,
@@ -2383,7 +2573,7 @@ pub const ChromeControlProvider = struct {
     }
 
     fn TabNavigate(p: *com.IRawElementProviderFragment, direction: i32, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         // UIA supplies HWND parent/siblings through the host provider.
@@ -2398,7 +2588,7 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabBounds(p: *com.IRawElementProviderFragment, out: *com.UiaRect) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = .{ .left = 0, .top = 0, .width = 0, .height = 0 };
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         var rect: RECT = undefined;
@@ -2415,13 +2605,13 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabSetFocus(p: *com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         _ = SetFocus(self.hwnd);
         return com.S_OK;
     }
     fn TabFragmentRoot(p: *com.IRawElementProviderFragment, out: *?*com.IRawElementProviderFragmentRoot) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment", p);
+        const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         _ = AddRef(&self.base);
@@ -2429,19 +2619,18 @@ pub const ChromeControlProvider = struct {
         return com.S_OK;
     }
     fn TabFromPoint(p: *com.IRawElementProviderFragmentRoot, x: f64, y: f64, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        const self = fromFragmentRoot(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (self.closeBounds()) |rect| {
-            if (x >= rect.left and x < rect.left + rect.width and y >= rect.top and y < rect.top + rect.height)
-                return TabNavigate(&self.fragment, com.NavigateDirection_FirstChild, out);
+            if (rect.contains(x, y)) return TabNavigate(&self.fragment, com.NavigateDirection_FirstChild, out);
         }
         _ = AddRef(&self.base);
         out.* = &self.fragment;
         return com.S_OK;
     }
     fn TabFocus(p: *com.IRawElementProviderFragmentRoot, out: *?*com.IRawElementProviderFragment) callconv(.winapi) com.HRESULT {
-        const self: *ChromeControlProvider = @fieldParentPtr("fragment_root", p);
+        const self = fromFragmentRoot(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (hwndHasKeyboardFocus(self.hwnd)) {
@@ -2591,6 +2780,12 @@ pub const ChromeControlProvider = struct {
     }
     fn fromSelectionItem(p: *com.ISelectionItemProvider) *ChromeControlProvider {
         return @fieldParentPtr("selection_item_iface", p);
+    }
+    fn fromFragment(p: *com.IRawElementProviderFragment) *ChromeControlProvider {
+        return @fieldParentPtr("fragment", p);
+    }
+    fn fromFragmentRoot(p: *com.IRawElementProviderFragmentRoot) *ChromeControlProvider {
+        return @fieldParentPtr("fragment_root", p);
     }
 
     const QueryInterface = Object.Interface("base").QueryInterface;
@@ -2891,6 +3086,7 @@ pub const ChromeControlProvider = struct {
 /// all owner callbacks. Instances share a stable runtime ID, not a cached BSTR.
 pub const TabCloseProvider = struct {
     const Object = object.ComObject(TabCloseProvider, query, release);
+    const runtime_id_tag: i32 = 0x54434C; // 'TCL'
 
     base: com.IRawElementProviderSimple,
     fragment: com.IRawElementProviderFragment,
@@ -2975,9 +3171,6 @@ pub const TabCloseProvider = struct {
     const FragmentQueryInterface = Object.Interface("fragment").QueryInterface;
     const InvokeQueryInterface = Object.Interface("invoke_iface").QueryInterface;
 
-    fn addRef(self: *TabCloseProvider) u32 {
-        return self.refcount.fetchAdd(1, .monotonic) + 1;
-    }
     pub const AddRef = Object.Interface("base").AddRef;
     const FragmentAddRef = Object.Interface("fragment").AddRef;
     const InvokeAddRef = Object.Interface("invoke_iface").AddRef;
@@ -3015,7 +3208,7 @@ pub const TabCloseProvider = struct {
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (pattern_id != constants.UIA_InvokePatternId) return com.S_OK;
         out.* = @ptrCast(&self.invoke_iface);
-        _ = self.addRef();
+        _ = AddRef(&self.base);
         return com.S_OK;
     }
 
@@ -3074,10 +3267,8 @@ pub const TabCloseProvider = struct {
         if (direction == com.NavigateDirection_Parent) {
             out.* = &self.parent.fragment;
             _ = ChromeControlProvider.AddRef(&self.parent.base);
-            return com.S_OK;
         }
         return com.S_OK; // The close button is the tab's only child.
-
     }
 
     pub fn GetRuntimeId(
@@ -3087,7 +3278,7 @@ pub const TabCloseProvider = struct {
         const self = fromFragment(p);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        return object.runtimeId(&.{ com.UiaAppendRuntimeId, 0x54434C, @bitCast(@as(u32, @truncate(self.parent.state.tag))) }, out);
+        return object.runtimeId(&.{ com.UiaAppendRuntimeId, runtime_id_tag, @bitCast(@as(u32, @truncate(self.parent.state.tag))) }, out);
     }
 
     pub fn GetBoundingRectangle(
@@ -3253,7 +3444,7 @@ pub fn returnChromeControlProvider(
 }
 
 pub const TerminalProvider = struct {
-    const Object = object.ComObject(TerminalProvider, queryInterface, release);
+    const Object = object.ComObject(TerminalProvider, query, release);
 
     base: com.IRawElementProviderSimple,
     value_iface: com.IValueProvider,
@@ -3373,7 +3564,7 @@ pub const TerminalProvider = struct {
 
     const ValueQueryInterface = Object.Interface("value_iface").QueryInterface;
 
-    fn queryInterface(
+    fn query(
         self: *TerminalProvider,
         iid: *const com.GUID,
         out: *?*anyopaque,
@@ -3968,9 +4159,9 @@ pub const TerminalProvider = struct {
 };
 
 const TerminalTextRangeProvider = struct {
-    const Object = object.ComObject(TerminalTextRangeProvider, queryObject, releaseObject);
+    const Object = object.ComObject(TerminalTextRangeProvider, query, release);
 
-    fn queryObject(self: *TerminalTextRangeProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
+    fn query(self: *TerminalTextRangeProvider, iid: *const com.GUID, out: *?*anyopaque) com.HRESULT {
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_ITextRangeProvider))
@@ -3982,7 +4173,7 @@ const TerminalTextRangeProvider = struct {
         return com.E_NOINTERFACE;
     }
 
-    fn releaseObject(self: *TerminalTextRangeProvider) u32 {
+    fn release(self: *TerminalTextRangeProvider) u32 {
         const prev = self.refcount.fetchSub(1, .acq_rel);
         if (prev == 1) {
             self.snapshot.release();
@@ -4266,6 +4457,12 @@ const TerminalTextRangeProvider = struct {
         return com.S_OK;
     }
 
+    /// Report no rectangles, as an empty array rather than a null one.
+    fn noRectangles(out: *?*com.SAFEARRAY) com.HRESULT {
+        out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+        return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+    }
+
     fn GetBoundingRectangles(
         self_base: *com.ITextRangeProvider,
         out: *?*com.SAFEARRAY,
@@ -4273,22 +4470,17 @@ const TerminalTextRangeProvider = struct {
         const self = fromBase(self_base);
         out.* = null;
         if (self.parent.detached.load(.acquire)) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        var geometry = self.geometry orelse {
-            out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-            return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
-        };
+        var geometry = self.geometry orelse return noRectangles(out);
         var row_shift: i64 = 0;
         if (self.parent.state.current_viewport) |current_viewport| {
             const current = current_viewport(self.parent.state.ctx) catch |err| {
                 if (err == error.ElementNotAvailable) return com.UIA_E_ELEMENTNOTAVAILABLE;
-                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+                return noRectangles(out);
             };
             if (current == null or geometry.row_numbering == null or
                 !std.meta.eql(geometry.row_numbering.?, current.?.row_numbering))
             {
-                out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-                return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+                return noRectangles(out);
             }
             const live = current.?;
             row_shift = @as(i64, @intCast(geometry.viewport_y)) - @as(i64, @intCast(live.viewport_y));
@@ -4300,10 +4492,7 @@ const TerminalTextRangeProvider = struct {
             geometry.origin_y = live.origin_y;
         }
         var screen_origin: POINT = .{ .x = 0, .y = 0 };
-        if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) {
-            out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
-            return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
-        }
+        if (ClientToScreen(self.parent.hwnd, &screen_origin) == 0) return noRectangles(out);
 
         const capacity = @as(usize, geometry.viewport_rows) * 4;
         const values = self.alloc.alloc(f64, capacity) catch return com.E_OUTOFMEMORY;
@@ -5095,6 +5284,74 @@ test "PaletteListProvider exposes configurable identity and focus" {
     _ = PaletteListProvider.FragmentRelease(focus_fragment.?);
 }
 
+test "PaletteListProvider with the focus on its rows gives it to the selected one, and reads their help text" {
+    const callbacks = struct {
+        var focused_now = true;
+        fn focused(_: *anyopaque) bool {
+            return focused_now;
+        }
+        fn rowHelp(_: *anyopaque, index: usize, buf: []u8) []const u8 {
+            return std.fmt.bufPrint(buf, "help for row {d}", .{index}) catch "";
+        }
+    };
+    callbacks.focused_now = true;
+    var state_data = TestPaletteState{ .count = 3, .selected = 1 };
+    var state = state_data.state();
+    state.keyboard_focusable = true;
+    state.focused = callbacks.focused;
+    state.help_text = "Up and Down move";
+    state.row_help = callbacks.rowHelp;
+    state.focus_selected_row = true;
+    const list = try settings_provider_windows.create("STATIC");
+    var list_alive = true;
+    defer if (list_alive) {
+        _ = settings_provider_windows.DestroyWindow(list);
+    };
+    const provider = try PaletteListProvider.create(std.testing.allocator, list, state);
+    defer _ = PaletteListProvider.Release(&provider.base);
+
+    // The list says how to use it, and leaves the focus to its selected row.
+    try expectBstrProperty(&provider.base, constants.UIA_HelpTextPropertyId, "Up and Down move");
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, PaletteListProvider.GetPropertyValue(&provider.base, constants.UIA_HasKeyboardFocusPropertyId, &value));
+    try std.testing.expectEqual(com.VARIANT_FALSE, value.value.bool_val);
+    var focus: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.S_OK, PaletteListProvider.FragmentRootGetFocus(&provider.fragment_root, &focus));
+    try std.testing.expectEqual(@as(usize, 1), PaletteRowProvider.fromFragment(focus.?).index);
+    _ = PaletteRowProvider.FragmentRelease(focus.?);
+
+    // Each row reads its own help text; the selected one has the focus.
+    for (0..3) |index| {
+        const row = provider.createRow(index).?;
+        defer _ = PaletteRowProvider.Release(&row.base);
+        var help: [32]u8 = undefined;
+        try expectBstrProperty(&row.base, constants.UIA_HelpTextPropertyId, try std.fmt.bufPrint(&help, "help for row {d}", .{index}));
+        for ([_]i32{ constants.UIA_HasKeyboardFocusPropertyId, constants.UIA_IsKeyboardFocusablePropertyId }, [_]bool{ index == 1, true }) |property, expected| {
+            value = com.VARIANT.empty();
+            try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetPropertyValue(&row.base, property, &value));
+            try std.testing.expectEqual(if (expected) com.VARIANT_TRUE else com.VARIANT_FALSE, value.value.bool_val);
+        }
+    }
+
+    // SetFocus on a row selects it and focuses the list.
+    const first = provider.createRow(0).?;
+    defer _ = PaletteRowProvider.Release(&first.base);
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.SetFocus(&first.fragment));
+    try std.testing.expectEqual(@as(?usize, 0), state_data.selected_by_provider);
+    try std.testing.expect(hwndHasKeyboardFocus(list));
+    // A list window already gone (torn down while a client still holds the
+    // row) takes no focus, and the row says so rather than reporting success.
+    _ = settings_provider_windows.DestroyWindow(list);
+    list_alive = false;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.SetFocus(&first.fragment));
+
+    // A list without the focus has none to give.
+    callbacks.focused_now = false;
+    focus = null;
+    try std.testing.expectEqual(com.S_OK, PaletteListProvider.FragmentRootGetFocus(&provider.fragment_root, &focus));
+    try std.testing.expect(focus == null);
+}
+
 test "palette list and row providers propagate COM threading options" {
     var state_data = TestPaletteState{ .count = 1, .selected = 0 };
     var provider = try PaletteListProvider.create(
@@ -5422,6 +5679,287 @@ test "PaletteListProvider fragment navigation reaches rows and parent" {
     try std.testing.expectEqual(@as(u32, 3), PaletteListProvider.FragmentRelease(parent.?));
 }
 
+/// Assert two texts are the same without printing either: a profile's command
+/// line or a variable's value can be a secret, and a failed
+/// `expectEqualStrings` prints both strings. Every test of profile text uses
+/// this, for row text, file bytes and messages alike.
+fn expectSameText(expected: []const u8, actual: []const u8) !void {
+    try std.testing.expect(std.mem.eql(u8, expected, actual));
+}
+
+test "Palette row exposes a read-only Value only for a row that has one" {
+    const Values = struct {
+        fn value(_: *anyopaque, index: usize, buf: []u8) ?[]const u8 {
+            if (index != 0) return null;
+            return std.fmt.bufPrint(buf, "shown text", .{}) catch null;
+        }
+    };
+    var state_data = TestPaletteState{ .count = 2 };
+    var state = state_data.state();
+    state.row_value = &Values.value;
+    var provider = try PaletteListProvider.create(std.testing.allocator, @ptrFromInt(0x1), state);
+    defer _ = PaletteListProvider.Release(&provider.base);
+    const with = provider.createRow(0).?;
+    defer _ = PaletteRowProvider.Release(&with.base);
+    const without = provider.createRow(1).?;
+    defer _ = PaletteRowProvider.Release(&without.base);
+
+    var pattern: ?*com.IUnknown = null;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetPatternProvider(&with.base, constants.UIA_ValuePatternId, &pattern));
+    try std.testing.expect(pattern != null);
+    try std.testing.expectEqual(@as(u32, 1), PaletteRowProvider.ValueRelease(@ptrCast(@alignCast(pattern.?))));
+    var none: ?*com.IUnknown = null;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetPatternProvider(&without.base, constants.UIA_ValuePatternId, &none));
+    try std.testing.expect(none == null);
+
+    var bstr: com.BSTR = null;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetValue(&with.value_item, &bstr));
+    defer com.SysFreeString(bstr);
+    var text_buf: [32]u8 = undefined;
+    const text = text_buf[0..try std.unicode.utf16LeToUtf8(&text_buf, bstr.?[0..com.SysStringLen(bstr)])];
+    try expectSameText("shown text", text);
+    var read_only: com.BOOL = 0;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetIsReadOnly(&with.value_item, &read_only));
+    try std.testing.expectEqual(@as(com.BOOL, 1), read_only);
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTENABLED, PaletteRowProvider.SetValue(&with.value_item, std.unicode.utf8ToUtf16LeStringLiteral("x")));
+    var empty: com.BSTR = null;
+    try std.testing.expectEqual(com.UIA_E_INVALIDOPERATION, PaletteRowProvider.GetValue(&without.value_item, &empty));
+    // A row with no Value gives no IValueProvider either.
+    var value_iface: ?*anyopaque = null;
+    try std.testing.expectEqual(com.E_NOINTERFACE, PaletteRowProvider.QueryInterface(&without.base, &com.IID_IValueProvider, &value_iface));
+    try std.testing.expect(value_iface == null);
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.QueryInterface(&with.base, &com.IID_IValueProvider, &value_iface));
+    try std.testing.expectEqual(@as(u32, 1), PaletteRowProvider.ValueRelease(@ptrCast(@alignCast(value_iface.?))));
+    // The Name stays the row's own.
+    var name = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetPropertyValue(&with.base, constants.UIA_NamePropertyId, &name));
+    defer _ = com.VariantClear(&name);
+    try std.testing.expectEqual(@as(u16, com.VT_BSTR), name.vt);
+}
+
+test "Palette row reports a Value it has no memory for as E_OUTOFMEMORY, never as an empty one" {
+    const Values = struct {
+        fn value(_: *anyopaque, _: usize, buf: []u8) ?[]const u8 {
+            return std.fmt.bufPrint(buf, "shown text", .{}) catch null;
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var state_data = TestPaletteState{ .count = 1 };
+    var state = state_data.state();
+    state.row_value = &Values.value;
+    var provider = try PaletteListProvider.create(failing.allocator(), @ptrFromInt(0x1), state);
+    defer _ = PaletteListProvider.Release(&provider.base);
+    const row = provider.createRow(0).?;
+    defer _ = PaletteRowProvider.Release(&row.base);
+    // The next allocation, the Value's text in UTF-16, fails.
+    failing.fail_index = failing.alloc_index;
+    var bstr: com.BSTR = null;
+    try std.testing.expectEqual(com.E_OUTOFMEMORY, PaletteRowProvider.GetValue(&row.value_item, &bstr));
+    try std.testing.expect(bstr == null);
+    failing.fail_index = failing.alloc_index;
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.E_OUTOFMEMORY, PaletteRowProvider.GetPropertyValue(&row.base, constants.UIA_ValueValuePropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+    failing.fail_index = std.math.maxInt(usize);
+}
+
+test "Palette row a client holds after its list detached never calls back into the owner, and every query is not available" {
+    // An owner whose every callback counts the calls made once it is gone.
+    const Owner = struct {
+        gone: bool = false,
+        calls_after_gone: u32 = 0,
+        fn of(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn touch(ctx: *anyopaque) void {
+            const self = of(ctx);
+            if (self.gone) self.calls_after_gone += 1;
+        }
+        fn name(ctx: *anyopaque, buf: []u8) []const u8 {
+            touch(ctx);
+            return std.fmt.bufPrint(buf, "list", .{}) catch "";
+        }
+        fn focused(ctx: *anyopaque) bool {
+            touch(ctx);
+            return true;
+        }
+        fn rowCount(ctx: *anyopaque) usize {
+            touch(ctx);
+            return 2;
+        }
+        fn selectedIndex(ctx: *anyopaque) ?usize {
+            touch(ctx);
+            return 0;
+        }
+        fn rowName(ctx: *anyopaque, index: usize, buf: []u8) []const u8 {
+            touch(ctx);
+            return std.fmt.bufPrint(buf, "row {d}", .{index}) catch "";
+        }
+        fn rowEnabled(ctx: *anyopaque, _: usize) bool {
+            touch(ctx);
+            return true;
+        }
+        fn rowId(ctx: *anyopaque, index: usize) u64 {
+            touch(ctx);
+            return 100 + index;
+        }
+        fn selectRow(ctx: *anyopaque, _: usize) void {
+            touch(ctx);
+        }
+        fn invokeRow(ctx: *anyopaque, _: usize) void {
+            touch(ctx);
+        }
+        fn rowHelp(ctx: *anyopaque, _: usize, buf: []u8) []const u8 {
+            touch(ctx);
+            return std.fmt.bufPrint(buf, "help", .{}) catch "";
+        }
+        fn rowValue(ctx: *anyopaque, index: usize, buf: []u8) ?[]const u8 {
+            touch(ctx);
+            if (index != 0) return null;
+            return std.fmt.bufPrint(buf, "shown text", .{}) catch null;
+        }
+    };
+    var owner: Owner = .{};
+    const state: PaletteListState = .{
+        .ctx = &owner,
+        .name = Owner.name,
+        .focused = Owner.focused,
+        .row_count = Owner.rowCount,
+        .selected_index = Owner.selectedIndex,
+        .row_name = Owner.rowName,
+        .row_enabled = Owner.rowEnabled,
+        .row_id = Owner.rowId,
+        .select_row = Owner.selectRow,
+        .invoke_row = Owner.invokeRow,
+        .row_help = Owner.rowHelp,
+        .row_value = Owner.rowValue,
+        .focus_selected_row = true,
+    };
+    var provider = try PaletteListProvider.create(std.testing.allocator, @ptrFromInt(0x1), state);
+    defer _ = PaletteListProvider.Release(&provider.base);
+    // Two rows a client holds: one with a Value, one without.
+    const with = provider.createRow(0).?;
+    defer _ = PaletteRowProvider.Release(&with.base);
+    const without = provider.createRow(1).?;
+    defer _ = PaletteRowProvider.Release(&without.base);
+
+    // The owner tears the list down, then goes.
+    provider.detach();
+    owner.gone = true;
+
+    // The interfaces a row answers for are its own: no call back.
+    var iface: ?*anyopaque = null;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.QueryInterface(&with.base, &com.IID_IValueProvider, &iface));
+    const value_iface: *com.IValueProvider = @ptrCast(@alignCast(iface.?));
+    defer _ = PaletteRowProvider.ValueRelease(value_iface);
+    try std.testing.expectEqual(com.E_NOINTERFACE, PaletteRowProvider.QueryInterface(&without.base, &com.IID_IValueProvider, &iface));
+    try std.testing.expectEqual(@as(u32, 0), owner.calls_after_gone);
+    // Every query is not available.
+    var bstr: com.BSTR = null;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetValue(value_iface, &bstr));
+    try std.testing.expect(bstr == null);
+    var read_only: com.BOOL = 0;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetIsReadOnly(value_iface, &read_only));
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.SetValue(value_iface, std.unicode.utf8ToUtf16LeStringLiteral("x")));
+    for ([_]i32{
+        constants.UIA_NamePropertyId,
+        constants.UIA_HelpTextPropertyId,
+        constants.UIA_ValueValuePropertyId,
+        constants.UIA_ValueIsReadOnlyPropertyId,
+        constants.UIA_HasKeyboardFocusPropertyId,
+        constants.UIA_SelectionItemIsSelectedPropertyId,
+        constants.UIA_IsEnabledPropertyId,
+    }) |property| {
+        var value = com.VARIANT.empty();
+        try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetPropertyValue(&with.base, property, &value));
+        try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+    }
+    var pattern: ?*com.IUnknown = null;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetPatternProvider(&with.base, constants.UIA_ValuePatternId, &pattern));
+    try std.testing.expect(pattern == null);
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.Select(&with.selection_item));
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.Invoke(&with.invoke_item));
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.SetFocus(&with.fragment));
+    var next: ?*com.IRawElementProviderFragment = null;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.Navigate(&with.fragment, com.NavigateDirection_NextSibling, &next));
+    // The list itself, held as well.
+    var list_value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteListProvider.GetPropertyValue(&provider.base, constants.UIA_NamePropertyId, &list_value));
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteListProvider.FragmentNavigate(&provider.fragment, com.NavigateDirection_FirstChild, &next));
+    try std.testing.expect(next == null);
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteListProvider.FragmentRootGetFocus(&provider.fragment_root, &next));
+    provider.raiseFocusOnSelectedRow();
+    provider.raiseSelectionChanged(0);
+
+    // Not one call reached the owner after it went.
+    try std.testing.expectEqual(@as(u32, 0), owner.calls_after_gone);
+}
+
+test "Palette row a client holds finds its Value by id after the list moved, is not available once removed, and never calls back with a stale index" {
+    const Owner = struct {
+        rows: TestPaletteState,
+        stale_calls: u32 = 0,
+        fn value(ctx: *anyopaque, index: usize, buf: []u8) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (index >= self.rows.count) {
+                self.stale_calls += 1;
+                return null;
+            }
+            return std.fmt.bufPrint(buf, "value {d}", .{self.rows.id_base + index}) catch null;
+        }
+        fn rowCount(ctx: *anyopaque) usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.rows.count;
+        }
+        fn rowId(ctx: *anyopaque, index: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.rows.id_base + index;
+        }
+    };
+    var owner: Owner = .{ .rows = .{ .count = 3, .id_base = 100 } };
+    var state = owner.rows.state();
+    state.ctx = &owner;
+    state.row_count = Owner.rowCount;
+    state.row_id = Owner.rowId;
+    state.selected_index = null;
+    state.row_value = Owner.value;
+    // The rest read `ctx` as a TestPaletteState: none is asked here.
+    state.row_enabled = null;
+    state.select_row = null;
+    state.invoke_row = null;
+    state.geometry = null;
+    state.row_bounds = null;
+    var provider = try PaletteListProvider.create(std.testing.allocator, @ptrFromInt(0x1), state);
+    defer _ = PaletteListProvider.Release(&provider.base);
+    // The row at index 2, id 102, held by a client.
+    const row = provider.createRow(2).?;
+    defer _ = PaletteRowProvider.Release(&row.base);
+    var bstr: com.BSTR = null;
+
+    // The list moved: id 102 is at index 1 now. Its Value is its own.
+    owner.rows.id_base = 101;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetValue(&row.value_item, &bstr));
+    var text_buf: [32]u8 = undefined;
+    const text = text_buf[0..try std.unicode.utf16LeToUtf8(&text_buf, bstr.?[0..com.SysStringLen(bstr)])];
+    com.SysFreeString(bstr);
+    bstr = null;
+    try expectSameText("value 102", text);
+
+    // The list shrank and the item is gone: the old index is past the end.
+    owner.rows = .{ .count = 1, .id_base = 100 };
+    var iface: ?*anyopaque = null;
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.QueryInterface(&row.base, &com.IID_IValueProvider, &iface));
+    const value_iface: *com.IValueProvider = @ptrCast(@alignCast(iface.?));
+    defer _ = PaletteRowProvider.ValueRelease(value_iface);
+    try std.testing.expectEqual(@as(u32, 0), owner.stale_calls);
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetValue(value_iface, &bstr));
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetPropertyValue(&row.base, constants.UIA_ValueValuePropertyId, &value));
+    var pattern: ?*com.IUnknown = null;
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetPatternProvider(&row.base, constants.UIA_ValuePatternId, &pattern));
+    try std.testing.expectEqual(@as(u32, 0), owner.stale_calls);
+}
+
 test "Palette row retains its parent and balances QueryInterface refs" {
     var state_data = TestPaletteState{ .count = 1 };
     var provider = try PaletteListProvider.create(std.testing.allocator, @ptrFromInt(0x1), state_data.state());
@@ -5515,6 +6053,33 @@ test "Palette row late query rejects a different item at the same filtered index
         com.UIA_E_ELEMENTNOTAVAILABLE,
         PaletteRowProvider.GetPropertyValue(&row.base, constants.UIA_NamePropertyId, &value),
     );
+}
+
+test "Palette row a client holds follows its item when the list reorders" {
+    var state_data = TestPaletteState{ .count = 3, .id_base = 100 };
+    var provider = try PaletteListProvider.create(std.testing.allocator, @ptrFromInt(0x1), state_data.state());
+    defer _ = PaletteListProvider.Release(&provider.base);
+    // The item of id 102, third.
+    const row = provider.createRow(2).?;
+    defer _ = PaletteRowProvider.Release(&row.base);
+
+    // An item sorted in before it: id 102 is fourth now, and the held row is
+    // that item there, named and selected as it.
+    state_data.count = 4;
+    state_data.id_base = 99;
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.GetPropertyValue(&row.base, constants.UIA_NamePropertyId, &value));
+    defer _ = com.VariantClear(&value);
+    const bstr = value.value.bstr.?;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("row 3", buf[0..try std.unicode.utf16LeToUtf8(&buf, bstr[0..com.SysStringLen(bstr)])]);
+    try std.testing.expectEqual(com.S_OK, PaletteRowProvider.Select(&row.selection_item));
+    try std.testing.expectEqual(@as(?usize, 3), state_data.selected_by_provider);
+
+    // Gone from the list: not available, at any index.
+    state_data.id_base = 200;
+    var gone = com.VARIANT.empty();
+    try std.testing.expectEqual(com.UIA_E_ELEMENTNOTAVAILABLE, PaletteRowProvider.GetPropertyValue(&row.base, constants.UIA_NamePropertyId, &gone));
 }
 
 test "Palette row selection callback may reenter provider" {
@@ -7910,24 +8475,7 @@ test "SettingsControlProvider exposes ValueProvider for edits and combos" {
 }
 
 test "SettingsControlProvider layout pane stays out of the control and content views" {
-    const win32 = struct {
-        extern "user32" fn CreateWindowExW(
-            dwExStyle: u32,
-            lpClassName: [*:0]const u16,
-            lpWindowName: [*:0]const u16,
-            dwStyle: u32,
-            x: i32,
-            y: i32,
-            nWidth: i32,
-            nHeight: i32,
-            hWndParent: ?com.HWND,
-            hMenu: ?*anyopaque,
-            hInstance: ?*anyopaque,
-            lpParam: ?*anyopaque,
-        ) callconv(.winapi) ?com.HWND;
-        extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
-        extern "user32" fn SetFocus(hWnd: com.HWND) callconv(.winapi) ?com.HWND;
-    };
+    const win32 = @import("../win32/sys.zig");
     const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
     const hwnd = win32.CreateWindowExW(
         0,
@@ -8861,24 +9409,11 @@ test "SettingsSectionProvider retains its selection container without a cycle" {
 }
 
 const settings_provider_windows = struct {
-    extern "user32" fn CreateWindowExW(
-        dwExStyle: u32,
-        lpClassName: [*:0]const u16,
-        lpWindowName: [*:0]const u16,
-        dwStyle: u32,
-        x: i32,
-        y: i32,
-        nWidth: i32,
-        nHeight: i32,
-        hWndParent: ?com.HWND,
-        hMenu: ?*anyopaque,
-        hInstance: ?*anyopaque,
-        lpParam: ?*anyopaque,
-    ) callconv(.winapi) ?com.HWND;
-    extern "user32" fn DestroyWindow(hWnd: com.HWND) callconv(.winapi) com.BOOL;
+    const sys = @import("../win32/sys.zig");
+    const DestroyWindow = sys.DestroyWindow;
 
     fn create(comptime class: []const u8) !com.HWND {
-        return CreateWindowExW(
+        return sys.CreateWindowExW(
             0,
             std.unicode.utf8ToUtf16LeStringLiteral(class),
             std.unicode.utf8ToUtf16LeStringLiteral(""),
@@ -8970,6 +9505,34 @@ test "SettingsControlProvider reports a field whose value Settings will not acce
     try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
 }
 
+test "SettingsControlProvider says a field differs from its default as ItemStatus" {
+    const hwnd = try settings_provider_windows.create("EDIT");
+    defer _ = settings_provider_windows.DestroyWindow(hwnd);
+    const edit = try SettingsControlProvider.create(std.testing.allocator, hwnd, .edit, "Font size");
+    defer _ = SettingsControlProvider.Release(&edit.base);
+
+    events.testing_property_changes = 0;
+    try expectBstrProperty(&edit.base, constants.UIA_ItemStatusPropertyId, "");
+    edit.setChangedFromDefault(true);
+    // A change is announced once; the same state again is not.
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    edit.setChangedFromDefault(true);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    try expectBstrProperty(&edit.base, constants.UIA_ItemStatusPropertyId, SettingsControlProvider.changed_from_default_status);
+    // The name a harness and voice control find the field by does not change.
+    try expectBstrProperty(&edit.base, constants.UIA_NamePropertyId, "Font size");
+    edit.setChangedFromDefault(false);
+    try std.testing.expectEqual(@as(usize, 2), events.testing_property_changes);
+    try expectBstrProperty(&edit.base, constants.UIA_ItemStatusPropertyId, "");
+
+    // A button is not a field and has no status.
+    const button = try SettingsControlProvider.create(std.testing.allocator, hwnd, .button, "Reset Font size");
+    defer _ = SettingsControlProvider.Release(&button.base);
+    var value = com.VARIANT.empty();
+    try std.testing.expectEqual(com.S_OK, SettingsControlProvider.GetPropertyValue(&button.base, constants.UIA_ItemStatusPropertyId, &value));
+    try std.testing.expectEqual(@as(u16, com.VT_EMPTY), value.vt);
+}
+
 test "SettingsSectionProvider reports what its section holds as ItemStatus" {
     const hwnd = try settings_provider_windows.create("BUTTON");
     defer _ = settings_provider_windows.DestroyWindow(hwnd);
@@ -8998,6 +9561,38 @@ test "SettingsSectionProvider reports what its section holds as ItemStatus" {
     try expectBstrProperty(&section.base, constants.UIA_NamePropertyId, "Appearance");
     section.setMarker(.none);
     try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "");
+}
+
+test "SettingsSectionProvider says how many settings a search found on its page" {
+    const hwnd = try settings_provider_windows.create("BUTTON");
+    defer _ = settings_provider_windows.DestroyWindow(hwnd);
+    const group = try SettingsSectionGroupProvider.create(std.testing.allocator, hwnd);
+    const section = try SettingsSectionProvider.create(std.testing.allocator, hwnd, "Privacy", 0, group);
+    group.setSection(0, section);
+    defer {
+        group.detach();
+        section.detach();
+        _ = SettingsSectionProvider.Release(&section.base);
+        _ = SettingsSectionGroupProvider.Release(&group.base);
+    }
+
+    events.testing_property_changes = 0;
+    section.setSearchCount(3);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    // The same count again is not announced.
+    section.setSearchCount(3);
+    try std.testing.expectEqual(@as(usize, 1), events.testing_property_changes);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "3 settings found");
+    section.setSearchCount(1);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "1 setting found");
+    section.setSearchCount(0);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "no settings found");
+    // After what the section holds.
+    section.setMarker(.invalid);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "Has an invalid value, no settings found");
+    // No search: the section's own status alone.
+    section.setSearchCount(null);
+    try expectBstrProperty(&section.base, constants.UIA_ItemStatusPropertyId, "Has an invalid value");
 }
 
 fn testTerminalState(data: *TestTerminalStateData) TerminalState {

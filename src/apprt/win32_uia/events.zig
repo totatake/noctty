@@ -130,10 +130,8 @@ pub fn raiseNotification(
     );
 }
 
-/// Under test, how many bell announcements were asked for on this thread
-/// (counted, not raised).
-pub threadlocal var testing_bells: usize = 0;
-
+/// Under test, how many input-mode announcements were asked for on this
+/// thread (counted, not raised).
 pub threadlocal var testing_input_modes: usize = 0;
 
 /// Input modes have their own MostRecent activity, apart from output,
@@ -150,6 +148,10 @@ pub fn raiseInputModeNotification(provider: *com.IRawElementProviderSimple, mess
         message,
     );
 }
+
+/// Under test, how many bell announcements were asked for on this thread
+/// (counted, not raised).
+pub threadlocal var testing_bells: usize = 0;
 
 /// The terminal's bell rang. Its own activity id lets a screen reader treat it
 /// apart from terminal text and palette messages; MostRecent keeps a burst of

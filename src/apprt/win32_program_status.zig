@@ -29,6 +29,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const terminal = @import("../terminal/main.zig");
 const progress_report = @import("../progress_report.zig");
+const rgb = @import("win32_theme.zig").rgb;
 
 const osc = terminal.osc;
 const program_status = osc.program_status;
@@ -196,8 +197,8 @@ pub const Records = struct {
         var id = record.id;
         while (id.len > 0) {
             id = parentId(id);
-            const i = self.find(id) orelse continue;
-            switch (self.list.items[i].state) {
+            const parent = self.get(id) orelse continue;
+            switch (parent.state) {
                 .working, .blocked => return true,
                 .idle, .done, .@"error", .clear => {},
             }
@@ -243,8 +244,7 @@ pub const Records = struct {
     }
 
     pub fn root(self: *const Records) ?*const Record {
-        const i = self.find("") orelse return null;
-        return &self.list.items[i];
+        return self.get("");
     }
 
     /// The record that decides what this terminal shows: the most urgent
@@ -282,8 +282,8 @@ pub const Records = struct {
         var id = record.id;
         while (id.len > 0) {
             id = parentId(id);
-            const i = self.find(id) orelse continue;
-            if (self.list.items[i].app) |value| return value;
+            const ancestor = self.get(id) orelse continue;
+            if (ancestor.app) |value| return value;
         }
         return null;
     }
@@ -293,6 +293,11 @@ pub const Records = struct {
             if (std.mem.eql(u8, record.id, id)) return i;
         }
         return null;
+    }
+
+    fn get(self: *const Records, id: []const u8) ?*const Record {
+        const i = self.find(id) orelse return null;
+        return &self.list.items[i];
     }
 
     fn clear(self: *Records, alloc: Allocator, id: []const u8) void {
@@ -399,13 +404,9 @@ pub fn badgeColor(indicator: Indicator, is_dark: bool, accent: u32, error_color:
     return switch (indicator) {
         .none, .working => accent,
         .failed => error_color,
-        .blocked => if (is_dark) colorref(0xFC, 0xE1, 0x00) else colorref(0x9D, 0x5D, 0x00),
-        .done => if (is_dark) colorref(0x6C, 0xCB, 0x5F) else colorref(0x0F, 0x7B, 0x0F),
+        .blocked => if (is_dark) rgb(0xFC, 0xE1, 0x00) else rgb(0x9D, 0x5D, 0x00),
+        .done => if (is_dark) rgb(0x6C, 0xCB, 0x5F) else rgb(0x0F, 0x7B, 0x0F),
     };
-}
-
-fn colorref(r: u8, g: u8, b: u8) u32 {
-    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16);
 }
 
 /// Where "go to the tab that needs attention" goes: the most urgent of
@@ -465,10 +466,14 @@ pub const max_shown_text_bytes = 240;
 
 /// Write `text` for display outside the terminal grid: without bidi
 /// controls and invisible formatting characters, so a program can't
-/// reorder or hide what the notification says, and with line and
-/// paragraph separators as spaces. Cuts at `max_bytes` on a codepoint
-/// boundary and marks the cut with an ellipsis. Text that isn't valid
-/// UTF-8 is skipped byte by byte; the parser only lets valid UTF-8 through.
+/// reorder or hide what the notification says, and with control
+/// characters, U+FFFE and U+FFFF, and line and paragraph separators as
+/// spaces (XML 1.0 cannot carry controls or those two noncharacters even
+/// escaped; a tab title can hold controls, and both a tab title and
+/// program status text can hold U+FFFE and U+FFFF, which the OSC 7501
+/// parser lets through). Cuts at `max_bytes` on a codepoint boundary and
+/// marks the cut with an ellipsis. Text that isn't valid UTF-8 is skipped
+/// byte by byte; the parser only lets valid UTF-8 through.
 pub fn writeSanitized(
     writer: *std.Io.Writer,
     text: []const u8,
@@ -490,7 +495,8 @@ pub fn writeSanitized(
         const bytes = text[i..][0..len];
         i += len;
         if (isHidden(cp)) continue;
-        const out: []const u8 = if (cp == 0x2028 or cp == 0x2029) " " else bytes;
+        const control = cp < 0x20 or (cp >= 0x7F and cp <= 0x9F) or cp == 0xFFFE or cp == 0xFFFF;
+        const out: []const u8 = if (control or cp == 0x2028 or cp == 0x2029) " " else bytes;
         if (written + out.len > max_bytes) {
             try writer.writeAll(ellipsis);
             return;
@@ -642,11 +648,6 @@ fn testApply(records: *Records, body: []const u8) !bool {
     return try records.apply(testing.allocator, cmd.program_status.report) != null;
 }
 
-fn testFind(records: *const Records, id: []const u8) ?*const Record {
-    const i = records.find(id) orelse return null;
-    return &records.list.items[i];
-}
-
 test "a report replaces its record completely" {
     var records: Records = .{};
     defer records.deinit(testing.allocator);
@@ -670,11 +671,11 @@ test "root and child records coexist and children inherit app" {
     _ = try testApply(&records, "state=working:id=deploy/us-east");
     _ = try testApply(&records, "state=working:id=deploy:app=tf");
     try testing.expectEqual(@as(usize, 3), records.list.items.len);
-    const child = testFind(&records, "deploy/us-east").?;
+    const child = records.get("deploy/us-east").?;
     try testing.expectEqualStrings("tf", records.app(child).?);
     _ = try testApply(&records, "state=clear:id=deploy");
     _ = try testApply(&records, "state=working:id=other/x");
-    try testing.expectEqualStrings("terraform", records.app(testFind(&records, "other/x").?).?);
+    try testing.expectEqualStrings("terraform", records.app(records.get("other/x").?).?);
 }
 
 test "clear is hierarchical and without an id clears everything" {
@@ -686,9 +687,9 @@ test "clear is hierarchical and without an id clears everything" {
     _ = try testApply(&records, "state=working:id=build/test");
     _ = try testApply(&records, "state=working:id=builder");
     _ = try testApply(&records, "state=clear:id=build");
-    try testing.expect(testFind(&records, "build") == null);
-    try testing.expect(testFind(&records, "build/test") == null);
-    try testing.expect(testFind(&records, "builder") != null);
+    try testing.expect(records.get("build") == null);
+    try testing.expect(records.get("build/test") == null);
+    try testing.expect(records.get("builder") != null);
     try testing.expect(records.root() != null);
 
     _ = try testApply(&records, "state=clear");
@@ -708,8 +709,8 @@ test "a new prompt or exit drops working, blocked and idle but keeps done and er
     _ = try testApply(&records, "state=error:id=e");
     try testing.expect(records.programEnded(testing.allocator));
     try testing.expectEqual(@as(usize, 2), records.list.items.len);
-    try testing.expect(testFind(&records, "d") != null);
-    try testing.expect(testFind(&records, "e") != null);
+    try testing.expect(records.get("d") != null);
+    try testing.expect(records.get("e") != null);
     try testing.expect(!records.programEnded(testing.allocator));
 
     // Seen, they go idle and show nothing; the next prompt ends them.
@@ -727,7 +728,7 @@ test "an acknowledged record still names the records beneath it" {
     _ = try testApply(&records, "state=done:app=claude");
     _ = try testApply(&records, "state=blocked:id=tool");
     try testing.expect(records.acknowledge());
-    try testing.expectEqualStrings("claude", records.app(testFind(&records, "tool").?).?);
+    try testing.expectEqualStrings("claude", records.app(records.get("tool").?).?);
     // The same done again, after the user saw the first, is news.
     try testing.expect(try testApply(&records, "state=done:app=claude"));
 }
@@ -778,9 +779,9 @@ test "the least recently updated record makes room at the cap" {
     _ = try testApply(&records, "state=working:id=r0");
     _ = try testApply(&records, "state=working:id=new");
     try testing.expectEqual(@as(usize, max_records), records.list.items.len);
-    try testing.expect(testFind(&records, "r0") != null);
-    try testing.expect(testFind(&records, "r1") == null);
-    try testing.expect(testFind(&records, "new") != null);
+    try testing.expect(records.get("r0") != null);
+    try testing.expect(records.get("r1") == null);
+    try testing.expect(records.get("new") != null);
 }
 
 test "news is a record newly blocked, done or failed" {
@@ -947,6 +948,16 @@ test "sanitized text drops bidi controls and invisible characters" {
     w = .fixed(&buf);
     try writeSanitized(&w, "abc", 3);
     try testing.expectEqualStrings("abc", w.buffered());
+
+    // C0, DEL and C1 controls, which a tab title can hold.
+    w = .fixed(&buf);
+    try writeSanitized(&w, "a\tb\x07c\x7Fd\u{9B}e", 100);
+    try testing.expectEqualStrings("a b c d e", w.buffered());
+
+    // The two noncharacters XML 1.0 forbids; U+FFFD and U+FFFC are text.
+    w = .fixed(&buf);
+    try writeSanitized(&w, "a\u{FFFE}b\u{FFFF}c\u{FFFD}\u{FFFC}", 100);
+    try testing.expectEqualStrings("a b c\u{FFFD}\u{FFFC}", w.buffered());
 }
 
 test "status lines name the record and say what it needs" {

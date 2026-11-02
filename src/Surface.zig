@@ -32,9 +32,6 @@ const Command = @import("Command.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
 const configUrl = @import("config/url.zig");
-// The link opener's local-only lookup, used for the existence check of a link
-// so that a link into a share is never stat-ed (Windows only, see `existingPath`).
-const local_target = @import("apprt/win32/local_target.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
@@ -337,11 +334,10 @@ test "Surface: ending a search does not wait for room in a full app mailbox" {
     defer alloc.destroy(app);
     @memset(std.mem.asBytes(app), 0);
     app.mailbox = .{};
-    // No windows and no UI thread: waking the app does nothing.
+    // No UI thread: waking the app returns without reading other fields.
     const rt_app = try alloc.create(apprt.runtime.App);
     defer alloc.destroy(rt_app);
     @memset(std.mem.asBytes(rt_app), 0);
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
 
     const surface = try alloc.create(Surface);
@@ -409,8 +405,10 @@ test "Surface: ending a search does not wait for room in a full app mailbox" {
 
 /// Mouse state for the surface.
 const Mouse = struct {
-    /// The last tracked mouse button state by button.
-    click_state: [input.MouseButton.max]input.MouseButtonState = @splat(.release),
+    /// The last tracked mouse button state by button, indexed by the
+    /// button's enum value. `max` is the largest value, not a count, so
+    /// the array needs one more slot than that to hold every button.
+    click_state: [input.MouseButton.max + 1]input.MouseButtonState = @splat(.release),
 
     /// The last mods state when the last mouse button (whatever it was) was
     /// pressed or release.
@@ -699,6 +697,7 @@ const DerivedConfig = struct {
     title: ?[:0]const u8,
     title_report: bool,
     links: []DerivedConfig.Link,
+    link_osc8: bool,
     link_previews: configpkg.LinkPreviews,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
     progress_style: bool,
@@ -762,9 +761,12 @@ const DerivedConfig = struct {
             .window_padding_balance = config.@"window-padding-balance",
             .window_height = config.@"window-height",
             .window_width = config.@"window-width",
-            .title = config.title,
+            // Copied: `config` is not owned past this call. It is a
+            // conditional-state clone, or a reload config the caller frees.
+            .title = if (config.title) |title| try alloc.dupeZ(u8, title) else null,
             .title_report = config.@"title-report",
             .links = links,
+            .link_osc8 = config.@"link-osc8",
             .link_previews = config.@"link-previews",
             .scroll_to_bottom = config.@"scroll-to-bottom",
             .progress_style = config.@"progress-style",
@@ -843,6 +845,31 @@ const DerivedConfig = struct {
         );
     }
 
+    test "DerivedConfig owns its title" {
+        const testing = std.testing;
+
+        // The config a DerivedConfig is built from dies first: the
+        // conditional-state clone at the end of Surface.init and
+        // updateConfig, or the reload config App.updateConfig's caller
+        // frees. So the derived title must not borrow the source's bytes.
+        var source = try configpkg.Config.default(testing.allocator);
+        var source_alive = true;
+        defer if (source_alive) source.deinit();
+        const title = try source._arena.?.allocator().dupeZ(u8, "pinned title");
+        source.title = title;
+
+        var derived = try DerivedConfig.init(testing.allocator, &source);
+        defer derived.deinit();
+
+        // Stands in for the freed source's memory being reused.
+        @memset(title, 'x');
+        try testing.expectEqualStrings("pinned title", derived.title.?);
+
+        source.deinit();
+        source_alive = false;
+        try testing.expectEqualStrings("pinned title", derived.title.?);
+    }
+
     fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
         const padding_top: u32 = padding_top: {
             const padding_top: f32 = @floatFromInt(self.window_padding_top);
@@ -912,11 +939,8 @@ pub fn init(
     // Initialize our renderer with our initialized surface.
     try Renderer.surfaceInit(rt_surface);
     if (comptime @hasDecl(apprt.Surface, "noteBenchmarkMemoryStage")) {
-        if (comptime build_config.d3d11) {
-            if (rt_surface.renderer_gl_prepared) rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        } else {
+        if (!build_config.d3d11 or rt_surface.renderer_gl_prepared)
             rt_surface.noteBenchmarkMemoryStage(.opengl_functions_loaded, null);
-        }
     }
 
     // Determine our DPI configurations so we can properly configure
@@ -976,14 +1000,21 @@ pub fn init(
 
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
-    var renderer_impl = try Renderer.init(alloc, .{
-        .config = try .init(alloc, config),
-        .font_grid = font_grid,
-        .size = size,
-        .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-        .rt_surface = rt_surface,
-        .thread = &self.renderer_thread,
-    });
+    var renderer_impl = renderer: {
+        // Renderer.init takes ownership of the config only on success, after
+        // which the errdefer below frees it, so this errdefer must end here.
+        var renderer_config = try Renderer.DerivedConfig.init(alloc, config);
+        errdefer renderer_config.deinit();
+
+        break :renderer try Renderer.init(alloc, .{
+            .config = renderer_config,
+            .font_grid = font_grid,
+            .size = size,
+            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .rt_surface = rt_surface,
+            .thread = &self.renderer_thread,
+        });
+    };
     // The renderer's GL objects belong to this surface's context, which a
     // later step (`finalizeSurfaceInit`, the renderer thread) can leave
     // un-current. Rebind it before deleting them, and abandon them if that
@@ -1095,6 +1126,12 @@ pub fn init(
         // Initialize our IO backend
         const exec_config: termio.Exec.Config = .{
             .command = command,
+            // A user profile's command line, which Exec runs as written when
+            // `command` still is its split (never for an `initial-command`).
+            .command_line = if (builtin.os.tag == .windows)
+                rt_surface.launchCommandLine()
+            else
+                null,
             .env = env,
             .env_override = config.env,
             .shell_integration = config.@"shell-integration",
@@ -1135,14 +1172,18 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        // Termio.init takes ownership of the config only on success.
+        var io_config = try termio.Termio.DerivedConfig.init(
+            alloc,
+            config,
+            app.config_conditional_state,
+        );
+        errdefer io_config.deinit();
+
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(
-                alloc,
-                config,
-                app.config_conditional_state,
-            ),
+            .config = io_config,
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
@@ -1416,6 +1457,16 @@ test "queueIo frees allocated writes in readonly mode" {
     } }, .unlocked);
 }
 
+test "Mouse.click_state holds every button" {
+    var mouse: Mouse = .{};
+    inline for (@typeInfo(input.MouseButton).@"enum".fields) |field| {
+        mouse.click_state[@intCast(field.value)] = .press;
+    }
+    for (mouse.click_state) |state| {
+        try std.testing.expectEqual(.press, state);
+    }
+}
+
 /// Whether a key event that wrote to the pty counts as typing for the
 /// viewport, which scrolls to the bottom and drops the selection. A press or
 /// repeat of a key other than a modifier does. A release does not, even when
@@ -1593,6 +1644,19 @@ pub fn deactivateInspector(self: *Surface) void {
 /// True if the surface requires confirmation to quit. This should be called
 /// by apprt to determine if the surface should confirm before quitting.
 pub fn needsConfirmQuit(self: *Surface) bool {
+    return self.confirmQuitAnswer(true).?;
+}
+
+/// `needsConfirmQuit` for a caller that must not wait for the renderer
+/// mutex: null when another holder has it. The holder can be the calling
+/// thread itself, below a sent message (the copy path holds it across
+/// `EmptyClipboard`, which dispatches incoming sent messages), and the mutex
+/// is not recursive. Treat null as needing confirmation.
+pub fn needsConfirmQuitNoWait(self: *Surface) ?bool {
+    return self.confirmQuitAnswer(false);
+}
+
+fn confirmQuitAnswer(self: *Surface, comptime wait: bool) ?bool {
     // If the surface is in read-only mode, always require confirmation
     if (self.readonly) return true;
 
@@ -1605,7 +1669,9 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
-            self.renderer_state.mutex.lock();
+            if (wait) {
+                self.renderer_state.mutex.lock();
+            } else if (!self.renderer_state.mutex.tryLock()) return null;
             defer self.renderer_state.mutex.unlock();
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
@@ -1724,9 +1790,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .pwd_change => |w| {
             defer w.deinit();
 
-            // We always allocate for this because we need to null-terminate.
-            const str = try self.alloc.dupeZ(u8, w.slice());
-            defer self.alloc.free(str);
+            var stack = std.heap.stackFallback(256, self.alloc);
+            const alloc = stack.get();
+            const str = try alloc.dupeZ(u8, w.slice());
+            defer alloc.free(str);
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2292,17 +2359,16 @@ fn searchCallback_(
 /// full mailbox would hang both threads. Once `stopping` is set, messages
 /// are dropped, with what they own, and a push already waiting for room
 /// gives up. Nothing is lost: ending a search clears the search state
-/// itself (`syncClearSearchState`) under a newer generation, which rejects
-/// any message from the ended search, and a closing surface has left the
-/// app.
+/// itself (`endSearch`, `syncClearSearchState`) under a newer generation,
+/// which rejects any message from the ended search, and a closing surface
+/// has left the app.
 fn pushSearchMessage(
     self: *Surface,
     stopping: *const std.atomic.Value(bool),
     msg: apprt.surface.Message,
 ) void {
-    if (!stopping.load(.acquire)) {
-        if (self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
-    }
+    if (!stopping.load(.acquire) and
+        self.surfaceMailbox().push(msg, .{ .forever_unless = stopping }) > 0) return;
     var dropped = msg;
     dropped.deinit();
 }
@@ -2973,8 +3039,9 @@ pub fn openLinkText(self: *Surface, text: []const u8) !void {
     try self.openUrl(.{ .kind = .unknown, .url = resolved_path orelse text });
 }
 
-/// The path to open for link text, when that is not the text itself: see
-/// `resolveOpenPath`. Takes the terminal's pwd for a relative path.
+/// The path to open for link text, when that is not the text itself
+/// (`internal_os.local_path.linkTarget` on Windows). Takes the terminal's pwd
+/// for a relative path.
 ///
 /// Must be called without the renderer state mutex held: it takes the mutex
 /// to copy the pwd, then checks the filesystem without it.
@@ -2987,544 +3054,106 @@ fn resolvePathForOpening(
     else
         try self.pwd(self.alloc) orelse return null;
     defer if (terminal_pwd) |p| self.alloc.free(p);
-    return resolveOpenPath(self.alloc, terminal_pwd, path);
-}
+    if (comptime builtin.os.tag == .windows) return internal_os.local_path.linkTarget(
+        self.alloc,
+        path,
+        .{ .dir = terminal_pwd, .wsl = self.launchesWsl() },
+    );
 
-/// What link text names on disk, as an owned path. Null leaves the text to
-/// the opener as written, which is right for a URL, for an absolute path with
-/// no location, and for text that names nothing (the opener refuses it).
-///
-/// A compiler's `file:12:5` or `file(12,5)` is not part of the name, but a
-/// name can end that way, so the whole text is tried first.
-///
-/// `dir` is null for an absolute path and the terminal's directory for a
-/// relative one.
-fn resolveOpenPath(
-    alloc: Allocator,
-    dir: ?[]const u8,
-    text: []const u8,
-) Allocator.Error!?[]const u8 {
-    const bare = configUrl.splitLocation(text);
-    if (dir == null) {
-        // The opener checks an absolute path itself; only a location needs us.
-        const stripped = bare orelse return null;
-        if (try existingPath(alloc, null, text)) |whole| {
-            alloc.free(whole);
-            return null;
-        }
-        return existingPath(alloc, null, stripped);
-    }
-    if (try existingPath(alloc, dir, text)) |whole| return whole;
-    return existingPath(alloc, dir, bare orelse return null);
-}
-
-/// `path` as an absolute path, if it exists. Relative to `dir` when that is
-/// set.
-fn existingPath(
-    alloc: Allocator,
-    dir: ?[]const u8,
-    path: []const u8,
-) Allocator.Error!?[]const u8 {
-    // Zig's `resolve` indexes an empty slice (a panic) when a drive-relative
-    // name such as `D:x` is joined onto a path (measured with `b:x`, `D:x`).
-    // No default pattern produces one, but a custom `link` regex can.
-    // Zig's parser takes any byte before the ':' as a drive (`1:x` panics too).
-    if (builtin.os.tag == .windows and path.len >= 2 and
-        path[1] == ':' and !std.fs.path.isAbsolute(path)) return null;
-
-    // A share or device path is never resolved either: `resolve` unwraps a null
-    // on a server whose share is a lone separator (`\\a\/`), and it is the
-    // opener's to refuse anyway.
-    if (builtin.os.tag == .windows and internal_os.path.isNetworkOrDevicePath(path)) return null;
-
-    // Always the output of `resolve`, which `windowsPathIsRepresentable`
-    // needs: it also folds `.`, `..` and mixed separators out of absolute text.
-    const resolved = if (dir) |base|
-        try std.fs.path.resolve(alloc, &.{ base, path })
-    else
-        try std.fs.path.resolve(alloc, &.{path});
-
-    // Link text is arbitrary, so resolution can produce a string Windows
-    // cannot represent as a path: "https://example.com" becomes
-    // "C:\Users\me\https:\example.com". `accessAbsolute` does not merely
-    // fail on such a path -- NT returns STATUS_OBJECT_NAME_INVALID and
-    // `std.posix.faccessatW` maps that status to `unreachable`, so the
-    // process aborts and the `catch` below cannot recover. Screen the
-    // result before handing it to the filesystem.
-    if (builtin.os.tag == .windows and !windowsPathIsRepresentable(resolved)) {
-        alloc.free(resolved);
-        return null;
-    }
-
-    // The opener's own bounded lookup answers whether it exists, not
-    // `accessAbsolute`. It refuses a path that is not on a local drive letter,
-    // a mapped network drive, and a symlink or junction that leads to a share
-    // (`C:\link\x.txt:12` into a share), all before anything touches the
-    // network; `accessAbsolute` follows such a link, and the UI thread would
-    // wait on the server first. It also answers with a status where
-    // `faccessatW` has an `unreachable`.
-    if (builtin.os.tag == .windows) {
-        const file = local_target.open(alloc, resolved, false) orelse {
-            alloc.free(resolved);
-            return null;
-        };
-        file.close();
-        return resolved;
-    }
-
+    const base = terminal_pwd orelse return null;
+    const resolved = try std.fs.path.resolve(self.alloc, &.{ base, path });
     std.fs.accessAbsolute(resolved, .{}) catch {
-        alloc.free(resolved);
+        self.alloc.free(resolved);
         return null;
     };
     return resolved;
 }
 
-/// Whether `path` is a local path Windows can address, which must be the output
-/// of `std.fs.path.resolve`.
-///
-/// Deliberately conservative. Anything this lets through that NT considers
-/// malformed does not merely fail: `std.posix.faccessatW` maps
-/// `STATUS_OBJECT_NAME_INVALID` to `unreachable`, so the process aborts and
-/// the caller cannot recover. Shapes we cannot cheaply prove safe are
-/// rejected, which only costs the link its file-path interpretation.
-fn windowsPathIsRepresentable(path: []const u8) bool {
-    // Also not for a network share or device path. The pwd can no longer be one
-    // (`reportPwd` refuses it), but `accessAbsolute` would contact the share
-    // before the opener's own refusal runs, so keep this the one gate.
-    if (internal_os.path.isNetworkOrDevicePath(path)) return false;
-
-    // `accessAbsolute` asserts that its argument is absolute, and `resolve` does
-    // not always return one: a pwd opening with `\/` comes back as
-    // `server\share\file`.
-    if (!std.fs.path.isAbsolute(path)) return false;
-
-    var rest = path;
-
-    if (rest.len >= 2 and rest[1] == ':' and std.ascii.isAlphabetic(rest[0])) {
-        rest = rest[2..];
-    }
-
-    const leaf_start = if (std.mem.lastIndexOfAny(u8, rest, "/\\")) |i| i + 1 else 0;
-    const dirs = rest[0..leaf_start];
-    const leaf = rest[leaf_start..];
-
-    // Outside the leaf a ':' names a directory Windows cannot address, which
-    // is the shape a URL takes once it is resolved against the terminal pwd.
-    if (std.mem.indexOfScalar(u8, dirs, ':') != null) return false;
-    if (!windowsNameIsAddressable(dirs)) return false;
-
-    // The leaf may carry one alternate-data-stream separator. NT accepts any
-    // character in a stream name, control characters included, but both sides
-    // of the ':' must be non-empty, and a second ':' introduces a stream
-    // *type* that NT validates against a fixed set ("$DATA" and friends).
-    // Rather than model that set we admit a single separator only.
-    const ads = std.mem.indexOfScalar(u8, leaf, ':') orelse
-        return !windowsNameIsDevice(leaf) and windowsNameIsAddressable(leaf);
-    const name = leaf[0..ads];
-    if (windowsNameIsDevice(name)) return false;
-    // `resolve` does not fold `.` or `..` when a stream follows (`C:\x\.:12`),
-    // and NT answers STATUS_OBJECT_NAME_INVALID for the name (found by a sweep
-    // of short strings; `...:x` and `a.:x` are fine).
-    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
-    const stream = leaf[ads + 1 ..];
-    if (name.len == 0 or stream.len == 0) return false;
-    if (std.mem.indexOfScalar(u8, stream, ':') != null) return false;
-    // Windows drops trailing dots and spaces from a component, so a stream made
-    // of nothing else (`b:.`, `b: `) is empty by the time NT sees it, and NT
-    // answers STATUS_OBJECT_NAME_INVALID, which `faccessatW` also turns into
-    // `unreachable`. `b:x.` and `b: x` are fine (measured: not found).
-    if (std.mem.trimRight(u8, stream, ". ").len == 0) return false;
-    // A NUL would truncate in `faccessatW`, so the existence check would run
-    // against a shorter path than the one we hand back to be opened.
-    if (std.mem.indexOfScalar(u8, stream, 0) != null) return false;
-    return windowsNameIsAddressable(name);
+/// Whether this pane runs WSL, as its launch command says
+/// (`termio.Exec.launchesWsl`).
+pub fn launchesWsl(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .exec => |*exec| exec.launchesWsl(),
+    };
 }
 
-/// Whether a final path component names a DOS device (`NUL`, `con.txt`,
-/// `COM1`, `CONOUT$`), however it is spelled: case, trailing spaces, and an
-/// extension (older Windows maps `NUL.txt` to NUL too).
-///
-/// `RtlGetFullPathName_U` turns such a final component into `\\.\nul`, Zig puts
-/// its own prefix in front of that, and NT rejects the result; `faccessatW`
-/// maps the rejection to `unreachable`. Measured with `C:\x\nul:12`, `./nul`,
-/// `nul.` and `nul ` (a process abort), while `con`, `aux`, `prn`, `com9`,
-/// `lpt1` and `nul.txt` were not mapped on Windows 11 build 26200. They are
-/// refused too: this is the one place that has to hold on every build.
-fn windowsNameIsDevice(name: []const u8) bool {
-    const stem = std.mem.trimRight(u8, name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len], " ");
-    for ([_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" }) |device| {
-        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
-    }
-    return stem.len == 4 and std.ascii.isDigit(stem[3]) and
-        (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or std.ascii.eqlIgnoreCase(stem[0..3], "LPT"));
-}
-
-/// Whether `name` uses only characters NT accepts in a file name. It may
-/// contain path separators, but no drive prefix and no stream separator.
-///
-/// `<>"|?*` are never legal, and neither are the C0 controls. DEL is legal:
-/// NT treats 0x7f like any other byte, so `std.ascii.isControl` would be too
-/// broad here.
-fn windowsNameIsAddressable(name: []const u8) bool {
-    if (std.mem.indexOfAny(u8, name, "<>\"|?*") != null) return false;
-    for (name) |c| if (c < 0x20) return false;
-    return true;
-}
-
-test "windowsPathIsRepresentable" {
-    const testing = std.testing;
-
-    // Ordinary paths resolve as before.
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\Documents"));
-    // Drive-relative input ("C:foo") resolves to a plain path.
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\foo"));
-
-    // A URL resolved against the pwd puts ':' in a directory component.
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\https:\\example.com"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\foo\\bar:baz\\qux"));
-    // Wildcards are never legal in a directory or file name.
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\a*b"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\dir*x\\leaf"));
-
-    // Network shares and device paths are refused before anything touches them,
-    // in every spelling `resolve` can leave (it rewrites `//server/share`).
-    for ([_][]const u8{
-        "\\\\server\\share\\file",
-        "//server/share/file",
-        "\\\\?\\UNC\\server\\share\\file",
-        "\\\\?\\C:\\Users\\me\\Documents",
-        "\\\\.\\pipe\\x",
-        "\\\\.\\GLOBALROOT\\Device\\Mup\\server\\share\\file",
-    }) |p| try testing.expect(!windowsPathIsRepresentable(p));
-
-    // C0 aborts in a directory or file name, wherever it appears.
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\bad\x01name\\leaf"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\leaf\x1f"));
-    // DEL is legal in a Windows name, so it must keep resolving.
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\leaf\x7f"));
-
-    // One ':' in the leaf is an alternate data stream. NT accepts anything in
-    // the stream name, so the file-name screens must not reach into it.
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\file.txt:stream"));
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\file.txt:str\x01eam"));
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\file.txt:str?eam"));
-    // A scheme with no path separator after it lands here too, and resolves
-    // safely to a missing stream rather than aborting.
-    try testing.expect(windowsPathIsRepresentable("C:\\Users\\me\\magnet:?xt=urn"));
-
-    // Both sides of the separator must be non-empty, and a second ':' names a
-    // stream type NT validates against a fixed set.
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\a:"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\:stream"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\a:b:c"));
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\magnet:?xt=urn:btih:0000"));
-    // A NUL would truncate the existence check to a shorter path.
-    try testing.expect(!windowsPathIsRepresentable("C:\\Users\\me\\file.txt:str\x00eam"));
-
-    // A stream of only dots and spaces is empty once Windows trims it, and NT
-    // rejects the name (measured: `C:\Windows\b: ` is STATUS_OBJECT_NAME_INVALID,
-    // while `b:x `, `b:x.` and `b: x` are not found).
-    for ([_][]const u8{
-        "C:\\Users\\me\\b:.",
-        "C:\\Users\\me\\b: ",
-        "C:\\Users\\me\\b:..",
-        "C:\\Users\\me\\b:. .",
-    }) |p| try testing.expect(!windowsPathIsRepresentable(p));
-    for ([_][]const u8{
-        "C:\\Users\\me\\b:x.",
-        "C:\\Users\\me\\b: x",
-        "C:\\Users\\me\\b:x ",
-    }) |p| try testing.expect(windowsPathIsRepresentable(p));
-
-    // A final component that is a DOS device name aborts the same way
-    // (measured with `nul`, `nul:12`, `nul.` and `nul `).
-    for ([_][]const u8{
-        "C:\\x\\nul",
-        "C:\\x\\NUL",
-        "C:\\x\\nul.",
-        "C:\\x\\nul ",
-        "C:\\x\\nul:12",
-        "C:\\x\\nul.txt",
-        "C:\\x\\con",
-        "C:\\x\\Aux.log",
-        "C:\\x\\prn",
-        "C:\\x\\com1",
-        "C:\\x\\LPT9.txt",
-        "C:\\x\\conin$",
-        "C:\\x\\CONOUT$",
-    }) |p| try testing.expect(!windowsPathIsRepresentable(p));
-    // A stream on `.` or `..` is rejected by NT too (found by a sweep).
-    for ([_][]const u8{
-        "C:\\x\\.:12",
-        "C:\\.:12",
-        "C:\\x\\..:a",
-    }) |p| try testing.expect(!windowsPathIsRepresentable(p));
-    for ([_][]const u8{ "C:\\x\\...:x", "C:\\x\\a.:x", "C:\\x\\.a:x" }) |p| {
-        try testing.expect(windowsPathIsRepresentable(p));
-    }
-    // Near misses and device-like directory names are ordinary.
-    for ([_][]const u8{
-        "C:\\x\\nul1",
-        "C:\\x\\nulls.txt",
-        "C:\\x\\console",
-        "C:\\x\\com",
-        "C:\\x\\com10",
-        "C:\\x\\lpt",
-        "C:\\x\\aux1.txt",
-        "C:\\x\\nul\\a.txt",
-    }) |p| try testing.expect(windowsPathIsRepresentable(p));
-}
-
-test "link text resolves to the file it names, without its line and column" {
+test "only a pane that is not WSL reads /c/x as C:\\x (#514)" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "weird(1)", .data = "" });
-    try tmp.dir.makePath("sub dir");
-    try tmp.dir.writeFile(.{ .sub_path = "sub dir/b.zig", .data = "" });
-    const dir = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir);
+    const file = try tmp.dir.realpathAlloc(alloc, "a.txt");
+    defer alloc.free(file);
+    if (!configpkg.windows_shell.isDriveAbsolutePath(file)) return error.SkipZigTest;
+    const text = try internal_os.local_path.testMsysPath(alloc, "", file);
+    defer alloc.free(text);
 
-    const Case = struct { text: []const u8, expect: ?[]const u8 };
-    const relative = [_]Case{
-        .{ .text = "a.txt", .expect = "a.txt" },
-        .{ .text = ".\\a.txt", .expect = "a.txt" },
-        .{ .text = "a.txt:12:5", .expect = "a.txt" },
-        .{ .text = "a.txt:12", .expect = "a.txt" },
-        .{ .text = "sub dir\\b.zig(3,4)", .expect = "sub dir\\b.zig" },
-        .{ .text = "sub dir/b.zig:7", .expect = "sub dir\\b.zig" },
-        // A name that ends like a location is tried whole first.
-        .{ .text = "weird(1)", .expect = "weird(1)" },
-        .{ .text = "missing.txt:1", .expect = null },
-        .{ .text = "missing(3,4)", .expect = null },
-        // A URL has no such file, and must not reach the filesystem as a path.
-        .{ .text = "https://example.com/a:1", .expect = null },
-    };
-    for (relative) |case| {
-        const got = try resolveOpenPath(alloc, dir, case.text);
-        defer if (got) |p| alloc.free(p);
-        if (case.expect) |name| {
-            const want = try std.fs.path.join(alloc, &.{ dir, name });
-            defer alloc.free(want);
-            try std.testing.expect(got != null);
-            try std.testing.expectEqualStrings(want, got.?);
-        } else {
-            std.testing.expect(got == null) catch |err| {
-                std.debug.print("text {s} resolved to {s}\n", .{ case.text, got.? });
-                return err;
-            };
-        }
-    }
+    // An absolute path never reads the pwd, so the surface needs only its
+    // allocator and its launch.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.alloc = alloc;
+    surface.io.backend = .{ .exec = undefined };
 
-    // An absolute path is left to the opener unless a location has to go.
-    for ([_][]const u8{ "a.txt", "weird(1)", "sub dir\\b.zig" }) |name| {
-        const absolute = try std.fs.path.join(alloc, &.{ dir, name });
-        defer alloc.free(absolute);
-        try std.testing.expect(try resolveOpenPath(alloc, null, absolute) == null);
-    }
-    {
-        const whole = try std.fmt.allocPrint(alloc, "{s}\\weird(1)", .{dir});
-        defer alloc.free(whole);
-        try std.testing.expect(try resolveOpenPath(alloc, null, whole) == null);
-    }
-    for ([_]struct { name: []const u8, suffix: []const u8, file: []const u8 }{
-        .{ .name = "a.txt", .suffix = ":12:5", .file = "a.txt" },
-        .{ .name = "sub dir\\b.zig", .suffix = "(3,4)", .file = "sub dir\\b.zig" },
-    }) |case| {
-        const text = try std.fmt.allocPrint(alloc, "{s}\\{s}{s}", .{ dir, case.name, case.suffix });
-        defer alloc.free(text);
-        const want = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ dir, case.file });
-        defer alloc.free(want);
-        const got = try resolveOpenPath(alloc, null, text);
-        defer if (got) |p| alloc.free(p);
-        try std.testing.expect(got != null);
-        try std.testing.expectEqualStrings(want, got.?);
-    }
-    {
-        const missing = try std.fmt.allocPrint(alloc, "{s}\\missing.txt:12", .{dir});
-        defer alloc.free(missing);
-        try std.testing.expect(try resolveOpenPath(alloc, null, missing) == null);
-    }
+    surface.io.backend.exec.subprocess.wsl_launch = false;
+    const got = try surface.resolvePathForOpening(text);
+    defer if (got) |p| alloc.free(p);
+    try std.testing.expect(got != null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(file, got.?));
 
-    // Text a program can print must never abort the process: a location can
-    // leave a stream of only dots and spaces (`b:.`), which `accessAbsolute`
-    // turns into `unreachable`. None of these needs a file on disk.
-    for ([_][]const u8{
-        "/pkg42-nowhere/b:.:1",
-        "C:\\pkg42-nowhere\\b: :12",
-        "C:\\pkg42-nowhere\\b: (1,2)",
-        "C:/pkg42-nowhere/./b:..:3",
-        // A DOS device name as the final component, with or without a location.
-        "C:\\pkg42-nowhere\\nul:12",
-        "C:\\pkg42-nowhere\\nul(1,2)",
-        "/pkg42-nowhere/nul:1",
-        "C:\\pkg42-nowhere\\NUL.",
-        // A path with no drive letter is the opener's to refuse; it is never
-        // looked at here (it would be stat-ed on the current drive).
-        "/pkg42-nowhere/a.txt:1",
-        // `resolve` unwraps a null on a server whose share is a lone separator,
-        // so a share is screened before it (and a share is never opened).
-        "\\\\a\\/",
-        "\\\\a\\/:12",
-        "\\\\a\\/:12:5",
-        "\\\\a\\/(3,4)",
-        "//C/\\:12",
-        "//./\\(3,4)",
-    }) |text| try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
-    // A stream on `.` or `..` is invalid to NT (and `resolve` keeps it), so the
-    // whole text is never looked at; its location-less form is the folder it
-    // names, which exists. Nothing may abort, and nothing may leak.
-    for ([_][]const u8{ "C:\\.:12", "C:/.:12", "C:\\\\.:12", "C:\\..:12" }) |text| {
-        const got = try resolveOpenPath(alloc, null, text);
-        defer if (got) |p| alloc.free(p);
-        if (got) |p| try std.testing.expectEqualStrings("C:\\", p);
-    }
-    // A drive-relative name has no sensible meaning against the pane's directory
-    // and used to reach Zig's `resolve`, which panics on it.
-    for ([_][]const u8{
-        "./b:.:1",
-        "./b:.",
-        "b: :12",
-        ".\\b: (1,2)",
-        "D:x",
-        "b:x:12",
-        "1:x",
-        "_:x:12",
-        "./nul",
-        ".\\nul:3",
-        "nul",
-    }) |text| {
-        try std.testing.expect(try resolveOpenPath(alloc, dir, text) == null);
-    }
-    // Same for a stream on `.` or `..`: it must not abort, and the folder the
-    // location-less text names is a fine answer.
-    for ([_][]const u8{ "./.:12", ".\\.:12", "..\\.:12", ".\\..:12" }) |text| {
-        const got = try resolveOpenPath(alloc, dir, text);
-        if (got) |p| alloc.free(p);
-    }
-
-    // A share or device path is never looked at, with or without a location.
-    for ([_][]const u8{
-        "\\\\server\\share\\a.txt:1",
-        "//server/share/a.txt:1",
-        "\\\\?\\UNC\\server\\share\\a.txt(1,2)",
-        "\\\\.\\pipe\\x:3",
-    }) |text| try std.testing.expect(try resolveOpenPath(alloc, null, text) == null);
-}
-
-test "a link through a symlink to a share is never stat-ed" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    tmp.dir.symLink("\\\\pkg42-no-such-host\\share", "link", .{ .is_directory = true }) catch |err| switch (err) {
-        error.AccessDenied => return error.SkipZigTest, // no symlink privilege
-        else => return err,
-    };
-    const dir = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir);
-
-    // `accessAbsolute` follows the link and waits on the (here nonexistent)
-    // server on the calling thread; the opener's bounded lookup refuses it
-    // first, which is also why this has a bound.
-    var timer = try std.time.Timer.start();
-    for ([_][]const u8{ "link\\report.txt:12", "link/report.txt", "link\\sub\\a.cs(3,4)" }) |text| {
-        try std.testing.expect(try resolveOpenPath(alloc, dir, text) == null);
-        const absolute = try std.fs.path.join(alloc, &.{ dir, text });
-        defer alloc.free(absolute);
-        try std.testing.expect(try resolveOpenPath(alloc, null, absolute) == null);
-    }
-    try std.testing.expect(timer.read() < 2 * std.time.ns_per_s);
-}
-
-test "a relative link never resolves onto a network or device pwd" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        "\\\\server\\share",
-        "//server/share",
-        "\\\\?\\UNC\\server\\share\\dir",
-        "\\\\.\\pipe",
-        "\\/server/share",
-        "/\\\\server/share",
-        // The NT namespace prefix is reachable from a reported pwd of
-        // `/??/UNC/server/share`, which `resolve` turns into `\??\UNC\...`.
-        "/??/UNC/server/share",
-        "\\??\\UNC\\server\\share",
-    }) |reported| {
-        const resolved = try std.fs.path.resolve(alloc, &.{ reported, "file.txt" });
-        defer alloc.free(resolved);
-        std.testing.expect(!windowsPathIsRepresentable(resolved)) catch |err| {
-            std.debug.print("pwd {s} resolved to {s}\n", .{ reported, resolved });
-            return err;
-        };
-    }
-
-    // A local pwd still resolves.
-    const local = try std.fs.path.resolve(alloc, &.{ "C:\\Users\\me", "file.txt" });
-    defer alloc.free(local);
-    try std.testing.expect(windowsPathIsRepresentable(local));
-}
-
-test "a relative resolution result is never handed to accessAbsolute" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    // `std.fs.accessAbsolute` asserts that its argument is absolute (a panic in
-    // safe builds, undefined behaviour in ReleaseFast). `resolve` does not
-    // always return one: a pwd that opens with `\/` is parsed as a drive-less
-    // UNC fragment and comes back as `server\share\file.txt`.
-    const alloc = std.testing.allocator;
-    const relative = try std.fs.path.resolve(alloc, &.{ "\\/server/share", "file.txt" });
-    defer alloc.free(relative);
-    try std.testing.expect(!std.fs.path.isAbsolute(relative));
-    try std.testing.expect(!windowsPathIsRepresentable(relative));
-
-    for ([_][]const u8{
-        "#x",
-        "relative",
-        "",
-        "/\\\\server/share",
-        "/home/me",
-        "kitty-shell-cwd:",
-        "\\/server/share",
-        "/\\server\\share",
-    }) |reported| {
-        const resolved = try std.fs.path.resolve(alloc, &.{ reported, "file.txt" });
-        defer alloc.free(resolved);
-        std.testing.expect(
-            std.fs.path.isAbsolute(resolved) or !windowsPathIsRepresentable(resolved),
-        ) catch |err| {
-            std.debug.print("pwd {s} resolved to {s}\n", .{ reported, resolved });
-            return err;
-        };
-    }
+    // In WSL `/c/x` is a Linux path: left to the opener as written, as before.
+    surface.io.backend.exec.subprocess.wsl_launch = true;
+    try std.testing.expect(try surface.resolvePathForOpening(text) == null);
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
 /// keyboard should be rendered.
 pub fn imePoint(self: *const Surface) apprt.IMEPos {
-    self.renderer_state.mutex.lock();
-    const cursor = self.renderer_state.terminal.screens.active.cursor;
-    const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
-    self.renderer_state.mutex.unlock();
-
-    // TODO: need to handle when scrolling and the cursor is not
-    // in the visible portion of the screen.
-
     // Our sizes are all scaled so we need to send the unscaled values back.
     const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
 
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    // TODO: need to handle when scrolling and the cursor is not
+    // in the visible portion of the screen.
+    const cursor = self.renderer_state.terminal.screens.active.cursor;
+    return imePosAt(
+        self.size,
+        content_scale,
+        cursor.x,
+        cursor.y,
+        self.renderer_state.terminal.cols,
+        if (self.renderer_state.preedit) |*preedit| preedit else null,
+    );
+}
+
+/// Where the IME's windows go for the terminal cursor at cell (`cursor_x`,
+/// `cursor_y`) on a grid `cols` wide: the bottom middle of the first cell
+/// the preedit is drawn on, which is the cursor's cell unless the preedit
+/// had to move left of it to fit.
+pub fn imePosAt(
+    size: rendererpkg.Size,
+    content_scale: apprt.ContentScale,
+    cursor_x: terminal.size.CellCountInt,
+    cursor_y: terminal.size.CellCountInt,
+    cols: terminal.size.CellCountInt,
+    preedit: ?*const rendererpkg.State.Preedit,
+) apprt.IMEPos {
+    // The cells the preedit is drawn on.
+    const start: usize, const cells: usize = if (preedit) |p| cells: {
+        if (p.codepoints.len == 0 or cols == 0) break :cells .{ cursor_x, 0 };
+        const placed = p.layout(cursor_x, cols - 1);
+        break :cells .{ placed.start, @as(usize, placed.end - placed.start) + 1 };
+    } else .{ cursor_x, 0 };
+
     const x: f64 = x: {
         // Simple x * cell width gives the top-left corner, then add padding offset
-        var x: f64 = @floatFromInt(cursor.x * self.size.cell.width + self.size.padding.left);
+        var x: f64 = @floatFromInt(start * size.cell.width + size.padding.left);
 
         // We want the midpoint
-        x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
+        x += @as(f64, @floatFromInt(size.cell.width)) / 2;
 
         // And scale it
         x /= content_scale.x;
@@ -3534,10 +3163,10 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
 
     const y: f64 = y: {
         // Simple y * cell height gives the top-left corner, then add padding offset
-        var y: f64 = @floatFromInt(cursor.y * self.size.cell.height + self.size.padding.top);
+        var y: f64 = @floatFromInt(@as(usize, cursor_y) * size.cell.height + size.padding.top);
 
         // We want the bottom
-        y += @floatFromInt(self.size.cell.height);
+        y += @floatFromInt(size.cell.height);
 
         // And scale it
         y /= content_scale.y;
@@ -3548,28 +3177,19 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
     // Our height for now is always just the cell height because our preedit
     // rendering only renders in a single line.
     const height: f64 = height: {
-        var height: f64 = @floatFromInt(self.size.cell.height);
+        var height: f64 = @floatFromInt(size.cell.height);
         height /= content_scale.y;
         break :height height;
     };
-    const width: f64 = width: {
-        var width: f64 = @floatFromInt(preedit_width * self.size.cell.width);
 
-        // Our max width is the remaining screen width after the cursor.
-        // We don't have to deal with wrapping because the preedit doesn't
-        // wrap right now.
-        const screen_width: f64 = @floatFromInt(self.size.terminal().width);
-        const x_offset: f64 = @floatFromInt((cursor.x + 1) * self.size.cell.width);
-        const max = screen_width - x_offset;
-        width = @min(width, max);
-
-        // Note: we don't apply content scale here because it looks like
-        // for some reason in macOS its already scaled. I'm not sure why
-        // that is so I'm going to just leave this comment here so its known
-        // that I left this out on purpose pending more investigation.
-
-        break :width width;
-    };
+    // The width the preedit is drawn with; it never wraps and never goes
+    // past the last column.
+    //
+    // Note: we don't apply content scale here because it looks like
+    // for some reason in macOS its already scaled. I'm not sure why
+    // that is so I'm going to just leave this comment here so its known
+    // that I left this out on purpose pending more investigation.
+    const width: f64 = @floatFromInt(cells * size.cell.width);
 
     return .{
         .x = x,
@@ -3577,6 +3197,51 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
         .width = width,
         .height = height,
     };
+}
+
+test "IME windows go to the first cell the preedit is drawn on" {
+    const testing = std.testing;
+    const Preedit = rendererpkg.State.Preedit;
+    // 96 DPI: 10 x 20 cells, 4 px padding, 10 columns.
+    const size: rendererpkg.Size = .{
+        .screen = .{ .width = 108, .height = 248 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 4, .bottom = 4, .left = 4, .right = 4 },
+    };
+    const one: apprt.ContentScale = .{ .x = 1, .y = 1 };
+
+    // No preedit: the cursor's cell.
+    try testing.expectEqual(apprt.IMEPos{ .x = 79, .y = 64, .width = 0, .height = 20 }, imePosAt(size, one, 7, 2, 10, null));
+
+    // A preedit that fits starts at the cursor.
+    const narrow: Preedit = .{ .codepoints = &.{ .{ .codepoint = 'a' }, .{ .codepoint = 'b' } } };
+    try testing.expectEqual(apprt.IMEPos{ .x = 79, .y = 64, .width = 20, .height = 20 }, imePosAt(size, one, 7, 2, 10, &narrow));
+
+    // A wide codepoint in the last column moves one cell left, and so do
+    // the windows.
+    const wide: Preedit = .{ .codepoints = &.{.{ .codepoint = 0xAC00, .wide = true }} };
+    try testing.expectEqual(apprt.IMEPos{ .x = 89, .y = 64, .width = 20, .height = 20 }, imePosAt(size, one, 9, 2, 10, &wide));
+
+    // From the last column, a caret after the text keeps a cell of its
+    // own: "b" is drawn one cell left, and "a" is cut.
+    const end_caret: Preedit = .{ .codepoints = &.{ .{ .codepoint = 'a' }, .{ .codepoint = 'b' } }, .caret = 2 };
+    try testing.expectEqual(apprt.IMEPos{ .x = 89, .y = 64, .width = 10, .height = 20 }, imePosAt(size, one, 9, 2, 10, &end_caret));
+
+    // A preedit too long for the row is cut, never moved: the cursor's
+    // cell, and the width of the cells left.
+    const long_cps: [15]Preedit.Codepoint = @splat(.{ .codepoint = 'a' });
+    const long: Preedit = .{ .codepoints = &long_cps };
+    try testing.expectEqual(apprt.IMEPos{ .x = 59, .y = 64, .width = 50, .height = 20 }, imePosAt(size, one, 5, 2, 10, &long));
+
+    // 144 DPI: device pixels scaled by 1.5 come back unscaled.
+    const scaled: rendererpkg.Size = .{
+        .screen = .{ .width = 162, .height = 372 },
+        .cell = .{ .width = 15, .height = 30 },
+        .padding = .{ .top = 6, .bottom = 6, .left = 6, .right = 6 },
+    };
+    const pos = imePosAt(scaled, .{ .x = 1.5, .y = 1.5 }, 9, 2, 10, &wide);
+    try testing.expectApproxEqAbs(@as(f64, (8 * 15 + 6 + 7.5) / 1.5), pos.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, (2 * 30 + 6 + 30) / 1.5), pos.y, 1e-9);
 }
 
 fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) !void {
@@ -3653,13 +3318,14 @@ fn copySelectionToClipboards(
 
     const ScreenFormatter = terminal.formatter.ScreenFormatter;
     var aw: std.Io.Writer.Allocating = .init(alloc);
-    var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
+    var contents_buf: [2]apprt.ClipboardContent = undefined;
+    var contents: std.ArrayList(apprt.ClipboardContent) = .initBuffer(&contents_buf);
     switch (format) {
         .plain => {
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -3676,7 +3342,7 @@ fn copySelectionToClipboards(
 
             // Codepoint mappings affect terminal cell text; formatter-generated
             // VT escape sequences are preserved as-is.
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -3692,7 +3358,7 @@ fn copySelectionToClipboards(
             try formatter.format(&aw.writer);
 
             // Codepoint mappings are applied before HTML encoding.
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/html",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -3703,7 +3369,7 @@ fn copySelectionToClipboards(
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -3725,7 +3391,7 @@ fn copySelectionToClipboards(
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
 
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/html",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -3935,6 +3601,10 @@ const ResizeBatch = struct {
     depth: u8 = 0,
     pending: bool = false,
 
+    fn begin(self: *ResizeBatch) void {
+        self.depth += 1;
+    }
+
     /// Whether a resize must wait for the batch to end.
     fn hold(self: *ResizeBatch) bool {
         if (self.depth == 0) return false;
@@ -3956,14 +3626,14 @@ test "Surface: a resize batch sends one resize when its last level ends" {
     const testing = std.testing;
     var batch: ResizeBatch = .{};
     try testing.expect(!batch.hold());
-    batch.depth += 1;
-    batch.depth += 1;
+    batch.begin();
+    batch.begin();
     try testing.expect(batch.hold());
     try testing.expect(batch.hold());
     try testing.expect(!batch.end());
     try testing.expect(batch.end());
     try testing.expect(!batch.end());
-    batch.depth += 1;
+    batch.begin();
     try testing.expect(!batch.end());
 }
 
@@ -4011,7 +3681,7 @@ test "Surface: resizes inside a batch reach termio once, with the final size and
 /// the new cells, a grid neither monitor uses, which can wrap lines into
 /// scrollback if termio applies it before the second arrives.
 pub fn beginResizeBatch(self: *Surface) void {
-    self.resize_batch.depth += 1;
+    self.resize_batch.begin();
 }
 
 pub fn endResizeBatch(self: *Surface) void {
@@ -4181,6 +3851,24 @@ fn balancePaddingIfNeeded(self: *Surface) void {
 ///
 /// The preedit input must be UTF-8 encoded.
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
+    try self.preeditCaretCallback(preedit_, null, null);
+}
+
+/// A clause of a preedit as a codepoint range, `start` up to, not including,
+/// `end`.
+pub const PreeditTarget = rendererpkg.State.Preedit.Target;
+
+/// `preeditCallback` with the input method's composition caret: `caret` is
+/// a codepoint index into `preedit_` (0 is before the first codepoint), or
+/// null when the input method reports none. `target` is the clause the
+/// input method is converting, as a codepoint range of `preedit_`, or null.
+/// Any change, the caret or the target alone included, redraws the preedit.
+pub fn preeditCaretCallback(
+    self: *Surface,
+    preedit_: ?[]const u8,
+    caret: ?usize,
+    target: ?PreeditTarget,
+) !void {
     // log.debug("text preeditCallback value={any}", .{preedit_});
 
     // Crash metadata in case we crash in here
@@ -4210,45 +3898,138 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     // Mark preedit dirty flag
     self.io.terminal.flags.dirty.preedit = true;
 
-    // If we have no text, we're done. We queue a render in case we cleared
-    // a prior preedit (likely).
-    const text = preedit_ orelse {
-        try self.queueRender();
-        return;
-    };
+    // With no text, or none that takes a cell, we're done. We queue a
+    // render in case we cleared a prior preedit (likely).
+    if (preedit_) |text| {
+        self.renderer_state.preedit = try preeditFromText(self.alloc, text, caret, target);
+    }
+    try self.queueRender();
+}
 
-    // We convert the UTF-8 text to codepoints.
+/// The preedit the renderer draws for UTF-8 `text`, or null when no
+/// codepoint in it takes a cell. Codepoints with no width are dropped (I've
+/// never seen a preedit text with a zero-width character; in theory it's
+/// possible but we can't really handle it right now), so `caret`, a
+/// codepoint index into `text`, becomes the number of kept codepoints
+/// before it, and so does each end of `target`. A target with no kept
+/// codepoint is dropped.
+fn preeditFromText(
+    alloc: Allocator,
+    text: []const u8,
+    caret: ?usize,
+    target: ?PreeditTarget,
+) !?rendererpkg.State.Preedit {
     const view = try std.unicode.Utf8View.init(text);
     var it = view.iterator();
 
-    // Allocate the codepoints slice
     const Codepoint = rendererpkg.State.Preedit.Codepoint;
     var codepoints: std.ArrayListUnmanaged(Codepoint) = .{};
-    defer codepoints.deinit(self.alloc);
-    while (it.nextCodepoint()) |cp| {
+    defer codepoints.deinit(alloc);
+    // Kept codepoints before the caret and before each end of the target.
+    var kept_before_caret: usize = 0;
+    var kept_before_start: usize = 0;
+    var kept_before_end: usize = 0;
+    var source: usize = 0;
+    while (it.nextCodepoint()) |cp| : (source += 1) {
         const width: usize = @intCast(unicode.table.get(cp).width);
-
-        // I've never seen a preedit text with a zero-width character. In
-        // theory its possible but we can't really handle it right now.
-        // Let's just ignore it.
         if (width <= 0) continue;
-
-        try codepoints.append(
-            self.alloc,
-            .{ .codepoint = cp, .wide = width >= 2 },
-        );
+        if (caret) |c| {
+            if (source < c) kept_before_caret += 1;
+        }
+        if (target) |t| {
+            if (source < t.start) kept_before_start += 1;
+            if (source < t.end) kept_before_end += 1;
+        }
+        try codepoints.append(alloc, .{ .codepoint = cp, .wide = width >= 2 });
     }
+    if (codepoints.items.len == 0) return null;
 
-    // If we have no codepoints, then we're done.
-    if (codepoints.items.len == 0) {
-        try self.queueRender();
-        return;
-    }
-
-    self.renderer_state.preedit = .{
-        .codepoints = try codepoints.toOwnedSlice(self.alloc),
+    return .{
+        .codepoints = try codepoints.toOwnedSlice(alloc),
+        .caret = if (caret != null) kept_before_caret else null,
+        .target = if (kept_before_start < kept_before_end)
+            .{ .start = kept_before_start, .end = kept_before_end }
+        else
+            null,
     };
-    try self.queueRender();
+}
+
+test "preedit caret maps onto the codepoints that take a cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        // U+0301 has no width and is dropped, so a caret after it counts
+        // only the codepoints that are drawn.
+        const p = (try preeditFromText(alloc, "e\u{0301}x", 2, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(usize, 2), p.codepoints.len);
+        try testing.expectEqual(@as(?usize, 1), p.caret);
+    }
+    {
+        const p = (try preeditFromText(alloc, "e\u{0301}x", 3, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 2), p.caret);
+    }
+    {
+        // Past the end clamps to the end.
+        const p = (try preeditFromText(alloc, "\u{4E2D}\u{56FD}", 9, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 2), p.caret);
+        try testing.expect(p.codepoints[0].wide);
+    }
+    {
+        const p = (try preeditFromText(alloc, "ab", 0, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, 0), p.caret);
+    }
+    {
+        // No caret stays none.
+        const p = (try preeditFromText(alloc, "ab", null, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?usize, null), p.caret);
+    }
+    try testing.expect((try preeditFromText(alloc, "", 0, null)) == null);
+    try testing.expect((try preeditFromText(alloc, "\u{0301}", 1, null)) == null);
+}
+
+test "preedit target maps onto the codepoints that take a cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Target = rendererpkg.State.Preedit.Target;
+
+    {
+        // Codepoint 1 (U+0301) is dropped, so the target 2..4 of the text
+        // is 1..3 of what is drawn.
+        const p = (try preeditFromText(alloc, "e\u{0301}xyz", 4, .{ .start = 2, .end = 4 })).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(usize, 4), p.codepoints.len);
+        try testing.expectEqual(@as(?Target, .{ .start = 1, .end = 3 }), p.target);
+        try testing.expectEqual(@as(?usize, 3), p.caret);
+    }
+    {
+        // A target that starts on the dropped codepoint keeps the rest.
+        const p = (try preeditFromText(alloc, "e\u{0301}xyz", null, .{ .start = 1, .end = 3 })).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?Target, .{ .start = 1, .end = 2 }), p.target);
+    }
+    {
+        // A target past the end is cut at the end.
+        const p = (try preeditFromText(alloc, "\u{304B}\u{306A}\u{6F22}\u{5B57}", null, .{ .start = 2, .end = 9 })).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?Target, .{ .start = 2, .end = 4 }), p.target);
+    }
+    {
+        // Nothing of it is drawn: no target.
+        const p = (try preeditFromText(alloc, "e\u{0301}x", null, .{ .start = 1, .end = 2 })).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?Target, null), p.target);
+    }
+    {
+        const p = (try preeditFromText(alloc, "ab", 1, null)).?;
+        defer p.deinit(alloc);
+        try testing.expectEqual(@as(?Target, null), p.target);
+    }
 }
 
 fn applyKeyRemaps(
@@ -5340,17 +5121,15 @@ fn encodeKey(
         );
         defer alloc_writer.deinit();
 
-        // This results in a double allocation but this is such an unlikely
-        // path the performance impact is unimportant.
         try input.key_encode.encode(
             &alloc_writer.writer,
             event,
             encoding_opts,
         );
-        break :req try termio.Message.WriteReq.init(
-            self.alloc,
-            alloc_writer.writer.buffered(),
-        );
+        break :req .{ .alloc = .{
+            .alloc = self.alloc,
+            .data = try alloc_writer.toOwnedSlice(),
+        } };
     };
 
     // Copy the encoded data into the inspector event if we have one.
@@ -6375,6 +6154,10 @@ fn maybePromptClick(self: *Surface) !bool {
     // prompt clicks because we can't move if we're not in a prompt!
     if (!t.cursorIsAtPrompt()) return false;
 
+    // A press reported under mouse tracking resets the click count, and its
+    // release must be reported too rather than moving the cursor.
+    if (self.mouse.left_click_count == 0) return false;
+
     // If we have a selection currently, then releasing the mouse
     // completes the selection and we don't do prompt moving. I don't
     // love this logic, I think it should be generalized to "if the
@@ -6429,20 +6212,27 @@ fn maybePromptClick(self: *Surface) !bool {
         // Guarded at the start of this function
         .none => unreachable,
 
-        .click_events => {
+        .click_events => |v| {
             // For the event, we always send a left-click press event.
             // This matches what Kitty sends.
+            const key: u8, const y: u32 = switch (v) {
+                .absolute => .{ 1, pos_vp.y +| 1 },
+                .relative => .{
+                    2,
+                    promptClickRelativeRow(&screen.pages, prompt_pin, click_pin),
+                },
+            };
             var data: termio.Message.WriteReq.Small.Array = undefined;
             const resp = try std.fmt.bufPrint(
                 &data,
                 "\x1B[<0;{d};{d}M",
-                .{ pos_vp.x + 1, pos_vp.y + 1 },
+                .{ pos_vp.x + 1, y },
             );
 
             // Not that noisy since this only happens on prompt clicks.
             log.debug(
-                "sending click_events=1 event=ESC{s}",
-                .{resp[1..]},
+                "sending click_events={} event=ESC{s}",
+                .{ key, resp[1..] },
             );
 
             // Ask our IO thread to write the data
@@ -6475,6 +6265,58 @@ fn maybePromptClick(self: *Surface) !bool {
     return true;
 }
 
+/// Returns the one-based SGR row for a click at or below the prompt.
+fn promptClickRelativeRow(
+    pages: *const terminal.PageList,
+    prompt_pin: terminal.Pin,
+    click_pin: terminal.Pin,
+) u32 {
+    const prompt_y = pages.pointFromPin(.screen, prompt_pin).?.screen.y;
+    const click_y = pages.pointFromPin(.screen, click_pin).?.screen.y;
+    return click_y - prompt_y + 1;
+}
+
+test "Surface: the release of a press reported to a program is not a prompt click" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+    {
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]133;A;cl=line\x07> \x1b]133;B\x07hello");
+    }
+    var mutex: std.Thread.Mutex = .{};
+
+    // Only the fields a prompt click reads are set; the rest is zeroed.
+    const rt_surface = try alloc.create(apprt.runtime.Surface);
+    defer alloc.destroy(rt_surface);
+    @memset(std.mem.asBytes(rt_surface), 0);
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    @memset(std.mem.asBytes(surface), 0);
+    surface.rt_surface = rt_surface;
+    surface.renderer_state.mutex = &mutex;
+    surface.renderer_state.terminal = &t;
+    surface.config.cursor_click_to_move = true;
+    surface.size = .{
+        .screen = .{ .width = 200, .height = 80 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    // A prompt click writes arrow keys; read-only drops them, so no IO
+    // thread is needed.
+    surface.readonly = true;
+
+    // Reporting a press zeroes the click count: its release is reported too.
+    try testing.expect(!try surface.maybePromptClick());
+
+    // An unreported click at the prompt moves the cursor.
+    surface.mouse.left_click_count = 1;
+    try testing.expect(try surface.maybePromptClick());
+}
+
 const Link = struct {
     action: input.Link.Action,
     selection: terminal.Selection,
@@ -6502,7 +6344,9 @@ fn linkAtPos(
     const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
 
     // If we have the proper modifiers set then we can check for OSC8 links.
-    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
+    if (self.config.link_osc8 and
+        mouse_mods.equal(input.ctrlOrSuper(.{})))
+    hyperlink: {
         const rac = mouse_pin.rowAndCell();
         const cell = rac.cell;
         if (!cell.hyperlink) break :hyperlink;
@@ -6512,6 +6356,59 @@ fn linkAtPos(
 
     // Fall back to configured links
     return try self.linkAtPin(mouse_pin, mouse_mods);
+}
+
+test "Surface: link-osc8 = false finds no OSC 8 link, only the text's own" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    // Only what linkAtPos reads is set. Hover, Ctrl+click, the context menu
+    // and copy_url_to_clipboard all find links through it.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    @memset(std.mem.asBytes(surface), 0);
+    surface.alloc = alloc;
+    surface.config.links = derived.links;
+    surface.mouse.mods = input.ctrlOrSuper(.{});
+    surface.size = .{
+        .screen = .{ .width = 400, .height = 20 },
+        .cell = .{ .width = 10, .height = 10 },
+        .padding = .{},
+    };
+    surface.io.terminal = try .init(alloc, .{ .cols = 40, .rows = 2 });
+    defer surface.io.terminal.deinit(alloc);
+    surface.renderer_state.terminal = &surface.io.terminal;
+    {
+        var stream = surface.io.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]8;;https://example.com/hidden\x1b\\click here\x1b]8;;\x1b\\\r\n");
+        stream.nextSlice("\x1b]8;;https://example.com/hidden\x1b\\https://example.com/shown\x1b]8;;\x1b\\");
+    }
+    const at = struct {
+        fn row(y: f32) apprt.CursorPos {
+            return .{ .x = 25, .y = y * 10 + 5 };
+        }
+    };
+
+    surface.config.link_osc8 = true;
+    for ([_]f32{ 0, 1 }) |y| {
+        const link = try surface.linkAtPos(at.row(y)) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(input.Link.Action._open_osc8, link.action);
+    }
+
+    surface.config.link_osc8 = false;
+    try testing.expect(try surface.linkAtPos(at.row(0)) == null);
+    // Text that is itself a URL is still that URL, never the hidden target.
+    const link = try surface.linkAtPos(at.row(1)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(input.Link.Action.open, link.action);
+    const text = try surface.io.terminal.screens.active.selectionString(alloc, .{ .sel = link.selection, .trim = false });
+    defer alloc.free(text);
+    try testing.expectEqualStrings("https://example.com/shown", text);
 }
 
 /// Detects if a link is present at the given pin.
@@ -6531,7 +6428,9 @@ fn linkAtPin(
     const line = screen.selectLine(.{
         .pin = mouse_pin,
         .whitespace = null,
-        .semantic_prompt_boundary = false,
+        // Respect semantic prompt boundaries so link/path matching doesn't
+        // merge shell prompt content with the text beside it.
+        .semantic_prompt_boundary = true,
     }) orelse return null;
 
     var strmap: terminal.StringMap = undefined;
@@ -6563,6 +6462,54 @@ fn linkAtPin(
     }
 
     return null;
+}
+
+test "Surface: a link does not run from a prompt into the command after it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    // Only what linkAtPin reads is set.
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    @memset(std.mem.asBytes(surface), 0);
+    surface.alloc = alloc;
+    surface.config.links = derived.links;
+    surface.io.terminal = try .init(alloc, .{ .cols = 40, .rows = 3 });
+    defer surface.io.terminal.deinit(alloc);
+    surface.renderer_state.terminal = &surface.io.terminal;
+    {
+        // Ubuntu's default bash prompt ends in a path, which the URL regex
+        // continues across the space into the command typed after it. cmd
+        // sends no C mark, so what follows stays input, URLs included.
+        var stream = surface.io.terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]133;A\x1b\\me@host:~/src$ \x1b]133;B\x1b\\ls docs\r\nsee https://example.com/a");
+    }
+    const Probe = struct {
+        fn link(s: *Surface, x: u16, y: u16) !?[:0]const u8 {
+            const screen = s.io.terminal.screens.active;
+            const pin = screen.pages.pin(.{ .active = .{ .x = x, .y = y } }).?;
+            const found = try s.linkAtPin(pin, null) orelse return null;
+            return try screen.selectionString(testing.allocator, .{ .sel = found.selection, .trim = false });
+        }
+    };
+
+    const prompt = try Probe.link(surface, 8, 0) orelse return error.TestUnexpectedResult;
+    defer alloc.free(prompt);
+    try testing.expectEqualStrings("~/src$", prompt);
+
+    const command = try Probe.link(surface, 18, 0);
+    defer if (command) |text| alloc.free(text);
+    try testing.expectEqualStrings("", command orelse "");
+
+    const url = try Probe.link(surface, 10, 1) orelse return error.TestUnexpectedResult;
+    defer alloc.free(url);
+    try testing.expectEqualStrings("https://example.com/a", url);
 }
 
 /// This returns the mouse mods to consider for link highlighting or
@@ -6615,7 +6562,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
 
     switch (action) {
         .open => try self.openLinkText(target),
-        ._open_osc8 => try self.openUrl(.{ .kind = .unknown, .url = target }),
+        ._open_osc8 => try self.openUrl(.{ .kind = .osc8, .url = target }),
     }
     return true;
 }
@@ -6646,7 +6593,7 @@ fn openUrl(
 /// if there is no hyperlink.
 fn osc8URI(self: *Surface, pin: terminal.Pin) ?[]const u8 {
     _ = self;
-    const page = &pin.node.data;
+    const page = pin.node.page();
     const cell = pin.rowAndCell().cell;
     const link_id = page.lookupHyperlink(cell) orelse return null;
     const entry = page.hyperlink_set.get(page.memory, link_id);
@@ -7289,10 +7236,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .text => |data| {
-            // For text we always allocate just because its easier to
-            // handle all cases that way.
-            const buf = try self.alloc.alloc(u8, data.len);
-            defer self.alloc.free(buf);
+            var stack = std.heap.stackFallback(256, self.alloc);
+            const alloc = stack.get();
+            const buf = try alloc.alloc(u8, data.len);
+            defer alloc.free(buf);
             const text = configpkg.string.parse(buf, data) catch |err| {
                 log.warn(
                     "error parsing text binding text={s} err={}",
@@ -8234,14 +8181,19 @@ pub fn endSearch(self: *Surface) !bool {
         s.deinit();
         self.search = null;
         self.search_query_options = .{};
-        try self.syncClearSearchState(generation);
+        self.renderer_thread.send(.{ .search_clear = generation });
     }
 
+    // end_search goes before the cleared totals and rows, so a GUI hides
+    // its search UI first and does not show (or announce) the clear as it
+    // closes. Every way of ending a search comes here: the Win32 docked
+    // search's own controls and the end_search binding alike.
     _ = try self.rt_app.performAction(
         .{ .surface = self },
         .end_search,
         {},
     );
+    if (performed) try self.reportSearchCleared();
 
     return performed;
 }
@@ -8265,7 +8217,11 @@ pub fn invalidateSearchResults(self: *Surface) !bool {
 
 fn syncClearSearchState(self: *Surface, generation: u64) !void {
     self.renderer_thread.send(.{ .search_clear = generation });
+    try self.reportSearchCleared();
+}
 
+/// Tells the apprt that the search has no total, selection or match rows.
+fn reportSearchCleared(self: *Surface) !void {
     _ = try self.rt_app.performAction(
         .{ .surface = self },
         .search_total,
@@ -8675,6 +8631,44 @@ fn completeClipboardPaste(
     };
 }
 
+/// What a program with bracketed paste on receives for a user paste that found
+/// no text on the clipboard: the two fences and nothing between them. It tells
+/// a program that reads the clipboard itself (an image, say) that the user
+/// pasted, which is what Windows Terminal sends in the same case.
+const empty_bracketed_paste = "\x1b[200~\x1b[201~";
+
+/// A user's paste found no text on the clipboard. Writes an empty bracketed
+/// paste if the program turned bracketed paste (DECSET 2004) on and returns
+/// true; otherwise writes nothing and returns false, so the caller can report
+/// "nothing was pasted" and a `performable:` binding falls through to the
+/// program as a key.
+///
+/// This is not `completeClipboardPaste` with empty data on purpose: that
+/// function ignores empty data, and the callers that share it (`textCallback`,
+/// automation `send_text`, drops, quick select, insert-last-command) must keep
+/// sending nothing for empty input. Only the apprt knows a user gesture found
+/// the clipboard without text, and it must never call this for an OSC 52 read.
+pub fn completeClipboardPasteWithoutText(self: *Surface) !bool {
+    if (self.readonly) return false;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
+        if (!opts.bracketed) return false;
+
+        // Like every paste, jump to the bottom (lock held).
+        self.scrollToBottom() catch |err| {
+            log.warn("error scrolling to bottom err={}", .{err});
+        };
+    }
+
+    // One write, so the pair cannot be split by other input.
+    self.queueIo(.{ .write_stable = empty_bracketed_paste }, .unlocked);
+    return true;
+}
+
 /// Insert uses the same unsafe-paste detector as clipboard paste, then applies
 /// a stricter contract than a normal paste: one non-empty UTF-8 line with no
 /// control or Unicode line-separator characters. The recovered text is never
@@ -8754,8 +8748,8 @@ fn completeClipboardReadOSC52(
     // This must hold the base64 encoded data PLUS the OSC code surrounding it.
     const enc = std.base64.standard.Encoder;
     const size = enc.calcSize(data.len);
-    var buf = try self.alloc.alloc(u8, size + 9); // const for OSC
-    defer self.alloc.free(buf);
+    const buf = try self.alloc.alloc(u8, size + 9); // const for OSC
+    errdefer self.alloc.free(buf);
 
     const kind: u8 = switch (clipboard_type) {
         .standard => 'c',
@@ -8773,10 +8767,10 @@ fn completeClipboardReadOSC52(
     const encoded = enc.encode(buf[prefix.len..], data);
     assert(encoded.len == size);
 
-    self.queueIo(try termio.Message.writeReq(
-        self.alloc,
-        buf,
-    ), .unlocked);
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = buf,
+    } }, .unlocked);
 }
 
 fn showDesktopNotification(self: *Surface, title: [:0]const u8, body: [:0]const u8) !void {
@@ -9390,4 +9384,42 @@ test "Surface: lock keys alone do not count as a mouse mods change" {
     try std.testing.expect(mouseModsChanged(stored, .{}));
     try std.testing.expect(mouseModsChanged(stored, .{ .ctrl = true, .shift = true }));
     try std.testing.expect(mouseModsChanged(.{}, .{ .super = true, .num_lock = true }));
+}
+
+test "promptClickRelativeRow" {
+    const testing = std.testing;
+    const Case = struct {
+        layout: enum { no_history, offset, cross_page, prompt_above_viewport },
+        click_y: u32,
+        expected: u32,
+    };
+    const cases = [_]Case{
+        .{ .layout = .no_history, .click_y = 1, .expected = 1 },
+        .{ .layout = .offset, .click_y = 3, .expected = 3 },
+        .{ .layout = .cross_page, .click_y = 3, .expected = 3 },
+        .{ .layout = .prompt_above_viewport, .click_y = 0, .expected = 3 },
+    };
+    for (cases) |case| {
+        var pages = try terminal.PageList.init(testing.allocator, 80, 5, null);
+        defer pages.deinit();
+        const scroll_rows: u32 = switch (case.layout) {
+            .no_history => 0,
+            .offset, .prompt_above_viewport => 10,
+            .cross_page => pages.pages.first.?.capacity().rows - 2,
+        };
+        for (0..scroll_rows) |_| _ = try pages.grow();
+
+        const prompt_y = if (case.layout == .prompt_above_viewport)
+            scroll_rows - 2
+        else
+            scroll_rows + 1;
+        const prompt = pages.pin(.{ .screen = .{ .y = prompt_y } }).?;
+        const click = pages.pin(.{ .viewport = .{ .x = 7, .y = case.click_y } }).?;
+        try testing.expectEqual(case.layout == .cross_page, prompt.node != click.node);
+        try testing.expectEqual(
+            case.layout == .prompt_above_viewport,
+            pages.pointFromPin(.viewport, prompt) == null,
+        );
+        try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
+    }
 }

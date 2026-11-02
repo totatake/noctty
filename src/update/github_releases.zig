@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const wuffs = @import("wuffs");
 const build_config = @import("../build_config.zig");
 const internal_os = @import("../os/main.zig");
 const conpty_redist = @import("conpty_redist.zig");
@@ -1076,6 +1077,104 @@ fn installerImageInUse(path: []const u8) bool {
     return false;
 }
 
+/// Whether an installer staged by the updater is running now, which is how
+/// the in-app Install runs Setup. The stage directory is the user's, so this
+/// sees an Install that any noctty process started. It asks for a running
+/// process whose image is a `.exe` directly inside a version directory under
+/// `updates`, and reads neither the state record nor the file: another
+/// process may clear or replace that record while Setup runs (an update check
+/// with another feed, a new release staged), and the file cannot tell. A
+/// write open is refused alike for a running image, a read-only file and the
+/// updater's own verification handle, which shares reads only and is held
+/// across the hash and signature checks of any noctty's update check. A
+/// staged installer the user started by hand counts, as does the portable
+/// update helper (which also relaunches noctty). False when nothing can be
+/// read.
+pub fn stagedInstallerRunning(alloc: Allocator, state_path: []const u8) bool {
+    if (builtin.os.tag != .windows) return false;
+    const state_dir = std.fs.path.dirname(state_path) orelse return false;
+    const updates_dir = std.fs.path.join(alloc, &.{ state_dir, "updates" }) catch return false;
+    defer alloc.free(updates_dir);
+    return processRunsFromStage(alloc, updates_dir);
+}
+
+/// Whether any process this user can query runs an image directly inside a
+/// version directory of `updates_dir` (`isStagedImage`). The directory is
+/// compared by its final path, which is how Windows reports a process's
+/// image, so a junction or another spelling of it still matches. It asks each
+/// process for `PROCESS_QUERY_LIMITED_INFORMATION` only, which an elevated
+/// process of the same user grants (not measured with an elevated Setup); a
+/// process that refuses even that is skipped.
+fn processRunsFromStage(alloc: Allocator, updates_dir: []const u8) bool {
+    const windows = std.os.windows;
+    var dir = std.fs.openDirAbsolute(updates_dir, .{}) catch return false;
+    defer dir.close();
+    const final_buf = alloc.alloc(u16, windows.PATH_MAX_WIDE) catch return false;
+    defer alloc.free(final_buf);
+    const final = windows.GetFinalPathNameByHandle(dir.fd, .{}, final_buf) catch return false;
+
+    var pids: []u32 = alloc.alloc(u32, 1024) catch return false;
+    defer alloc.free(pids);
+    var count: usize = 0;
+    while (true) {
+        const size: u32 = @intCast(pids.len * @sizeOf(u32));
+        var needed: u32 = 0;
+        if (K32EnumProcesses(pids.ptr, size, &needed) == 0) return false;
+        // A full buffer may have cut the list short.
+        if (needed < size) {
+            count = needed / @sizeOf(u32);
+            break;
+        }
+        if (pids.len >= 1 << 20) return false;
+        pids = alloc.realloc(pids, pids.len * 2) catch return false;
+    }
+
+    const image = alloc.alloc(u16, windows.PATH_MAX_WIDE) catch return false;
+    defer alloc.free(image);
+    for (pids[0..count]) |pid| {
+        if (pid == 0) continue;
+        const process = OpenProcess(process_query_limited_information, 0, pid) orelse continue;
+        defer windows.CloseHandle(process);
+        var len: u32 = @intCast(image.len);
+        if (QueryFullProcessImageNameW(process, 0, image.ptr, &len) == 0) continue;
+        if (len == 0 or len > image.len) continue;
+        if (isStagedImage(final, image[0..len])) return true;
+    }
+    return false;
+}
+
+/// Whether `image` is `<updates>\<version>\<name>.exe`, where staging puts
+/// Setup, compared without case. A portable payload or backup, a level
+/// deeper, is not.
+fn isStagedImage(updates: []const u16, image: []const u16) bool {
+    const sep: u16 = '\\';
+    if (image.len <= updates.len + 1 or image[updates.len] != sep) return false;
+    if (!std.os.windows.eqlIgnoreCaseWTF16(image[0..updates.len], updates)) return false;
+    const rest = image[updates.len + 1 ..];
+    const split = std.mem.indexOfScalar(u16, rest, sep) orelse return false;
+    if (split == 0) return false;
+    const name = rest[split + 1 ..];
+    if (std.mem.indexOfScalar(u16, name, sep) != null) return false;
+    const exe = std.unicode.utf8ToUtf16LeStringLiteral(".exe");
+    if (name.len <= exe.len) return false;
+    return std.os.windows.eqlIgnoreCaseWTF16(name[name.len - exe.len ..], exe);
+}
+
+const process_query_limited_information: u32 = 0x1000;
+
+extern "kernel32" fn K32EnumProcesses(
+    process_ids: [*]u32,
+    size: u32,
+    needed: *u32,
+) callconv(.winapi) i32;
+
+extern "kernel32" fn QueryFullProcessImageNameW(
+    process: std.os.windows.HANDLE,
+    flags: u32,
+    exe_name: [*]u16,
+    size: *u32,
+) callconv(.winapi) i32;
+
 /// Called at start-up. Install quits the app right after launching Setup and
 /// nothing watches Setup's result, so this is the first chance to find out
 /// whether it worked: a recorded apply request while this build is still
@@ -2050,12 +2149,10 @@ fn resolveRedirectTarget(
 /// Response body caps. `std.Io.Reader.streamRemaining` pumps until EOF with
 /// no limit, so an oversized or hostile response would otherwise grow the
 /// caller's buffer (metadata) or the staged file (download) without bound.
-/// Every body read below goes through `streamBounded` with one of these.
+/// Every body read below is bounded by one of these.
 const max_metadata_response_bytes: u64 = 4 * 1024 * 1024;
 const max_download_response_bytes: u64 = 512 * 1024 * 1024;
 const max_redirect_body_bytes: u64 = 1024 * 1024;
-
-const streamBounded = http_windows.streamBounded;
 
 fn clearOptionalOwned(alloc: Allocator, slot: *?[]u8) void {
     if (slot.*) |old| alloc.free(old);
@@ -2082,19 +2179,11 @@ fn fetchHttps(
 
         if (response.status.class() == .redirect) {
             if (redirect_count >= 3) return error.TooManyHttpRedirects;
-            const location = try response.header(alloc, 33) orelse return error.HttpRedirectLocationMissing;
+            const location = try response.header(alloc, http_windows.query_location) orelse return error.HttpRedirectLocationMissing;
             defer alloc.free(location);
             const next_url = try resolveRedirectTarget(alloc, current_url, location);
             errdefer alloc.free(next_url);
-            var discarded: u64 = 0;
-            var buffer: [16 * 1024]u8 = undefined;
-            while (true) {
-                const room = max_redirect_body_bytes + 1 - discarded;
-                const n = try response.read(buffer[0..@min(room, buffer.len)]);
-                if (n == 0) break;
-                discarded += n;
-                if (discarded > max_redirect_body_bytes) return error.HttpResponseTooLarge;
-            }
+            try response.discardBody(alloc, max_redirect_body_bytes);
             alloc.free(current_url);
             current_url = next_url;
             redirect_count += 1;
@@ -2313,8 +2402,8 @@ fn extractAndVerifyPortableZip(
     errdefer portable_apply.cleanupUpdatePath(partial_root) catch {};
     try std.fs.cwd().makePath(partial_root);
 
-    // `std.zip.extract` creates every entry relative to this handle, so the
-    // archive cannot escape it. The handle itself is still resolved by
+    // `extractPortableZip` creates every entry relative to this handle, so
+    // the archive cannot escape it. The handle itself is still resolved by
     // pathname, so confirm it is the directory we asked for before anything
     // is written through it: a junction planted at `payload.partial` between
     // the makePath and this open would otherwise redirect the whole payload.
@@ -2324,14 +2413,7 @@ fn extractAndVerifyPortableZip(
     if (!try lockedHandleMatchesPath(alloc, partial_root, destination.fd)) {
         return error.InvalidPortableUpdatePath;
     }
-    var zip_file = try std.fs.openFileAbsolute(zip_path, .{});
-    defer zip_file.close();
-    var reader_buffer: [64 * 1024]u8 = undefined;
-    var zip_reader = zip_file.reader(&reader_buffer);
-    var diagnostics: std.zip.Diagnostics = .{ .allocator = alloc };
-    defer diagnostics.deinit();
-    try std.zip.extract(destination, &zip_reader, .{ .diagnostics = &diagnostics });
-    if (!std.mem.eql(u8, diagnostics.root_dir, "noctty")) return error.InvalidPortableArchiveRoot;
+    try extractPortableZip(alloc, destination, zip_path);
     destination.close();
     destination_open = false;
 
@@ -2393,6 +2475,135 @@ fn validatePortableZipEntries(alloc: Allocator, zip_path: []const u8) !void {
             return error.DuplicatePortableArchiveEntry;
         }
     }
+}
+
+/// Extract a ZIP that `validatePortableZipEntries` accepted into
+/// `destination`, creating every entry relative to that handle.
+///
+/// This replaces `std.zip.extract`, which inflates with Zig 0.15.2's
+/// std.compress.flate: a fixed-Huffman match that crosses the end of its
+/// 64 KiB window reaches `unreachable` there, a segfault in ReleaseFast
+/// (#570, ziglang/zig#24963), and for any malformed deflate entry it unwraps
+/// the file reader's null error (`stream.err.?`). The checks below are
+/// std's; the inflater is WUFFS. Unlike std, a file's decoded size and CRC-32
+/// must match its central directory record, and a directory's recorded ones
+/// must be 0 (its stored bytes are not decoded, as in std).
+fn extractPortableZip(alloc: Allocator, destination: std.fs.Dir, zip_path: []const u8) !void {
+    var zip_file = try std.fs.openFileAbsolute(zip_path, .{});
+    defer zip_file.close();
+    var reader_buffer: [64 * 1024]u8 = undefined;
+    var zip_reader = zip_file.reader(&reader_buffer);
+    // A local extra area (at most 64 KiB) first, then the output file's,
+    // the CRC's and the entry data's buffers.
+    const buffers = try alloc.alloc(u8, 96 * 1024);
+    defer alloc.free(buffers);
+    var iterator = std.zip.Iterator.init(&zip_reader) catch return error.InvalidPortableArchive;
+    var diagnostics: std.zip.Diagnostics = .{ .allocator = alloc };
+    defer diagnostics.deinit();
+    var name_buffer: [max_portable_name_bytes]u8 = undefined;
+    while (iterator.next() catch return error.InvalidPortableArchive) |entry| {
+        const name = try extractPortableZipEntry(alloc, &zip_reader, entry, &name_buffer, destination, buffers);
+        try diagnostics.nextFilename(name);
+    }
+    if (!std.mem.eql(u8, diagnostics.root_dir, "noctty")) return error.InvalidPortableArchiveRoot;
+}
+
+fn extractPortableZipEntry(
+    alloc: Allocator,
+    zip_reader: *std.fs.File.Reader,
+    entry: std.zip.Iterator.Entry,
+    name_buffer: *[max_portable_name_bytes]u8,
+    destination: std.fs.Dir,
+    buffers: []u8,
+) ![]const u8 {
+    if (entry.filename_len == 0 or entry.filename_len > max_portable_name_bytes) {
+        return error.UnsafePortableArchiveEntry;
+    }
+    const name = name_buffer[0..entry.filename_len];
+    try zip_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+    try zip_reader.interface.readSliceAll(name);
+    // Validation read the same name; check it again where it is used. This
+    // also covers std's backslash, absolute and `..` refusals.
+    if (!portable_apply.isSafeZipEntryPath(name)) return error.UnsafePortableArchiveEntry;
+    switch (entry.compression_method) {
+        .store, .deflate => {},
+        else => return error.UnsupportedPortableArchive,
+    }
+
+    // The local header has to agree with the central directory. A zip64
+    // local header (sizes of 0xFFFFFFFF) is refused rather than parsed: no
+    // entry may exceed max_portable_entry_bytes anyway.
+    try zip_reader.seekTo(entry.file_offset);
+    const local = try zip_reader.interface.takeStruct(std.zip.LocalFileHeader, .little);
+    if (!std.mem.eql(u8, &local.signature, &std.zip.local_file_header_sig) or
+        local.version_needed_to_extract != entry.version_needed_to_extract or
+        local.last_modification_time != entry.last_modification_time or
+        local.last_modification_date != entry.last_modification_date or
+        @as(u16, @bitCast(local.flags)) != @as(u16, @bitCast(entry.flags)) or
+        local.compression_method != entry.compression_method or
+        (local.crc32 != 0 and local.crc32 != entry.crc32) or
+        (local.compressed_size != 0 and local.compressed_size != entry.compressed_size) or
+        (local.uncompressed_size != 0 and local.uncompressed_size != entry.uncompressed_size) or
+        local.filename_len != entry.filename_len)
+    {
+        return error.InvalidPortableArchive;
+    }
+    // As in std, the whole declared local extra area must be in the file,
+    // and each field must fit inside it; a tail too short for a field is
+    // ignored. Field contents are not needed, since zip64 sizes are refused
+    // above. Read the area rather than discard it: in Zig 0.15.2 a
+    // positional File.Reader's discard returns 0 at the end of the file, and
+    // discardAll then loops forever.
+    const extra = buffers[0..local.extra_len];
+    try zip_reader.seekTo(entry.file_offset + @sizeOf(std.zip.LocalFileHeader) + local.filename_len);
+    try zip_reader.interface.readSliceAll(extra);
+    var extra_offset: usize = 0;
+    while (extra_offset + 4 <= extra.len) {
+        extra_offset += 4 + std.mem.readInt(u16, extra[extra_offset + 2 ..][0..2], .little);
+        if (extra_offset > extra.len) return error.InvalidPortableArchive;
+    }
+
+    if (name[name.len - 1] == '/') {
+        if (entry.uncompressed_size != 0) return error.InvalidPortableArchive;
+        // An empty entry's CRC-32 is 0.
+        if (entry.crc32 != 0) return error.PortableArchiveChecksumMismatch;
+        try destination.makePath(name[0 .. name.len - 1]);
+        return name;
+    }
+    var parent = try destination.makeOpenPath(std.fs.path.dirname(name).?, .{});
+    defer parent.close();
+    const file = try parent.createFile(std.fs.path.basename(name), .{ .exclusive = true });
+    defer file.close();
+    var file_writer = file.writer(buffers[0 .. 64 * 1024]);
+    var crc = file_writer.interface.hashed(std.hash.Crc32.init(), buffers[64 * 1024 ..][0 .. 16 * 1024]);
+    try zip_reader.seekTo(entry.file_offset + @sizeOf(std.zip.LocalFileHeader) + local.filename_len + local.extra_len);
+    switch (entry.compression_method) {
+        .store => {
+            if (entry.compressed_size != entry.uncompressed_size) return error.InvalidPortableArchive;
+            zip_reader.interface.streamExact64(&crc.writer, entry.uncompressed_size) catch |err| switch (err) {
+                error.ReadFailed => return zip_reader.err orelse err,
+                error.WriteFailed => return file_writer.err orelse err,
+                error.EndOfStream => return error.InvalidPortableArchive,
+            };
+        },
+        .deflate => {
+            // Bounded by the entry's compressed size: unlike std, inflate
+            // cannot read on into the next entry or the central directory.
+            var data = zip_reader.interface.limited(.limited64(entry.compressed_size), buffers[80 * 1024 ..]);
+            const len = wuffs.deflate.decompress(alloc, &data.interface, &crc.writer, entry.uncompressed_size) catch |err| switch (err) {
+                error.ReadFailed => return zip_reader.err orelse err,
+                error.WriteFailed => return file_writer.err orelse err,
+                error.WuffsError, error.Overflow => return error.InvalidPortableArchive,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            if (len != entry.uncompressed_size) return error.InvalidPortableArchive;
+        },
+        else => unreachable, // Refused before the local header was read.
+    }
+    crc.writer.flush() catch return file_writer.err orelse error.WriteFailed;
+    if (crc.hasher.final() != entry.crc32) return error.PortableArchiveChecksumMismatch;
+    try file_writer.end();
+    return name;
 }
 
 fn verifyPortablePayloadManifest(path: []const u8) !void {
@@ -3470,31 +3681,6 @@ test "update release feed resolution" {
     }
 }
 
-test "bounded response streaming refuses an oversized body" {
-    const alloc = std.testing.allocator;
-    const body = "0123456789";
-
-    // Exactly at the cap is accepted.
-    {
-        var reader: std.Io.Reader = .fixed(body);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try streamBounded(&reader, &out.writer, body.len);
-        try std.testing.expectEqualStrings(body, out.written());
-    }
-
-    // One byte over the cap is refused.
-    {
-        var reader: std.Io.Reader = .fixed(body);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try std.testing.expectError(
-            error.HttpResponseTooLarge,
-            streamBounded(&reader, &out.writer, body.len - 1),
-        );
-    }
-}
-
 test "update installer version must meet the claimed release version" {
     const claimed = try std.SemanticVersion.parse("1.3.100");
     try std.testing.expect(installerVersionAtLeastClaim(.{
@@ -3939,6 +4125,140 @@ test "a start while Setup is still running leaves the request for a later start"
     try std.testing.expect(std.mem.indexOf(u8, message, "did not finish installing") != null);
 }
 
+test "a staged installer reads as running only while a process runs from it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+
+    // No stage directory.
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    const name = "noctty-1.3.200-windows-x64-setup.exe";
+    try tmp.dir.makePath("updates/1.3.200/backup");
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/" ++ name, .data = "setup" });
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/noctty-1.3.200-windows-x64-portable.zip", .data = "zip" });
+    try tmp.dir.writeFile(.{ .sub_path = "updates/1.3.200/backup/noctty.exe", .data = "old" });
+    const installer_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.200", name });
+    defer alloc.free(installer_path);
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    // The updater's own verification open (shared reads only), held by any
+    // noctty's update check while it hashes and checks the signature, refuses
+    // write access as a running image does. No process runs from the file,
+    // so it is not an Install, and an external upgrade's restart stays.
+    inline for (.{ name, "noctty-1.3.200-windows-x64-portable.zip", "backup\\noctty.exe" }) |other| {
+        const other_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.200", other });
+        defer alloc.free(other_path);
+        var held = try openLockedInstaller(other_path);
+        defer held.close();
+        try std.testing.expect(installerImageInUse(other_path));
+        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+    }
+
+    // Nor is a read-only leftover.
+    {
+        var file = try std.fs.openFileAbsolute(installer_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_READONLY } });
+        defer file.setPermissions(.{ .inner = .{ .attributes = std.os.windows.FILE_ATTRIBUTE_NORMAL } }) catch {};
+        try std.testing.expect(installerImageInUse(installer_path));
+        try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+    }
+
+    // A running process is: this test runner, whose image sits at
+    // <dir>\<subdir>\<name>.exe, the shape of updates\<version>\setup.exe.
+    // Its attributes and the state record play no part.
+    const self_exe = try std.fs.selfExePathAlloc(alloc);
+    defer alloc.free(self_exe);
+    const self_dir = std.fs.path.dirname(self_exe).?;
+    try std.testing.expect(processRunsFromStage(alloc, std.fs.path.dirname(self_dir).?));
+    // One level off is not.
+    try std.testing.expect(!processRunsFromStage(alloc, self_dir));
+}
+
+test "a running staged Setup stays found after another feed's check drops the staged record" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const state_path = try std.fs.path.join(alloc, &.{ root, "update-state.json" });
+    defer alloc.free(state_path);
+    try tmp.dir.makePath("updates/1.3.200");
+    const setup_path = try std.fs.path.join(alloc, &.{ root, "updates", "1.3.200", "noctty-1.3.200-windows-x64-setup.exe" });
+    defer alloc.free(setup_path);
+    // The stand-in Setup: a copy of ping.exe, started with no console window.
+    const system_root = try std.process.getEnvVarOwned(alloc, "SystemRoot");
+    defer alloc.free(system_root);
+    const ping = try std.fs.path.join(alloc, &.{ system_root, "System32", "PING.EXE" });
+    defer alloc.free(ping);
+    try std.fs.copyFileAbsolute(ping, setup_path, .{});
+
+    var state: State = .{
+        .release_feed_url = try alloc.dupe(u8, "https://updates.example/feed-a"),
+        .staged_version = try alloc.dupe(u8, "1.3.200"),
+        .staged_kind = .installer,
+        .staged_installer_path = try alloc.dupe(u8, setup_path),
+        .staged_sha256 = try alloc.dupe(u8, "00"),
+        .staged_feed_url = try alloc.dupe(u8, "https://updates.example/feed-a"),
+    };
+    defer state.deinit(alloc);
+    try saveState(state_path, &state);
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+
+    var setup = std.process.Child.init(&.{ setup_path, "-n", "60", "127.0.0.1" }, alloc);
+    setup.stdin_behavior = .Ignore;
+    setup.stdout_behavior = .Ignore;
+    setup.stderr_behavior = .Ignore;
+    setup.create_no_window = true;
+    try setup.spawn();
+    var running = true;
+    defer if (running) {
+        _ = setup.kill() catch {};
+    };
+    try std.testing.expect(stagedInstallerRunning(alloc, state_path));
+
+    // An update check from another noctty with another feed drops the staged
+    // record; it cannot delete the running image, and Setup still runs.
+    try std.testing.expect(try invalidateForeignFeedState(alloc, state_path, &state, "https://updates.example/feed-b"));
+    {
+        var loaded = try loadState(alloc, state_path);
+        defer loaded.deinit(alloc);
+        try std.testing.expect(loaded.staged_kind == null);
+        try std.testing.expect(loaded.staged_installer_path == null);
+    }
+    try std.fs.accessAbsolute(setup_path, .{});
+    try std.testing.expect(stagedInstallerRunning(alloc, state_path));
+
+    _ = try setup.kill();
+    running = false;
+    try std.testing.expect(!stagedInstallerRunning(alloc, state_path));
+}
+
+test "a staged installer image is an exe directly inside a version directory" {
+    @setEvalBranchQuota(10_000);
+    const w = std.unicode.utf8ToUtf16LeStringLiteral;
+    const updates = w("C:\\L\\noctty\\updates");
+    try std.testing.expect(isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\setup.exe")));
+    try std.testing.expect(isStagedImage(updates, w("c:\\l\\NOCTTY\\UPDATES\\1.3.200\\SETUP.EXE")));
+    try std.testing.expect(isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\helper.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\payload\\noctty\\a.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\backup\\noctty.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\setup.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\\\setup.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\setup.zip")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates\\1.3.200\\.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\noctty\\updates-old\\1\\setup.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\L\\Temp\\WinGet\\setup.exe")));
+    try std.testing.expect(!isStagedImage(updates, w("C:\\Program Files\\noctty\\noctty.exe")));
+}
+
 test "a start leaves a portable apply request to the portable recovery" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4029,6 +4349,259 @@ test "portable update ZIP preflight binds EOCD to archive end" {
         error.InvalidPortableArchive,
         validatePortableZipEntries(alloc, trailing_path),
     );
+}
+
+const TestZipEntry = struct {
+    name: []const u8,
+    method: std.zip.CompressionMethod = .store,
+    /// What the archive holds for the entry: raw DEFLATE for `.deflate`.
+    data: []const u8,
+    /// What the entry decodes to; the CRC-32 and sizes derive from it and
+    /// `data` unless overridden below.
+    contents: []const u8,
+    crc32: ?u32 = null,
+    compressed_size: ?u32 = null,
+    /// The local header's extra area; the central directory record has none.
+    local_extra: []const u8 = "",
+};
+
+fn testZipLocalHeader(entry: TestZipEntry) std.zip.LocalFileHeader {
+    return .{
+        .signature = std.zip.local_file_header_sig,
+        .version_needed_to_extract = 20,
+        .flags = @bitCast(@as(u16, 0)),
+        .compression_method = entry.method,
+        .last_modification_time = 0,
+        .last_modification_date = 0x21, // 1980-01-01
+        .crc32 = entry.crc32 orelse std.hash.Crc32.hash(entry.contents),
+        .compressed_size = entry.compressed_size orelse @intCast(entry.data.len),
+        .uncompressed_size = @intCast(entry.contents.len),
+        .filename_len = @intCast(entry.name.len),
+        .extra_len = @intCast(entry.local_extra.len),
+    };
+}
+
+fn writeTestPortableZip(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8, entries: []const TestZipEntry) !void {
+    var zip: std.Io.Writer.Allocating = .init(alloc);
+    defer zip.deinit();
+    const offsets = try alloc.alloc(u32, entries.len);
+    defer alloc.free(offsets);
+    for (entries, offsets) |entry, *offset| {
+        offset.* = @intCast(zip.written().len);
+        try zip.writer.writeStruct(testZipLocalHeader(entry), .little);
+        try zip.writer.writeAll(entry.name);
+        try zip.writer.writeAll(entry.local_extra);
+        try zip.writer.writeAll(entry.data);
+    }
+    const directory_offset = zip.written().len;
+    for (entries, offsets) |entry, offset| {
+        try zip.writer.writeStruct(testZipCentralHeader(testZipLocalHeader(entry), offset), .little);
+        try zip.writer.writeAll(entry.name);
+    }
+    try zip.writer.writeStruct(testZipEndRecord(entries.len, directory_offset, zip.written().len - directory_offset, 0), .little);
+    try dir.writeFile(.{ .sub_path = sub_path, .data = zip.written() });
+}
+
+fn testZipCentralHeader(local: std.zip.LocalFileHeader, local_offset: usize) std.zip.CentralDirectoryFileHeader {
+    return .{
+        .signature = std.zip.central_file_header_sig,
+        .version_made_by = 20,
+        .version_needed_to_extract = local.version_needed_to_extract,
+        .flags = local.flags,
+        .compression_method = local.compression_method,
+        .last_modification_time = local.last_modification_time,
+        .last_modification_date = local.last_modification_date,
+        .crc32 = local.crc32,
+        .compressed_size = local.compressed_size,
+        .uncompressed_size = local.uncompressed_size,
+        .filename_len = local.filename_len,
+        .extra_len = 0,
+        .comment_len = 0,
+        .disk_number = 0,
+        .internal_file_attributes = 0,
+        .external_file_attributes = 0,
+        .local_file_header_offset = @intCast(local_offset),
+    };
+}
+
+fn testZipEndRecord(count: usize, directory_offset: usize, directory_len: usize, comment_len: usize) std.zip.EndRecord {
+    return .{
+        .signature = std.zip.end_record_sig,
+        .disk_number = 0,
+        .central_directory_disk_number = 0,
+        .record_count_disk = @intCast(count),
+        .record_count_total = @intCast(count),
+        .central_directory_size = @intCast(directory_len),
+        .central_directory_offset = @intCast(directory_offset),
+        .comment_len = @intCast(comment_len),
+    };
+}
+
+/// Validate and extract `sub_path` into a fresh `out` directory beside it.
+fn extractTestPortableZip(alloc: Allocator, dir: std.fs.Dir, sub_path: []const u8) !std.fs.Dir {
+    const zip_path = try dir.realpathAlloc(alloc, sub_path);
+    defer alloc.free(zip_path);
+    try validatePortableZipEntries(alloc, zip_path);
+    try dir.deleteTree("out");
+    try dir.makeDir("out");
+    var out = try dir.openDir("out", .{});
+    errdefer out.close();
+    try extractPortableZip(alloc, out, zip_path);
+    return out;
+}
+
+/// #609's fixture: a 160x120 RGBA frame (76,800 bytes) compressed by zlib
+/// 1.3.1 with `Z_FIXED`, so every block uses the fixed Huffman code and its
+/// matches cross std.compress.flate's 64 KiB window. The raw DEFLATE stream a
+/// ZIP holds sits between the 2-byte zlib header and the Adler-32 trailer.
+const fixed_huffman_zlib = @embedFile("../terminal/kitty/testdata/image-rgba-zlib_deflate_fixed-160x120-raw.data");
+const fixed_huffman_deflate = fixed_huffman_zlib[2 .. fixed_huffman_zlib.len - 4];
+
+test "portable update ZIP extraction inflates fixed Huffman blocks past 64 KiB (#570)" {
+    const alloc = std.testing.allocator;
+    // The zlib decoder checks the encoder's Adler-32, so these are the bytes
+    // zlib compressed.
+    const frame = try wuffs.zlib.decompress(alloc, fixed_huffman_zlib, 1 << 20, null);
+    defer alloc.free(frame);
+    try std.testing.expectEqual(@as(usize, 160 * 120 * 4), frame.len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPortableZip(alloc, tmp.dir, "fixed.zip", &.{
+        .{ .name = "noctty/", .data = "", .contents = "" },
+        .{ .name = "noctty/themes/fixed", .method = .deflate, .data = fixed_huffman_deflate, .contents = frame },
+        .{ .name = "noctty/LICENSE", .data = "stored", .contents = "stored" },
+    });
+    var out = try extractTestPortableZip(alloc, tmp.dir, "fixed.zip");
+    defer out.close();
+    const inflated = try out.readFileAlloc(alloc, "noctty/themes/fixed", 1 << 20);
+    defer alloc.free(inflated);
+    try std.testing.expectEqualSlices(u8, frame, inflated);
+    const stored = try out.readFileAlloc(alloc, "noctty/LICENSE", 64);
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("stored", stored);
+}
+
+test "portable update ZIP inflate decodes across short compressed reads" {
+    // Extraction reads entry data through a 16 KiB `limited` buffer, which
+    // holds this whole fixture at once. Smaller buffers make the decoder
+    // suspend for input mid-stream, around the same 64 KiB output flushes.
+    const alloc = std.testing.allocator;
+    const frame = try wuffs.zlib.decompress(alloc, fixed_huffman_zlib, 1 << 20, null);
+    defer alloc.free(frame);
+    for ([_]usize{ 1, 7, 4096 }) |buffer_len| {
+        const buffer = try alloc.alloc(u8, buffer_len);
+        defer alloc.free(buffer);
+        var input: std.Io.Reader = .fixed(fixed_huffman_deflate);
+        var data = input.limited(.unlimited, buffer);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(u64, frame.len), try wuffs.deflate.decompress(alloc, &data.interface, &out.writer, frame.len));
+        try std.testing.expectEqualSlices(u8, frame, out.written());
+    }
+}
+
+test "portable update ZIP extraction checks each entry's CRC-32 and sizes" {
+    const alloc = std.testing.allocator;
+    // Raw DEFLATE, one fixed Huffman block too short to cross std's window.
+    const hello = "hello, wuffs deflate";
+    const hello_deflate = "\xcb\x48\xcd\xc9\xc9\xd7\x51\x28\x2f\x4d\x4b\x2b\x56\x48\x49\x4d\xcb\x49\x2c\x49\x05\x00";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // std.zip.extract wrote every one of these without an error.
+    for ([_]struct { entry: TestZipEntry, err: anyerror }{
+        .{ .entry = .{ .name = "noctty/stored", .data = hello, .contents = hello, .crc32 = 0x12345678 }, .err = error.PortableArchiveChecksumMismatch },
+        .{ .entry = .{ .name = "noctty/inflated", .method = .deflate, .data = hello_deflate, .contents = hello, .crc32 = 0x12345678 }, .err = error.PortableArchiveChecksumMismatch },
+        .{ .entry = .{ .name = "noctty/directory/", .data = "", .contents = "", .crc32 = 0x12345678 }, .err = error.PortableArchiveChecksumMismatch },
+        // Decodes past its declared size: std stopped there and kept the rest out.
+        .{ .entry = .{ .name = "noctty/longer", .method = .deflate, .data = hello_deflate, .contents = hello[0 .. hello.len - 1] }, .err = error.InvalidPortableArchive },
+        // Ends past its compressed size: std read on into the next record.
+        .{ .entry = .{ .name = "noctty/overrun", .method = .deflate, .data = hello_deflate, .contents = hello, .compressed_size = hello_deflate.len - 3 }, .err = error.InvalidPortableArchive },
+    }) |case| {
+        try writeTestPortableZip(alloc, tmp.dir, "case.zip", &.{case.entry});
+        try std.testing.expectError(case.err, extractTestPortableZip(alloc, tmp.dir, "case.zip"));
+    }
+}
+
+test "portable update ZIP extraction refuses a local extra field that runs past its area" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An extended-timestamp field (ID 0x5455) with its five data bytes, then
+    // three stray bytes, which std also ignored.
+    const framed = "\x55\x54\x05\x00\x01\x00\x00\x00\x00" ++ "\x00\x00\x00";
+    try writeTestPortableZip(alloc, tmp.dir, "framed.zip", &.{
+        .{ .name = "noctty/framed", .data = "framed", .contents = "framed", .local_extra = framed },
+    });
+    var out = try extractTestPortableZip(alloc, tmp.dir, "framed.zip");
+    out.close();
+    // The same field claiming eight data bytes overruns the nine-byte area.
+    try writeTestPortableZip(alloc, tmp.dir, "overrun.zip", &.{
+        .{ .name = "noctty/overrun", .data = "overrun", .contents = "overrun", .local_extra = "\x55\x54\x08\x00\x01\x00\x00\x00\x00" },
+    });
+    try std.testing.expectError(error.InvalidPortableArchive, extractTestPortableZip(alloc, tmp.dir, "overrun.zip"));
+}
+
+test "portable update ZIP extraction refuses a local header cut off by the end of the archive" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // std read the whole declared extra area before ignoring a tail too
+    // short to be a field, so an area past the end of the file failed. Here
+    // the central directory comes first and the end record's comment holds
+    // a directory's local header, which declares three extra bytes the file
+    // does not have; in the second case its name is cut short too, where
+    // skipping it with discardAll looped forever.
+    const entry: TestZipEntry = .{ .name = "noctty/directory/", .data = "", .contents = "" };
+    var local = testZipLocalHeader(entry);
+    local.extra_len = 3;
+    const directory_len = @sizeOf(std.zip.CentralDirectoryFileHeader) + entry.name.len;
+    for ([_][]const u8{ entry.name, entry.name[0..5] }) |name_left| {
+        var zip: std.Io.Writer.Allocating = .init(alloc);
+        defer zip.deinit();
+        try zip.writer.writeStruct(testZipCentralHeader(local, directory_len + @sizeOf(std.zip.EndRecord)), .little);
+        try zip.writer.writeAll(entry.name);
+        try zip.writer.writeStruct(testZipEndRecord(1, 0, directory_len, @sizeOf(std.zip.LocalFileHeader) + name_left.len), .little);
+        try zip.writer.writeStruct(local, .little);
+        try zip.writer.writeAll(name_left);
+        try tmp.dir.writeFile(.{ .sub_path = "cut.zip", .data = zip.written() });
+        try std.testing.expectError(error.EndOfStream, extractTestPortableZip(alloc, tmp.dir, "cut.zip"));
+    }
+}
+
+test "portable update ZIP extraction fails cleanly on corrupt deflate data" {
+    const alloc = std.testing.allocator;
+    const frame = try wuffs.zlib.decompress(alloc, fixed_huffman_zlib, 1 << 20, null);
+    defer alloc.free(frame);
+    const data = try alloc.alloc(u8, fixed_huffman_deflate.len);
+    defer alloc.free(data);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prng = std.Random.DefaultPrng.init(570);
+    const random = prng.random();
+    // Byte flips and truncations: each must end in a clean error or, where
+    // a flip happens to keep the stream, the exact frame the CRC-32 names.
+    for (0..100) |i| {
+        @memcpy(data, fixed_huffman_deflate);
+        var len = data.len;
+        if (i % 4 == 0) {
+            len = random.intRangeLessThan(usize, data.len / 2, data.len);
+        } else for (0..random.intRangeAtMost(usize, 1, 4)) |_| {
+            data[random.uintLessThan(usize, data.len)] ^= random.int(u8) | 1;
+        }
+        try writeTestPortableZip(alloc, tmp.dir, "fuzz.zip", &.{
+            .{ .name = "noctty/fuzz", .method = .deflate, .data = data[0..len], .contents = frame },
+        });
+        if (extractTestPortableZip(alloc, tmp.dir, "fuzz.zip")) |out_dir| {
+            var out = out_dir;
+            defer out.close();
+            const inflated = try out.readFileAlloc(alloc, "noctty/fuzz", 1 << 20);
+            defer alloc.free(inflated);
+            try std.testing.expectEqualSlices(u8, frame, inflated);
+        } else |err| switch (err) {
+            error.InvalidPortableArchive, error.PortableArchiveChecksumMismatch => {},
+            else => return err,
+        }
+    }
 }
 
 test "portable update serializes helper launch handoff" {

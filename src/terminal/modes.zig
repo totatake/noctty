@@ -52,6 +52,16 @@ pub const ModeState = struct {
         }
     }
 
+    /// Get the value a mode is reset to.
+    pub fn getDefault(self: *const ModeState, mode: Mode) bool {
+        switch (mode) {
+            inline else => |mode_comptime| {
+                const entry = comptime entryForMode(mode_comptime);
+                return @field(self.default, entry.name);
+            },
+        }
+    }
+
     /// Save the state of the given mode. This can then be restored
     /// with restore. This will only be accurate if the previous
     /// mode was saved exactly once and not restored. Otherwise this
@@ -77,8 +87,44 @@ pub const ModeState = struct {
     }
 
     /// Return a DECRPM report for the given mode tag. If the tag does
-    /// not correspond to a known mode, the report state is .not_recognized.
-    pub fn getReport(self: *const ModeState, tag: ModeTag) Report {
+    /// not correspond to a known mode, the report state is .not_recognized,
+    /// except for the permanently-reset modes below.
+    pub fn getReport(self: *const ModeState, tag: Report.Tag) Report {
+        // DECECM (Erase Color Mode, DEC private mode 117) controls whether erasing
+        // and scrolling use the default background or the active background color.
+        // Ghostty's behavior is fixed equivalent to DECECM reset, and DECRQM has a
+        // "permanently reset" response for recognized modes that cannot be changed.
+        // Report that instead of "not recognized" so applications can query and adapt
+        // to Ghostty's erase-color behavior.
+        //
+        // See VT520/VT525 Programmer Information, "Erase Color" and DECRQM/DECRPM:
+        // https://web.mit.edu/dosathena/doc/www/ek-vt520-rm.pdf
+
+        if (!tag.ansi and tag.value == 117) {
+            return .{ .tag = tag, .state = .permanently_reset };
+        }
+
+        // These unimplemented ANSI modes report fixed reset, matching
+        // xterm: GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM,
+        // TSM, EBM. Report permanently_reset instead of not_recognized so
+        // DECRQM callers hear "unsupported" rather than "unknown".
+        if (tag.ansi) {
+            switch (tag.value) {
+                inline 1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 => |v| {
+                    comptime for (entries) |entry| {
+                        if (entry.ansi and entry.value == v) @compileError(
+                            std.fmt.comptimePrint(
+                                "ANSI mode {} is in the mode table and " ++
+                                    "must not be reported as permanently reset",
+                                .{v},
+                            ),
+                        );
+                    };
+                    return .{ .tag = tag, .state = .permanently_reset };
+                },
+                else => {},
+            }
+        }
         const mode = modeFromInt(tag.value, tag.ansi) orelse return .{
             .tag = tag,
             .state = .not_recognized,
@@ -176,14 +222,27 @@ pub fn modeFromInt(v: u16, ansi: bool) ?Mode {
 
 /// A DECRPM mode report response.
 pub const Report = struct {
-    tag: ModeTag,
+    tag: Tag,
     state: State,
+
+    /// A query identifier can use the full parser parameter range. Keep it
+    /// separate from ModeTag, which packs supported modes and the ANSI flag
+    /// into a u16 and is also used by the public C API.
+    pub const Tag = struct {
+        value: u16,
+        ansi: bool = false,
+
+        pub fn fromMode(mode: Mode) Tag {
+            const tag = ModeTag.fromMode(mode);
+            return .{ .value = tag.value, .ansi = tag.ansi };
+        }
+    };
 
     pub const max_size = max_size: {
         // Construct the largest possible report in terms of values.
         const report: Report = .{
             .tag = .{
-                .value = std.math.maxInt(u15),
+                .value = std.math.maxInt(u16),
                 .ansi = false,
             },
             .state = .permanently_reset,
@@ -270,6 +329,11 @@ const entries: []const ModeEntry = &.{
     .{ .name = "reverse_wrap", .value = 45 },
     .{ .name = "alt_screen_legacy", .value = 47 },
     .{ .name = "keypad_keys", .value = 66 },
+    // DEC Backarrow Key Mode (DECBKM)
+    // See https://vt100.net/dec/ek-vt3xx-tp-002.pdf page 170
+    // If `false` (the default), `backspace` emits 0x7f
+    // If `true`, `backspace` emits 0x08
+    .{ .name = "backarrow_key_mode", .value = 67 },
     .{ .name = "enable_left_and_right_margin", .value = 69 },
     .{ .name = "mouse_event_normal", .value = 1000 },
     .{ .name = "mouse_event_button", .value = 1002 },
@@ -349,6 +413,31 @@ test "getReport known ANSI mode" {
     try testing.expectEqual(true, report.tag.ansi);
 }
 
+test "getReport DECECM permanently reset" {
+    const state: ModeState = .{};
+    const report = state.getReport(.{ .value = 117, .ansi = false });
+    try testing.expectEqual(Report.State.permanently_reset, report.state);
+    try testing.expectEqual(false, report.tag.ansi);
+}
+
+test "getReport unsupported ANSI modes permanently reset" {
+    const state: ModeState = .{};
+    // GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM, TSM, EBM.
+    for ([_]u16{ 1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 }) |value| {
+        // None of these may gain a settable mode table entry without
+        // leaving this list first.
+        try testing.expect(modeFromInt(value, true) == null);
+        const report = state.getReport(.{ .value = value, .ansi = true });
+        try testing.expectEqual(Report.State.permanently_reset, report.state);
+        try testing.expectEqual(true, report.tag.ansi);
+        try testing.expectEqual(value, report.tag.value);
+    }
+
+    // An unlisted ANSI mode is still unknown, not permanently reset.
+    const unknown = state.getReport(.{ .value = 9, .ansi = true });
+    try testing.expectEqual(Report.State.not_recognized, unknown.state);
+}
+
 test "getReport unknown mode" {
     const state: ModeState = .{};
     const report = state.getReport(.{ .value = 9999 });
@@ -385,4 +474,26 @@ test "Report.encode not recognized" {
     const report: Report = .{ .tag = .{ .value = 9999, .ansi = false }, .state = .not_recognized };
     try report.encode(&writer);
     try testing.expectEqualStrings("\x1B[?9999;0$y", writer.buffered());
+}
+
+test "getReport large unknown modes" {
+    const state: ModeState = .{};
+    // These would alias ANSI insert mode and fixed-status DEC mode 117.
+    for ([_]Report.Tag{
+        .{ .value = 32772, .ansi = true },
+        .{ .value = 32885 },
+    }) |tag| {
+        const report = state.getReport(tag);
+        try testing.expectEqual(Report.State.not_recognized, report.state);
+        try testing.expectEqualDeep(tag, report.tag);
+    }
+}
+
+test "Report.encode maximum size" {
+    var buf: [Report.max_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const report: Report = .{ .tag = .{ .value = 65535 }, .state = .permanently_reset };
+    try report.encode(&writer);
+    try testing.expectEqualStrings("\x1b[?65535;4$y", writer.buffered());
+    try testing.expectEqual(buf.len, writer.buffered().len);
 }

@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 10
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-smoke.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Poll cadence while waiting for smoke-test output.
 $script:SMOKE_POLL_MS = 100
@@ -177,3 +182,7 @@ $stderrTail
 }
 
 Write-Host "interactive-win11 smoke test: PASS ($stderrPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

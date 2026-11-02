@@ -108,7 +108,7 @@ pub const Action = union(Key) {
     dcs_put: u8,
     dcs_unhook,
     apc_start,
-    apc_end,
+    apc_end: ApcEnd,
     apc_put: u8,
     end_hyperlink,
     active_status_display: ansi.StatusDisplay,
@@ -129,6 +129,7 @@ pub const Action = union(Key) {
     semantic_prompt: SemanticPrompt,
     program_status: ProgramStatus,
     mouse_shape_reset,
+    soft_reset,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -229,6 +230,7 @@ pub const Action = union(Key) {
             "semantic_prompt",
             "program_status",
             "mouse_shape_reset",
+            "soft_reset",
         },
     );
 
@@ -257,6 +259,21 @@ pub const Action = union(Key) {
         pub fn cval(self: Print) Print.C {
             return .{ .cp = @intCast(self.cp) };
         }
+    };
+
+    /// Sent when an APC string ends, for any reason.
+    ///
+    /// An APC is only complete when it ends with the string terminator,
+    /// either `ESC \` or the 8-bit 0x9C. A program can also stop an APC
+    /// partway through. CAN (0x18) or SUB (0x1A) cancels it, and any other
+    /// 8-bit control byte, such as CSI (0x9B), aborts it. ECMA-48 says a
+    /// string stopped this way must be thrown away, so a handler should
+    /// only act on the APC when `terminated` is true.
+    pub const ApcEnd = extern struct {
+        /// True when the string terminator ended the APC. False when the
+        /// APC was cancelled or aborted, in which case its contents
+        /// should be discarded.
+        terminated: bool,
     };
 
     pub const InvokeCharset = lib.Struct(lib.target, struct {
@@ -765,7 +782,9 @@ pub fn Stream(comptime H: type) type {
                     .dcs_unhook => self.handler.vt(.dcs_unhook, {}),
                     .apc_start => self.handler.vt(.apc_start, {}),
                     .apc_put => |code| self.handler.vt(.apc_put, code),
-                    .apc_end => self.handler.vt(.apc_end, {}),
+                    .apc_end => self.handler.vt(.apc_end, .{
+                        .terminated = c == std.ascii.control_code.esc or c == 0x9C,
+                    }),
                 }
             }
         }
@@ -804,7 +823,7 @@ pub fn Stream(comptime H: type) type {
 
                 // DLE through US (CAN and SUB included) do nothing here, and
                 // a binary dump is full of them, so they are not logged.
-                else => if (c < 0x10) log.warn("invalid C0 character, ignoring: 0x{x}", .{c}),
+                else => if (c < 0x10) logUnsupportedOnce("invalid C0 character, ignoring: 0x{x}", .{c}, c),
             }
         }
 
@@ -1322,7 +1341,11 @@ pub fn Stream(comptime H: type) type {
                     if (req) |r| {
                         self.handler.vt(.device_attributes, r);
                     } else {
-                        log.warn("invalid device attributes command: {f}", .{input});
+                        logUnsupportedOnce(
+                            "invalid device attributes command: {f}",
+                            .{input},
+                            if (input.params.len > 0) input.params[0] else 0,
+                        );
                         return;
                     }
                 },
@@ -1370,6 +1393,7 @@ pub fn Stream(comptime H: type) type {
                 'g' => switch (input.intermediates.len) {
                     0 => {
                         const mode: csi.TabClear = switch (input.params.len) {
+                            0 => .current,
                             1 => std.meta.intToEnum(csi.TabClear, input.params[0]) catch {
                                 log.warn("invalid tab clear mode: {}", .{input.params[0]});
                                 return;
@@ -1408,7 +1432,7 @@ pub fn Stream(comptime H: type) type {
                         if (modes.modeFromInt(mode_int, ansi_mode)) |mode| {
                             self.handler.vt(.set_mode, .{ .mode = mode });
                         } else {
-                            log.warn("unimplemented mode: {}", .{mode_int});
+                            logUnsupportedOnce("unimplemented mode: {}", .{mode_int}, mode_int);
                         }
                     }
                 },
@@ -1429,7 +1453,7 @@ pub fn Stream(comptime H: type) type {
                         if (modes.modeFromInt(mode_int, ansi_mode)) |mode| {
                             self.handler.vt(.reset_mode, .{ .mode = mode });
                         } else {
-                            log.warn("unimplemented mode: {}", .{mode_int});
+                            logUnsupportedOnce("unimplemented mode: {}", .{mode_int}, mode_int);
                         }
                     }
                 },
@@ -1498,9 +1522,10 @@ pub fn Stream(comptime H: type) type {
                                 self.handler.vt(.modify_key_format, format);
                             },
 
-                            else => log.warn(
+                            else => logUnsupportedOnce(
                                 "unknown CSI m with intermediate: {}",
                                 .{input.intermediates[0]},
+                                input.intermediates[0],
                             ),
                         },
 
@@ -1572,9 +1597,22 @@ pub fn Stream(comptime H: type) type {
                     }
                 },
 
-                // DECRQM - Request Mode
+                // DECRQM - Request Mode, DECSTR - Soft Terminal Reset
                 'p' => switch (input.intermediates.len) {
-                    2 => decrqm: {
+                    1, 2 => decrqm: {
+                        // DECSTR - Soft Terminal Reset
+                        if (input.intermediates.len == 1 and
+                            input.intermediates[0] == '!')
+                        {
+                            if (input.params.len != 0) {
+                                log.warn("invalid DECSTR command: {f}", .{input});
+                                break :decrqm;
+                            }
+
+                            self.handler.vt(.soft_reset, {});
+                            break :decrqm;
+                        }
+
                         const ansi_mode = ansi: {
                             switch (input.intermediates.len) {
                                 1 => if (input.intermediates[0] == '$') break :ansi true,
@@ -1809,10 +1847,17 @@ pub fn Stream(comptime H: type) type {
                                     .{input},
                                 ),
                                 18 => if (input.params.len == 1) {
-                                    // report screen size in characters
+                                    // report text area size in characters
                                     self.handler.vt(.size_report, .csi_18_t);
                                 } else log.warn(
                                     "ignoring CSI 18 t with extra parameters: {f}",
+                                    .{input},
+                                ),
+                                19 => if (input.params.len == 1) {
+                                    // report screen size in characters
+                                    self.handler.vt(.size_report, .csi_19_t);
+                                } else log.warn(
+                                    "ignoring CSI 19 t with extra parameters: {f}",
                                     .{input},
                                 ),
                                 21 => if (input.params.len == 1) {
@@ -1838,13 +1883,15 @@ pub fn Stream(comptime H: type) type {
                                         23 => self.handler.vt(.title_pop, index),
                                         else => @compileError("unreachable"),
                                     }
-                                } else log.warn(
+                                } else logUnsupportedOnce(
                                     "ignoring CSI 22/23 t with extra parameters: {f}",
                                     .{input},
+                                    input.params[0],
                                 ),
-                                else => log.warn(
+                                else => logUnsupportedOnce(
                                     "ignoring CSI t with unimplemented parameter: {f}",
                                     .{input},
+                                    input.params[0],
                                 ),
                             }
                         } else log.err(
@@ -2019,7 +2066,11 @@ pub fn Stream(comptime H: type) type {
 
                 .change_window_icon => |icon| {
                     @branchHint(.likely);
-                    log.info("OSC 1 (change icon) received and ignored icon={s}", .{icon});
+                    logUnsupportedOnce(
+                        "OSC 1 (change icon) received and ignored icon={s}",
+                        .{icon},
+                        0,
+                    );
                 },
 
                 .clipboard_contents => |clip| {
@@ -2221,7 +2272,11 @@ pub fn Stream(comptime H: type) type {
                         else => {}, // fall through
                     }
 
-                    log.warn("unimplemented ESC action: {f}", .{action});
+                    logUnsupportedOnce(
+                        "unimplemented ESC action: {f}",
+                        .{action},
+                        action.final,
+                    );
                 },
 
                 // IND - Index
@@ -2415,10 +2470,70 @@ pub fn Stream(comptime H: type) type {
                     @branchHint(.likely);
                 },
 
-                else => log.warn("unimplemented ESC action: {f}", .{action}),
+                else => logUnsupportedOnce(
+                    "unimplemented ESC action: {f}",
+                    .{action},
+                    action.final,
+                ),
             }
         }
     };
+}
+
+/// Logs an unsupported-input message at most once per distinct key
+/// per process.
+///
+/// These messages are emitted in response to input that the terminal
+/// application controls, so a misbehaving (or merely chatty) program
+/// can trigger the same message millions of times, e.g. by toggling
+/// an unimplemented mode on every frame. Each log call has a real
+/// throughput cost (formatting plus a blocking write per message)
+/// while adding no diagnostic value beyond the first occurrence.
+///
+/// The keys seen so far are tracked in a small fixed table (64 bytes)
+/// instantiated per (format, argument type) tuple, i.e. roughly per
+/// call site. Real streams only ever produce a handful of distinct
+/// unsupported values per site, so if the table ever fills, messages
+/// for further new values are suppressed as well: by that point the
+/// log already shows this class of problem and unbounded distinct
+/// values would flood it anyway.
+fn logUnsupportedOnce(
+    comptime format: []const u8,
+    args: anytype,
+    key: u16,
+) void {
+    // u32 slots so every u16 key is representable alongside an empty
+    // sentinel and so 32-bit targets (e.g. wasm32) have native
+    // atomics.
+    const empty = std.math.maxInt(u32);
+    const Static = struct {
+        var seen: [16]u32 = @splat(empty);
+    };
+
+    // The atomics make concurrent streams safe: slots are only ever
+    // claimed, never changed, so the scan can stop at the first empty
+    // slot. The worst case race is a benign duplicate message.
+    for (&Static.seen) |*slot| {
+        const cur = @atomicLoad(u32, slot, .acquire);
+        if (cur == key) return; // already logged
+        if (cur != empty) continue; // other key, keep scanning
+
+        // Empty slot: claim it for this key and log below.
+        const actual = @cmpxchgStrong(
+            u32,
+            slot,
+            empty,
+            key,
+            .acq_rel,
+            .acquire,
+        ) orelse break;
+
+        // Lost the race: suppress if it was to the same key, keep
+        // scanning otherwise.
+        if (actual == key) return;
+    } else return; // table full: suppress new values too
+
+    log.warn(format, args);
 }
 
 test Action {
@@ -2716,6 +2831,91 @@ test "stream: ansi set mode (SM) and reset mode (RM)" {
     s.handler.mode = null;
     s.nextSlice("\x1B[>5h");
     try testing.expect(s.handler.mode == null);
+}
+
+test "stream: DECRQM dispatch" {
+    const H = struct {
+        calls: usize = 0,
+        mode: ?modes.Mode = null,
+        raw: ?Action.RawMode = null,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            switch (action) {
+                .request_mode => {
+                    self.calls += 1;
+                    self.mode = value.mode;
+                },
+                .request_mode_unknown => {
+                    self.calls += 1;
+                    self.raw = value;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        mode: ?modes.Mode = null,
+        raw: ?Action.RawMode = null,
+    }{
+        .{ .input = "\x1b[4$p", .mode = .insert },
+        .{ .input = "\x1b[?4$p", .mode = .slow_scroll },
+        .{ .input = "\x1b[9999$p", .raw = .{ .mode = 9999, .ansi = true } },
+        .{ .input = "\x1b[?9999$p", .raw = .{ .mode = 9999, .ansi = false } },
+        .{ .input = "\x1b[4p" },
+        .{ .input = "\x1b[?4p" },
+        .{ .input = "\x1b[4!p" },
+        .{ .input = "\x1b[4 p" },
+        .{ .input = "\x1b[>4$p" },
+        .{ .input = "\x1b[?4!p" },
+        .{ .input = "\x1b[$p" },
+        .{ .input = "\x1b[?$p" },
+        .{ .input = "\x1b[4;20$p" },
+        .{ .input = "\x1b[?4;7$p" },
+        .{ .input = "\x1b[4:20$p" },
+    };
+    for (cases) |case| {
+        for (0..case.input.len + 1) |split| {
+            var s: Stream(H) = .init(.{});
+            s.nextSlice(case.input[0..split]);
+            if (split < case.input.len) try testing.expectEqual(0, s.handler.calls);
+            s.nextSlice(case.input[split..]);
+            try testing.expectEqual(@as(usize, if (case.mode != null or case.raw != null) 1 else 0), s.handler.calls);
+            try testing.expectEqual(case.mode, s.handler.mode);
+            try testing.expectEqualDeep(case.raw, s.handler.raw);
+        }
+    }
+}
+
+test "stream: DECSTR dispatch" {
+    const H = struct {
+        calls: usize = 0,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            _ = value;
+            switch (action) {
+                .soft_reset => self.calls += 1,
+                else => {},
+            }
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        calls: usize,
+    }{
+        .{ .input = "\x1b[!p", .calls = 1 },
+        .{ .input = "\x1b[1!p", .calls = 0 },
+        .{ .input = "\x1b[?!p", .calls = 0 },
+        .{ .input = "\x1b[$p", .calls = 0 },
+    };
+
+    for (cases) |case| {
+        var s: Stream(H) = .init(.{});
+        s.nextSlice(case.input);
+        try testing.expectEqual(case.calls, s.handler.calls);
+    }
 }
 
 test "stream: ansi set mode (SM) and reset mode (RM) with unknown value" {
@@ -3309,6 +3509,9 @@ test "stream: send report with CSI t" {
     s.nextSlice("\x1b[18t");
     try testing.expectEqual(csi.SizeReportStyle.csi_18_t, s.handler.style);
 
+    s.nextSlice("\x1b[19t");
+    try testing.expectEqual(csi.SizeReportStyle.csi_19_t, s.handler.style);
+
     s.nextSlice("\x1b[21t");
     try testing.expectEqual(csi.SizeReportStyle.csi_21_t, s.handler.style);
 }
@@ -3623,6 +3826,36 @@ test "stream: SGR with 17+ parameters for underline color" {
     // This tests the fix where param 17 was being dropped
     s.nextSlice("\x1b[4:3;38;2;51;51;51;48;2;170;170;170;58;2;255;97;136;0m");
     try testing.expect(s.handler.called);
+}
+
+test "stream: tab clear with no param clears the current stop" {
+    const H = struct {
+        action: ?Action.Tag = null,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = value;
+            switch (action) {
+                .tab_clear_current, .tab_clear_all => self.action = action,
+                else => {},
+            }
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    s.nextSlice("\x1b[g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_current), s.handler.action);
+
+    s.handler.action = null;
+    s.nextSlice("\x1b[0g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_current), s.handler.action);
+
+    s.handler.action = null;
+    s.nextSlice("\x1b[3g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_all), s.handler.action);
 }
 
 test "stream: tab clear with overflowing param" {

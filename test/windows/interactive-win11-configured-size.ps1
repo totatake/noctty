@@ -4,6 +4,11 @@ param(
     [int] $TimeoutSeconds = 15
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-configured-size.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 # Poll cadence while waiting for configured-size evidence.
 $script:CONFIGURED_SIZE_POLL_MS = 100
@@ -192,3 +197,7 @@ finally {
 }
 
 Write-Host "interactive-win11 configured-size validation: PASS (pty=${width}x${height}, dpi=$dpi, result=$resultPath, stderr=$stderrPath)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

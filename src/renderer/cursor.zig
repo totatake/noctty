@@ -44,9 +44,11 @@ pub fn style(
     // The cursor must be visible in the viewport to be rendered.
     if (state.cursor.viewport == null) return null;
 
-    // If we are in preedit, then we always show the block cursor. We do
-    // this even if the cursor is explicitly not visible because it shows
-    // an important editing state to the user.
+    // If we are in preedit, the cursor is shown even when it is explicitly
+    // not visible, because it shows an important editing state to the user.
+    // The style returned here is not what gets drawn: the generic renderer
+    // replaces the cursor with a steady bar at the IME caret and draws
+    // nothing when the input method reports no caret.
     if (opts.preedit) return .block;
 
     // If we're at a password input its always a lock.

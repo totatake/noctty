@@ -24,6 +24,19 @@ pub const Error = error{
     ValueRequired,
     InvalidField,
     InvalidValue,
+    /// A profile line (`profile-command`, `profile-env`, ...) that cannot
+    /// be used (`src/config/profile_map.zig` `check`). Unlike
+    /// `InvalidValue`, the message never quotes the value past a valid id or
+    /// a drive letter: a line written without an id starts with a command
+    /// line, which may hold a secret.
+    MissingProfileId,
+    InvalidProfileId,
+    ProfileIdLooksLikeDrive,
+    ReservedProfileId,
+    ProfileCommandPrefix,
+    ProfileNoProgram,
+    ProfileEnvNoName,
+    ProfileNotUtf8,
 };
 
 /// Parse the command line arguments from iter into dst.
@@ -86,6 +99,26 @@ pub fn parse(
     };
 
     while (iter.next()) |arg| {
+        // A config file line too long to read was skipped. It is not an
+        // argument, so no hook sees it and it is not replayed; the problem
+        // is, as a replay step of its own when the destination keeps them.
+        if (arg.ptr == LineIterator.skipped_line.ptr) {
+            if (comptime canTrackDiags(T)) {
+                const diag: Diagnostic = .{
+                    .message = std.fmt.comptimePrint(
+                        "line is longer than {d} bytes and was skipped",
+                        .{LineIterator.max_line_len},
+                    ),
+                    .location = try diags.Location.fromIter(iter, arena_alloc),
+                };
+                try dst._diagnostics.append(arena_alloc, diag);
+                if (@hasField(T, "_replay_steps")) {
+                    try dst._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
+                }
+            }
+            continue;
+        }
+
         // Do manual parsing if we have a hook for it.
         if (@hasDecl(T, "parseManuallyHook")) {
             if (!try dst.parseManuallyHook(
@@ -93,6 +126,11 @@ pub fn parse(
                 arg,
                 iter,
             )) return;
+        }
+
+        // An argument the destination takes itself, which is not a field.
+        if (@hasDecl(T, "consumeManuallyHook")) {
+            if (try dst.consumeManuallyHook(arena_alloc, arg, iter)) continue;
         }
 
         // If the destination supports help then we check for it, call
@@ -162,6 +200,15 @@ pub fn parse(
                 error.InvalidField => "unknown field",
                 error.ValueRequired => formatValueRequired(T, arena_alloc, key) catch "value required",
                 error.InvalidValue => formatInvalidValue(T, arena_alloc, key, value) catch "invalid value",
+                error.MissingProfileId,
+                error.InvalidProfileId,
+                error.ProfileIdLooksLikeDrive,
+                error.ReservedProfileId,
+                error.ProfileCommandPrefix,
+                error.ProfileNoProgram,
+                error.ProfileEnvNoName,
+                error.ProfileNotUtf8,
+                => |e| try formatProfileProblem(arena_alloc, key, value orelse "", e),
                 else => try std.fmt.allocPrintSentinel(
                     arena_alloc,
                     "unknown error {}",
@@ -263,6 +310,67 @@ fn formatInvalidValue(
 
     const written = stream.written();
     return written[0 .. written.len - 1 :0];
+}
+
+/// The message for a refused profile line. It names the id only when the id
+/// is valid (every error after `InvalidProfileId`), and otherwise nothing of
+/// the value, which may be a command line holding a token.
+fn formatProfileProblem(
+    arena_alloc: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+    err: anyerror,
+) Allocator.Error![:0]const u8 {
+    const colon = mem.indexOfScalar(u8, value, ':') orelse value.len;
+    const id = mem.trim(u8, value[0..colon], &std.ascii.whitespace);
+    return switch (err) {
+        error.MissingProfileId => "needs a profile id and a ':' before the value (the value is not shown)",
+        error.InvalidProfileId => "the text before the first ':' is not a profile id; start the line with an id " ++
+            "(1 to 64 ASCII letters, digits, '.', '_' or '-') and a ':' (the value is not shown)",
+        error.ProfileIdLooksLikeDrive => try std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "\"{s}:\" looks like a drive letter; start the line with a profile id: {s} = <id>: {s}:\\...",
+            .{ id, key, id },
+            0,
+        ),
+        error.ReservedProfileId => if (std.ascii.eqlIgnoreCase(id, "user"))
+            "write the id without \"user:\""
+        else if (mem.eql(u8, key, "profile-command"))
+            try std.fmt.allocPrintSentinel(
+                arena_alloc,
+                "\"{s}\" names a detected profile or a reference word; choose another id",
+                .{id},
+                0,
+            )
+        else
+            try std.fmt.allocPrintSentinel(
+                arena_alloc,
+                "\"{s}\" is not a profile you defined; a detected profile cannot be changed with " ++
+                    "profile-* lines (define your own with profile-command and hide the detected one with profile-hidden)",
+                .{id},
+                0,
+            ),
+        error.ProfileCommandPrefix => try std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "\"{s}\": direct: and shell: belong to command; write the Windows command line itself",
+            .{id},
+            0,
+        ),
+        error.ProfileNoProgram => try std.fmt.allocPrintSentinel(arena_alloc, "\"{s}\" has no program to run", .{id}, 0),
+        error.ProfileEnvNoName => try std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "\"{s}\": a variable name is needed before the '='",
+            .{id},
+            0,
+        ),
+        error.ProfileNotUtf8 => try std.fmt.allocPrintSentinel(
+            arena_alloc,
+            "\"{s}\": the line is not UTF-8; save the file as UTF-8 (the value is not shown)",
+            .{id},
+            0,
+        ),
+        else => unreachable,
+    };
 }
 
 fn formatValues(
@@ -1429,6 +1537,28 @@ pub const LineIterator = struct {
     /// like 4 years and be wrong about this.
     pub const MAX_LINE_SIZE = 4096;
 
+    /// The longest line `next` reads, line ending excluded: the entry buffer
+    /// less the `--` it is returned with. (The buffer has one byte more, for
+    /// the CR of a CRLF line, which the trim below removes.)
+    pub const max_line_len = MAX_LINE_SIZE - 2;
+
+    /// What `next` returns for a line longer than `max_line_len`, which it
+    /// skips whole: no part of it is applied, and the next line is read as
+    /// usual. Compare by pointer (a mutable global has an address no string
+    /// literal shares); `location` names the skipped line. `parse` turns it
+    /// into a config problem.
+    pub const skipped_line: []const u8 = &skipped_line_storage;
+    var skipped_line_storage = [_]u8{ '-', '-' };
+
+    /// Whether `next` reads `line`, the bytes of a line before its `\n` (a
+    /// CRLF line's CR, and any other CR, included), rather than skip it as
+    /// too long (`skipped_line`): at most `max_line_len` bytes, or one more
+    /// when the last is a CR. Anything that has to read a config file's
+    /// lines as the loader does asks this.
+    pub fn takes(line: []const u8) bool {
+        return line.len <= max_line_len or (line.len == max_line_len + 1 and line[line.len - 1] == '\r');
+    }
+
     /// Our stateful reader.
     r: *std.Io.Reader,
 
@@ -1444,7 +1574,13 @@ pub const LineIterator = struct {
 
     /// This is the buffer where we store the current entry that
     /// is formatted to be compatible with the parse function.
-    entry: [MAX_LINE_SIZE]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 2)),
+    entry: [MAX_LINE_SIZE + 1]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 1)),
+
+    /// Whether reading the input failed (`error.ReadFailed`) before its end.
+    /// `next` stops there as at the end, as it always has, so what came after
+    /// was never read: a caller that has to know asks this
+    /// (`Config.loadReader` records it as a problem).
+    read_failed: bool = false,
 
     pub fn init(reader: *std.Io.Reader) Self {
         return .{ .r = reader };
@@ -1462,7 +1598,7 @@ pub const LineIterator = struct {
         // fillMore asserts that the buffer has available capacity,
         // so skip this if it's full.
         if (self.r.bufferedLen() < self.r.buffer.len) {
-            self.r.fillMore() catch {};
+            self.r.fillMore() catch |err| self.noteRead(err);
         }
 
         var writer: std.Io.Writer = .fixed(self.entry[2..]);
@@ -1471,14 +1607,33 @@ pub const LineIterator = struct {
             // Reset write head
             writer.end = 0;
 
-            _ = self.r.streamDelimiterEnding(&writer, '\n') catch |e| {
-                log.warn("cannot read from \"{s}\": {}", .{ self.filepath, e });
-                return null;
+            _ = self.r.streamDelimiterEnding(&writer, '\n') catch |e| switch (e) {
+                error.WriteFailed => {
+                    // Longer than the entry buffer. Skip to the end of the
+                    // line, so the rest of the file is still read.
+                    _ = self.r.discardDelimiterInclusive('\n') catch |err| discard: {
+                        self.noteRead(err);
+                        break :discard 0;
+                    };
+                    self.line += 1;
+                    return skipped_line;
+                },
+                else => {
+                    log.warn("cannot read from \"{s}\": {}", .{ self.filepath, e });
+                    self.noteRead(e);
+                    return null;
+                },
             };
-            _ = self.r.discardDelimiterInclusive('\n') catch {};
+            _ = self.r.discardDelimiterInclusive('\n') catch |err| discard: {
+                self.noteRead(err);
+                break :discard 0;
+            };
 
             var entry = writer.buffered();
             self.line += 1;
+            // The byte past `max_line_len` is there only for a CRLF line's
+            // CR, so a CRLF file has the same limit as an LF one.
+            if (!takes(entry)) return skipped_line;
 
             // Trim any whitespace (including CR) around it
             const trim = std.mem.trim(u8, entry, whitespace ++ "\r");
@@ -1487,8 +1642,15 @@ pub const LineIterator = struct {
                 entry = entry[0..trim.len];
             }
 
-            // Ignore blank lines and comments
-            if (entry.len == 0 or entry[0] == '#') continue;
+            // Ignore blank lines and comments. If this line consumed the
+            // remaining buffer, refill before the loop condition checks for
+            // more data.
+            if (entry.len == 0 or entry[0] == '#') {
+                if (self.r.seek == self.r.end) {
+                    self.r.fillMore() catch |err| self.noteRead(err);
+                }
+                continue;
+            }
             break entry;
         } else return null;
 
@@ -1523,6 +1685,12 @@ pub const LineIterator = struct {
         // of our buffer so that we can trick the CLI parser to treat it
         // as CLI args.
         return self.entry[0 .. entry.len + 2];
+    }
+
+    /// A read that ended in `err`: the end of the input is no failure, a
+    /// failed read is (`read_failed`).
+    fn noteRead(self: *Self, err: anyerror) void {
+        if (err == error.ReadFailed) self.read_failed = true;
     }
 
     /// Returns a location for a diagnostic message.
@@ -1655,4 +1823,166 @@ test "LineIterator with buffered and primed reader" {
     try testing.expectEqualStrings("--B=C", iter.next().?);
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+}
+
+test "LineIterator refills after ignored line at buffer boundary" {
+    const testing = std.testing;
+
+    {
+        var f: std.Io.Reader = .fixed("#\nA\n");
+        var buf: [2]u8 = undefined;
+        var r = f.limited(.unlimited, &buf);
+        var iter: LineIterator = .init(&r.interface);
+
+        try testing.expectEqualStrings("--A", iter.next().?);
+        try testing.expectEqual(@as(?[]const u8, null), iter.next());
+    }
+
+    {
+        var f: std.Io.Reader = .fixed("\nA\n");
+        var buf: [1]u8 = undefined;
+        var r = f.limited(.unlimited, &buf);
+        var iter: LineIterator = .init(&r.interface);
+
+        try testing.expectEqualStrings("--A", iter.next().?);
+        try testing.expectEqual(@as(?[]const u8, null), iter.next());
+    }
+}
+
+test "LineIterator skips a line longer than its buffer and reads on" {
+    const testing = std.testing;
+    const max = LineIterator.max_line_len;
+    // 4094 bytes fits, also with a CRLF line ending; 4095 does not, with
+    // either ending; neither does a line whose last character, a three-byte
+    // one, crosses the limit.
+    const fits = "a=" ++ "x" ** (max - 2);
+    const over = "b=" ++ "y" ** (max - 1);
+    const utf8 = "c=" ++ "z" ** (max - 3) ++ "\xe2\x82\xac";
+    const text = fits ++ "\n" ++ over ++ "\n" ++ "d=1\n" ++ utf8 ++ "\n" ++ "e=2\n" ++
+        fits ++ "\r\n" ++ over ++ "\r\n" ++ "f=3\r\n" ++ over;
+    // Through a small read buffer, as a config file is read.
+    var f: std.Io.Reader = .fixed(text);
+    var buf: [2048]u8 = undefined;
+    var r = f.limited(.unlimited, &buf);
+    var iter: LineIterator = .{ .r = &r.interface, .filepath = "t" };
+
+    try testing.expectEqualStrings("--" ++ fits, iter.next().?);
+    try testing.expectEqual(LineIterator.skipped_line.ptr, iter.next().?.ptr);
+    try testing.expectEqual(@as(usize, 2), iter.line);
+    try testing.expectEqualStrings("--d=1", iter.next().?);
+    try testing.expectEqual(LineIterator.skipped_line.ptr, iter.next().?.ptr);
+    try testing.expectEqual(@as(usize, 4), iter.line);
+    try testing.expectEqualStrings("--e=2", iter.next().?);
+    // CRLF: the CR does not count.
+    try testing.expectEqualStrings("--" ++ fits, iter.next().?);
+    try testing.expectEqual(LineIterator.skipped_line.ptr, iter.next().?.ptr);
+    try testing.expectEqual(@as(usize, 7), iter.line);
+    try testing.expectEqualStrings("--f=3", iter.next().?);
+    // A long last line without a line ending.
+    try testing.expectEqual(LineIterator.skipped_line.ptr, iter.next().?.ptr);
+    try testing.expectEqual(@as(usize, 9), iter.line);
+    try testing.expectEqual(@as(?[]const u8, null), iter.next());
+}
+
+test "LineIterator reads a line at 4095 bytes only when it ends in a CR, skips one at 4096, and takes says so" {
+    const testing = std.testing;
+    const max = LineIterator.max_line_len;
+    const Case = struct { line: []const u8, read: bool };
+    // Each line as the reader holds it: its bytes before the LF, every CR
+    // included.
+    const cases = [_]Case{
+        .{ .line = "a=" ++ "x" ** (max - 2), .read = true },
+        .{ .line = "a=" ++ "x" ** (max - 1), .read = false },
+        .{ .line = "a=" ++ "x" ** (max - 2) ++ "\r", .read = true },
+        .{ .line = "a=" ++ "x" ** (max - 3) ++ "\r\r", .read = true },
+        .{ .line = "a=" ++ "x" ** (max - 2) ++ "\r\r", .read = false },
+        .{ .line = "a=" ++ "x" ** (max - 1) ++ "\r", .read = false },
+        .{ .line = "a=" ++ "x" ** max ++ "\r\r", .read = false },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(case.read, LineIterator.takes(case.line));
+        // With an LF after it and a line after that, and as the last line.
+        for ([_]bool{ true, false }) |newline| {
+            var text_buf: [max + 16]u8 = undefined;
+            const text = if (newline)
+                try std.fmt.bufPrint(&text_buf, "{s}\nb=1\n", .{case.line})
+            else
+                try std.fmt.bufPrint(&text_buf, "{s}", .{case.line});
+            var f: std.Io.Reader = .fixed(text);
+            var buf: [2048]u8 = undefined;
+            var r = f.limited(.unlimited, &buf);
+            var iter: LineIterator = .{ .r = &r.interface, .filepath = "t" };
+            const arg = iter.next().?;
+            if (case.read) {
+                try testing.expect(arg.ptr != LineIterator.skipped_line.ptr);
+                try testing.expectEqualStrings(std.mem.trimEnd(u8, case.line, "\r"), arg[2..]);
+            } else try testing.expectEqual(LineIterator.skipped_line.ptr, arg.ptr);
+            if (newline) try testing.expectEqualStrings("--b=1", iter.next().?);
+            try testing.expectEqual(@as(?[]const u8, null), iter.next());
+        }
+    }
+}
+
+/// For tests: a reader that hands over `chunk` and then fails, as a file
+/// that opens and then cannot be read past some point does.
+pub const TestFailingReader = struct {
+    interface: std.Io.Reader,
+    chunk: []const u8,
+    given: usize = 0,
+
+    pub fn init(chunk: []const u8, buffer: []u8) TestFailingReader {
+        return .{ .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 }, .chunk = chunk };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *TestFailingReader = @fieldParentPtr("interface", r);
+        if (self.given == self.chunk.len) return error.ReadFailed;
+        const n = try w.write(limit.sliceConst(self.chunk[self.given..]));
+        self.given += n;
+        return n;
+    }
+};
+
+test "LineIterator stops at a failed read as at the end, and says the read failed" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var failing = TestFailingReader.init("a=1\nb=2\nc=", &buf);
+    var iter: LineIterator = .{ .r = &failing.interface, .filepath = "t" };
+    try testing.expectEqualStrings("--a=1", iter.next().?);
+    try testing.expectEqualStrings("--b=2", iter.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), iter.next());
+    try testing.expect(iter.read_failed);
+    // The end of the input is no failure.
+    var f: std.Io.Reader = .fixed("a=1\nb=2");
+    var whole: LineIterator = .{ .r = &f, .filepath = "t" };
+    try testing.expectEqualStrings("--a=1", whole.next().?);
+    try testing.expectEqualStrings("--b=2", whole.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), whole.next());
+    try testing.expect(!whole.read_failed);
+}
+
+test "parse reports a skipped line with its place and keeps the rest" {
+    const testing = std.testing;
+    const Step = union(enum) { diagnostic: diags.Diagnostic };
+    var data: struct {
+        a: []const u8 = "",
+        b: []const u8 = "",
+        _arena: ?ArenaAllocator = null,
+        _diagnostics: diags.DiagnosticList = .{},
+        _replay_steps: std.ArrayListUnmanaged(Step) = .empty,
+    } = .{};
+    defer if (data._arena) |arena| arena.deinit();
+
+    const text = "a=1\nb=" ++ "x" ** LineIterator.max_line_len ++ "\nb=2\n";
+    var f: std.Io.Reader = .fixed(text);
+    var iter: LineIterator = .{ .r = &f, .filepath = "C:\\cfg" };
+    try parse(@TypeOf(data), testing.allocator, &data, &iter);
+    try testing.expectEqualStrings("1", data.a);
+    try testing.expectEqualStrings("2", data.b);
+    try testing.expectEqual(@as(usize, 1), data._diagnostics.items().len);
+    const diag = data._diagnostics.items()[0];
+    try testing.expectEqualStrings("line is longer than 4094 bytes and was skipped", diag.message);
+    try testing.expectEqual(@as(usize, 2), diag.location.file.line);
+    // Kept for a replay, which does not read the file again.
+    try testing.expectEqual(@as(usize, 1), data._replay_steps.items.len);
 }

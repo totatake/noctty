@@ -1,8 +1,7 @@
 //! Headless benchmark: scrollback search while output streams.
 //!
 //! Fills a Terminal's scrollback with log-like lines, most of which match
-//! the needle, and drives the search thread's `Search` state the way the
-//! search thread does (`notify`, `tick`, `feed` under the terminal lock).
+//! the needle, and steps a `QuerySearch` the way the search thread does.
 //!
 //! Two modes:
 //!
@@ -10,9 +9,10 @@
 //!                  prefilled history, then streams `--stream-mib` of new
 //!                  lines and, after every `--refresh-kib` of output (the
 //!                  renderer marks the viewport dirty on every frame and the
-//!                  search thread refreshes every 24 ms), times one
-//!                  `Search.feed` (active-area reload, history feed and the
-//!                  match-row rebuild) plus the `notify` that follows it.
+//!                  search thread refreshes every 24 ms), times one refresh
+//!                  step (active-area reload, history feed and the
+//!                  match-row rebuild, then its report) and the steps that
+//!                  follow it until the search is caught up.
 //!
 //!   --mode=thread  The real search thread. Streams `--stream-mib` into the
 //!                  terminal under the terminal lock, as the IO thread does,
@@ -24,6 +24,11 @@
 //!                  the search of that output dominates, and a short stream
 //!                  spans only a refresh or two.
 //!
+//! `--regex` and `--whole-word` search with those options, so every
+//! searcher matches through the query's compiled pattern. Matching lines
+//! carry `--match-text` (default: the needle); give a regex a text it
+//! matches, such as `--regex --needle=req[a-z]+ --match-text=request`.
+//!
 //! Usage:
 //!   zig build bench:search-stream -- --mode=feed --lines=100000 --runs=5
 //!   zig build bench:search-stream -- --mode=thread --lines=100000 --stream-mib=8 --rate-mib-s=2 --runs=3
@@ -33,7 +38,7 @@ const bench_core = @import("bench_core");
 const terminal = bench_core.terminal;
 const Terminal = terminal.Terminal;
 const SearchThread = terminal.search.Thread;
-const ThreadSearch = SearchThread.Search;
+const QuerySearch = terminal.search.QuerySearch;
 const stats = @import("stats.zig");
 
 pub const std_options: std.Options = .{ .log_level = .err };
@@ -57,6 +62,10 @@ const Args = struct {
     cols: u16 = 140,
     scrollback_mib: usize = 200,
     needle: []const u8 = "request",
+    /// The word a matching line carries; null means the needle itself.
+    match_text: ?[]const u8 = null,
+    regex: bool = false,
+    whole_word: bool = false,
     /// `--mode=thread`: output rate in MiB/s, as a producer such as a
     /// console host limits it; 0 streams as fast as the terminal takes it.
     rate_mib_s: f64 = 0,
@@ -98,7 +107,7 @@ fn buildLines(
         const n = first + i;
         const line = out[i * args.line_len ..][0..args.line_len];
         @memset(line, '.');
-        const word: []const u8 = if (n % args.match_every == 0) args.needle else "reply";
+        const word: []const u8 = if (n % args.match_every == 0) args.match_text orelse args.needle else "reply";
         _ = std.fmt.bufPrint(
             line[0 .. args.line_len - 2],
             "{d:0>8} GET /api/items/{d} {s} status={d} bytes={d} ",
@@ -106,7 +115,7 @@ fn buildLines(
         ) catch {
             // A cut line could lose the needle and measure another workload.
             std.log.err(
-                "bench:search-stream: --line-len={d} is too short for the line text and --needle",
+                "bench:search-stream: --line-len={d} is too short for the line text and --match-text",
                 .{args.line_len},
             );
             return error.InvalidArgument;
@@ -128,6 +137,11 @@ fn initTerminal(alloc: std.mem.Allocator, args: Args) !Terminal {
 fn writeAll(t: *Terminal, bytes: []const u8) void {
     var stream = t.vtStream();
     defer stream.deinit();
+    nextSliceChunked(&stream, bytes);
+}
+
+/// Feed `bytes` to `stream` in 4 KiB writes.
+fn nextSliceChunked(stream: anytype, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = @min(offset + 4096, bytes.len);
@@ -142,21 +156,46 @@ const Sink = struct {
     alloc: std.mem.Allocator,
     row_messages: usize = 0,
     row_values: usize = 0,
+    rows: usize = 0,
     total: usize = 0,
+    /// The query did not compile; the search reports nothing more.
+    invalid: bool = false,
     complete: std.Thread.ResetEvent = .{},
 
     fn callback(event: SearchThread.Event, _: u64, ud: ?*anyopaque) void {
         const self: *Sink = @ptrCast(@alignCast(ud.?));
         switch (event) {
-            .match_rows => |rows| {
-                const copy = self.alloc.dupe(u32, rows) catch return;
-                self.alloc.free(copy);
-                self.row_messages += 1;
-                self.row_values += rows.len;
-            },
+            .match_rows => |rows| self.matchRows(rows),
             .total_matches => |v| self.total = v,
             .complete => self.complete.set(),
+            .invalid_query => {
+                self.invalid = true;
+                self.complete.set();
+            },
             else => {},
+        }
+    }
+
+    fn matchRows(self: *Sink, rows: []const u32) void {
+        const copy = self.alloc.dupe(u32, rows) catch return;
+        self.alloc.free(copy);
+        self.row_messages += 1;
+        self.row_values += rows.len;
+        self.rows = rows.len;
+    }
+
+    /// Step with `req`, then until the search is caught up, as the search
+    /// thread does, taking what each report carries as the callback would.
+    fn run(self: *Sink, qs: *QuerySearch, req: QuerySearch.Request) void {
+        var report = qs.step(req);
+        while (true) {
+            if (report.match_rows) |rows| self.matchRows(rows);
+            if (report.total) |total| switch (total) {
+                .count => |n| self.total = n,
+                .invalid => self.invalid = true,
+            };
+            if (report.state != .busy) return;
+            report = qs.step(.{});
         }
     }
 };
@@ -200,25 +239,17 @@ fn runFeed(
         writeAll(&t, history);
 
         var sink: Sink = .{ .alloc = alloc };
-        var search = try ThreadSearch.init(alloc, args.needle, .{});
-        defer search.deinit(&t);
-        // Single-threaded: `tick` takes the terminal lock only to clean up
-        // after a matcher failure, and nothing else contends for it here.
+        // Single-threaded: nothing else contends for the lock here.
         var mutex: std.Thread.Mutex = .{};
+        var search: QuerySearch = .init(alloc, .{ .terminal = &t, .mutex = &mutex });
+        defer search.deinit();
 
-        // `changeQuery`'s initial feed, then the search thread's loop until
-        // the search completes.
+        // The query's initial feed, then the search thread's loop until the
+        // search completes.
         var timer = try std.time.Timer.start();
-        search.feed(alloc, &t);
-        while (true) {
-            search.notify(alloc, &Sink.callback, 1, &sink, false);
-            if (search.isComplete()) break;
-            switch (search.tick(&mutex)) {
-                .complete, .progress => {},
-                .blocked => search.feed(alloc, &t),
-            }
-        }
+        sink.run(&search, .{ .query = .{ .needle = args.needle, .options = queryOptions(args) } });
         initial_ms[run] = nsToMs(timer.read());
+        if (sink.invalid) return error.InvalidQuery;
 
         // Streaming with a refresh after every `refresh_bytes` of output.
         var stream = t.vtStream();
@@ -227,49 +258,35 @@ fn runFeed(
         var offset: usize = 0;
         while (offset < streamed.len) {
             const end = @min(offset + refresh_bytes, streamed.len);
-            var chunk = offset;
-            while (chunk < end) {
-                const chunk_end = @min(chunk + 4096, end);
-                stream.nextSlice(streamed[chunk..chunk_end]);
-                chunk = chunk_end;
-            }
+            nextSliceChunked(&stream, streamed[offset..end]);
             offset = end;
 
             // What the renderer does on a dirty frame.
             t.flags.search_viewport_dirty = true;
 
             var refresh_timer = try std.time.Timer.start();
-            search.feed(alloc, &t);
-            while (true) {
-                search.notify(alloc, &Sink.callback, 1, &sink, false);
-                if (search.isComplete()) break;
-                switch (search.tick(&mutex)) {
-                    .complete, .progress => {},
-                    .blocked => search.feed(alloc, &t),
-                }
-            }
+            sink.run(&search, .{ .refresh = true });
             try refresh_all.append(alloc, nsToMs(refresh_timer.read()));
         }
         stream_ms[run] = nsToMs(stream_timer.read());
 
         final_total = sink.total;
-        final_rows = search.match_rows.items.len;
+        final_rows = sink.rows;
         final_nodes = 0;
         var node_it = t.screens.active.pages.pages.first;
         while (node_it) |node| : (node_it = node.next) final_nodes += 1;
         row_messages = sink.row_messages;
     }
 
-    std.mem.sort(f64, initial_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, stream_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, baseline_ms, {}, std.sort.asc(f64));
-    std.mem.sort(f64, refresh_all.items, {}, std.sort.asc(f64));
+    for ([_][]f64{ initial_ms, stream_ms, baseline_ms, refresh_all.items }) |samples| {
+        std.mem.sort(f64, samples, {}, std.sort.asc(f64));
+    }
 
     var out_buf: [4096]u8 = undefined;
     var out_writer = std.fs.File.stdout().writer(&out_buf);
     const out = &out_writer.interface;
     try out.print(
-        \\bench:search-stream mode=feed
+        \\bench:search-stream mode=feed regex={} whole-word={}
         \\  history lines      = {d} (1 in {d} matches "{s}"), {d}x{d}, scrollback {d} MiB
         \\  streamed           = {d} MiB, refresh every {d} KiB
         \\  final matches      = {d}, match rows = {d}, page nodes = {d}
@@ -280,6 +297,8 @@ fn runFeed(
         \\  stream, no search  median {d:.1} ms
         \\
     , .{
+        args.regex,
+        args.whole_word,
         args.lines,
         args.match_every,
         args.needle,
@@ -350,7 +369,7 @@ fn runThread(
     const with_median = stats.median(with_ms).?;
     const without_median = stats.median(without_ms).?;
     try out.print(
-        \\bench:search-stream mode=thread
+        \\bench:search-stream mode=thread regex={} whole-word={}
         \\  history lines      = {d} (1 in {d} matches "{s}"), {d}x{d}, scrollback {d} MiB
         \\  streamed           = {d} MiB in 4 KiB writes under the terminal lock, paced at {d} MiB/s (0 = unpaced)
         \\  final matches      = {d}, row snapshots sent = {d} (last run)
@@ -360,6 +379,8 @@ fn runThread(
         \\  slowdown           {d:.2}x
         \\
     , .{
+        args.regex,
+        args.whole_word,
         args.lines,
         args.match_every,
         args.needle,
@@ -428,11 +449,12 @@ fn streamLocked(
         var timer = try std.time.Timer.start();
         thread.send(.{ .change_query = .{
             .generation = 1,
-            .options = .{},
+            .options = queryOptions(args),
             .req = try .init(alloc, args.needle),
         } });
         try search_sink.complete.timedWait(600 * std.time.ns_per_s);
         result.initial_ms = nsToMs(timer.read());
+        if (search_sink.invalid) return error.InvalidQuery;
     }
 
     const ns_per_byte: f64 = if (args.rate_mib_s > 0)
@@ -464,6 +486,10 @@ fn streamLocked(
     result.wall_ms = nsToMs(timer.read());
     result.lock_wait_ms = nsToMs(lock_wait_ns);
     return result;
+}
+
+fn queryOptions(args: Args) terminal.search.QueryOptions {
+    return .{ .regex = args.regex, .whole_word = args.whole_word };
 }
 
 fn nsToMs(ns: u64) f64 {
@@ -498,6 +524,12 @@ fn parseArgs(raw: []const []const u8) !Args {
             out.rate_mib_s = try std.fmt.parseFloat(f64, arg["--rate-mib-s=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--needle=")) {
             out.needle = arg["--needle=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--match-text=")) {
+            out.match_text = arg["--match-text=".len..];
+        } else if (std.mem.eql(u8, arg, "--regex")) {
+            out.regex = true;
+        } else if (std.mem.eql(u8, arg, "--whole-word")) {
+            out.whole_word = true;
         } else {
             std.log.err("bench:search-stream: unknown arg '{s}'", .{arg});
             return error.InvalidArgument;
@@ -508,7 +540,8 @@ fn parseArgs(raw: []const []const u8) !Args {
     // hold at least one line.
     if (out.runs == 0 or out.match_every == 0 or out.line_len < 64 or
         out.line_len > 1024 * 1024 or out.stream_mib == 0 or
-        out.needle.len == 0 or out.rows == 0 or out.cols == 0)
+        out.needle.len == 0 or (out.match_text != null and out.match_text.?.len == 0) or
+        out.rows == 0 or out.cols == 0)
     {
         return error.InvalidArgument;
     }

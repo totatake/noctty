@@ -7,6 +7,11 @@ param(
     [string] $OutputDirectory = ''
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-shader-pacing.ps1'
+try {
+
+
 # Regression harness for #297: with an animated custom shader and power-saver
 # pacing active (Battery Saver or Energy Saver on battery, forced here with
 # `power-saver-rendering = on`), typed input must reach the screen.
@@ -69,12 +74,18 @@ Invoke-InteractiveWin11HarnessMain `
     -ArgumentList $forwardedArgs
 
 if ($Rebuild) {
-    Push-Location $repoRoot
-    try {
-        zig build -Demit-exe=true -Dcustom-shaders=true
-        if ($LASTEXITCODE -ne 0) { throw "shader-enabled build failed with exit code $LASTEXITCODE" }
+    if (Test-InteractiveWin11MeasureMode) {
+        # The measurement generation always carries custom shader support.
+        Invoke-InteractiveWin11Build -RepoRoot $repoRoot
     }
-    finally { Pop-Location }
+    else {
+        Push-Location $repoRoot
+        try {
+            zig build -Demit-exe=true -Dcustom-shaders=true
+            if ($LASTEXITCODE -ne 0) { throw "shader-enabled build failed with exit code $LASTEXITCODE" }
+        }
+        finally { Pop-Location }
+    }
 }
 
 $realStartupPath = Join-Path $env:LOCALAPPDATA 'noctty\startup-attempts.json'
@@ -343,4 +354,8 @@ Write-Host ("interactive-win11 shader-pacing validation: PASS " +
 if ($OutputDirectory) {
     [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
     @{status='pass';binarySHA256=(Get-FileHash -LiteralPath $exePath).Hash;presentedWithinMs=$presentedMs;animationSwapsPerSecond=$animationSwapsPerSecond;frameUpdates=([uint64]$typed.renderer_update_frame_count-[uint64]$before.renderer_update_frame_count);outputBytes=([uint64]$typed.last_swap_process_output_bytes-[uint64]$before.last_swap_process_output_bytes)} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'shader-pacing.json')
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

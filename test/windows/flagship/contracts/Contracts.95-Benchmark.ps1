@@ -49,15 +49,77 @@ foreach ($threshold in $thresholds) {
     }
 }
 
+# Each gate command is pinned as a whole line, followed by the exit-code check
+# that lets its failure fail the step. Matching argument by argument let a
+# trailing `--min-mb-s=0` (the tool takes the last value, so it disables the
+# gate), a changed `--bytes` or a commented-out line through. The floors are for
+# the fastest run (docs/windows-benchmark-methodology.md, BENCH-VT-FLOOR-01).
+$benchmarkGateCommands = @(
+    'zig build bench:vt-throughput -- --workload=ascii --bytes=4194304 --seed=121 --runs=60 --rows=45 --cols=140 --min-mb-s=50'
+    'zig build bench:vt-throughput -- --workload=utf8 --bytes=4194304 --seed=121 --runs=60 --rows=45 --cols=140 --min-mb-s=35'
+    'zig build bench:vt-throughput -- --workload=osc --bytes=4194304 --seed=121 --runs=20 --rows=45 --cols=140 --min-mb-s=3'
+    'zig build bench:vt-throughput -- --workload=scroll --bytes=4194304 --seed=121 --runs=60 --rows=45 --cols=140 --min-mb-s=50'
+    'zig build bench:palette-match -- --entries=5000 --keystrokes=5000 --budget-us=2500'
+)
+$benchmarkGateLinePatterns = foreach ($command in $benchmarkGateCommands) {
+    '^[ \t]*' + [regex]::Escape($command) + '[ \t]*\r?\n[ \t]*if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}[ \t]*\r?$'
+}
+$benchmarkGateStepPattern = '(?ms)' + ($benchmarkGateLinePatterns -join '.*?')
+# Exactly four throughput invocations in the job: an extra one could re-run a
+# workload with a floor of 0. Every check below reads the job with its comments
+# removed (a line that starts with `#`, or a `<# ... #>` block that opens at the start of
+# a line, as in the job's pwsh steps): a note that names the step does not count as an
+# invocation, and a command or exit-code check that sits in a comment does not satisfy
+# a pin. Anchoring both at the start of a line keeps a `<#` or `#>` inside a string
+# (`Write-Host '<#'`) from hiding what lies between them. The job text is YAML around
+# several steps, not one script, so PowerShell's tokenizer cannot read it whole.
+$benchmarkGateCountPattern = '(?s)\A(?:(?!bench:vt-throughput).)*(?:bench:vt-throughput(?:(?!bench:vt-throughput).)*){4}\z'
+# One left-to-right pass, so a `<#` inside a line comment opens no block and a `#` line
+# inside a block closes nothing early.
+$benchmarkGateCommentPattern = '^[ \t]*<#.*?#>|^[ \t]*#[^\r\n]*'
+function Get-BenchmarkGateActiveText([string] $JobText) {
+    [regex]::Replace($JobText, $benchmarkGateCommentPattern, '', [System.Text.RegularExpressions.RegexOptions]'Singleline, Multiline')
+}
+# The runner's CPU is logged to read a failure against; looking it up must never
+# be able to fail the step before any benchmark runs.
+$benchmarkGateCpuLine = "try { Write-Host ('runner cpu: ' + (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()) } catch { Write-Host 'runner cpu: unknown' }"
+$benchmarkGateCpuPattern = '(?m)^[ \t]*' + [regex]::Escape($benchmarkGateCpuLine) + '[ \t]*\r?$'
+$benchmarkGateStepName = 'Headless benchmark regression gates'
+
+function Test-BenchmarkGateJob([string] $JobText) {
+    $step = Get-BenchmarkGateActiveText (Get-YamlStepBlock -Content $JobText -Name $benchmarkGateStepName -Source $testWorkflow)
+    [regex]::IsMatch($step, $benchmarkGateStepPattern) -and
+    [regex]::IsMatch($step, $benchmarkGateCpuPattern) -and
+    [regex]::IsMatch((Get-BenchmarkGateActiveText $JobText), $benchmarkGateCountPattern)
+}
+
 Invoke-ContractTable -Contracts @(
     @{
         File = "$testWorkflow :: bench headless benchmark gates"
         Content = {
-            (Get-YamlJobText -Content $testWorkflowText -Name 'bench' -Source $testWorkflow)
+            Get-BenchmarkGateActiveText (Get-YamlStepBlock -Content (Get-YamlJobText -Content $testWorkflowText -Name 'bench' -Source $testWorkflow) -Name $benchmarkGateStepName -Source $testWorkflow)
         }
-        Pattern = '(?ms)- name: Headless benchmark regression gates.*?--workload=ascii.*?--min-mb-s=50.*?--workload=utf8.*?--min-mb-s=35.*?--workload=osc.*?--min-mb-s=3.*?--workload=scroll.*?--min-mb-s=50.*?bench:palette-match.*?--budget-us=2500'
+        Pattern = $benchmarkGateStepPattern
         Kind = 'Text'
-        Description = 'CI runs every headless throughput floor and the palette budget'
+        Description = 'CI runs every headless throughput floor on the fastest of 60 runs (20 for OSC) and the palette budget, each command exactly'
+    }
+    @{
+        File = "$testWorkflow :: bench headless benchmark gates"
+        Content = {
+            Get-BenchmarkGateActiveText (Get-YamlStepBlock -Content (Get-YamlJobText -Content $testWorkflowText -Name 'bench' -Source $testWorkflow) -Name $benchmarkGateStepName -Source $testWorkflow)
+        }
+        Pattern = $benchmarkGateCpuPattern
+        Kind = 'Text'
+        Description = 'the gate step logs the runner CPU best effort, so the lookup cannot fail the step'
+    }
+    @{
+        File = "$testWorkflow :: bench headless benchmark gates"
+        Content = {
+            Get-BenchmarkGateActiveText (Get-YamlJobText -Content $testWorkflowText -Name 'bench' -Source $testWorkflow)
+        }
+        Pattern = $benchmarkGateCountPattern
+        Kind = 'Text'
+        Description = 'the bench job invokes the throughput gate exactly four times, comment lines aside'
     }
     @{
         File = $benchmarkHarness
@@ -132,7 +194,7 @@ Invoke-ContractTable -Contracts @(
     @{
         File = "$rendererGeneric + src\renderer\Thread.zig :: renderer frame activity"
         Content = { $rendererGenericText + "`n" + (Get-Content -LiteralPath (Join-Path $repoRoot 'src\renderer\Thread.zig') -Raw) }
-        Pattern = '(?s)output_progress\s*=\s*null.*?\.output_progress\s*=\s*output_progress.*?noteRendererUpdateFrame\(update\.output_progress, cursor_blinking\)'
+        Pattern = '(?s)output_progress\s*=\s*null.*?\.output_progress\s*=\s*output_progress.*?noteRendererUpdateFrame\(done\.output_progress, cursor_blinking\)'
         Kind = 'Text'
         Description = 'completed frame updates remain observable even when output provenance is intentionally unavailable'
     }
@@ -172,3 +234,82 @@ Invoke-ContractTable -Contracts @(
         Description = 'the frame-time p95 threshold compares the p95 statistic rather than the median'
     }
 )
+
+# Negative controls for the gate commands above. They mutate only the workflow
+# text already read and never run anything. Every mutant must be rejected: the
+# trailing floor of 0, the changed bytes, the commented-out line and the
+# unchecked exit code each left the older argument-by-argument pattern passing.
+# Positive controls follow them: comments that name the step are accepted.
+$benchmarkGateJob = Get-YamlJobText -Content $testWorkflowText -Name 'bench' -Source $testWorkflow
+if (Test-BenchmarkGateJob $benchmarkGateJob) {
+    $gateCmd = $benchmarkGateCommands
+    $benchmarkGateMutants = [System.Collections.Generic.List[object]]::new()
+    foreach ($case in @(
+        @{ Index = 0; To = "$($gateCmd[0]) --min-mb-s=0" }
+        @{ Index = 3; To = "$($gateCmd[3]) --runs=1" }
+        @{ Index = 0; To = $gateCmd[0].Replace('--bytes=4194304', '--bytes=4096') }
+        @{ Index = 1; To = $gateCmd[1].Replace('--seed=121', '--seed=7') }
+        @{ Index = 2; To = $gateCmd[2].Replace('--rows=45', '--rows=4') }
+        @{ Index = 1; To = $gateCmd[1].Replace('--cols=140', '--cols=14') }
+        @{ Index = 0; To = "# $($gateCmd[0])" }
+        @{ Index = 3; To = "# $($gateCmd[3])" }
+        @{ Index = 0; To = $gateCmd[0].Replace('--min-mb-s=50', '--min-mb-s=40') }
+        @{ Index = 3; To = $gateCmd[3].Replace('--min-mb-s=50', '--min-mb-s=5') }
+        @{ Index = 1; To = $gateCmd[1].Replace('--min-mb-s=35', '--min-mb-s=3.5') }
+        @{ Index = 2; To = $gateCmd[2].Replace('--min-mb-s=3', '--min-mb-s=3e-9') }
+        @{ Index = 0; To = $gateCmd[0].Replace('--runs=60', '--runs=5') }
+        @{ Index = 0; To = $gateCmd[0].Replace('--runs=60', '--runs=600') }
+        @{ Index = 2; To = $gateCmd[2].Replace('--runs=20', '--runs=2') }
+        @{ Index = 4; To = $gateCmd[4].Replace('--budget-us=2500', '--budget-us=250000') }
+    )) {
+        $benchmarkGateMutants.Add(@{ Name = $case.To; Text = $benchmarkGateJob.Replace($gateCmd[$case.Index], $case.To) })
+    }
+    # A fifth throughput invocation after the real four, with its floor disabled.
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation'; Text = $benchmarkGateJob.TrimEnd() + "`n          $($gateCmd[0]) --min-mb-s=0`n" })
+    # The same, behind a `#` that is not the first character of its line (after a
+    # space, so a filter that cuts at any `#` preceded by whitespace fails too): only a
+    # line that starts with `#` is a comment.
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation behind a mid-line #'; Text = $benchmarkGateJob.TrimEnd() + "`n          Write-Host ' #'; $($gateCmd[0]) --min-mb-s=0`n" })
+    # Block comments only hide what they enclose: an invocation after a closed one, one
+    # behind a `#>` with no opener, and one between two blocks (a greedy `<#.*#>` would
+    # swallow it) all still run.
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation after a closed block comment'; Text = $benchmarkGateJob.TrimEnd() + "`n          <# note #> $($gateCmd[0]) --min-mb-s=0`n" })
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation behind a lone #>'; Text = $benchmarkGateJob.TrimEnd() + "`n          Write-Host '#>'; $($gateCmd[0]) --min-mb-s=0`n" })
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation between two block comments'; Text = $benchmarkGateJob.TrimEnd() + "`n          <# a #>`n          $($gateCmd[0]) --min-mb-s=0`n          <# b #>`n" })
+    # And between block delimiters that are string contents, which comment nothing.
+    $benchmarkGateMutants.Add(@{ Name = 'a fifth invocation between block delimiters inside strings'; Text = $benchmarkGateJob.TrimEnd() + "`n          Write-Host '<#'`n          $($gateCmd[0]) --min-mb-s=0`n          Write-Host '#>'`n" })
+    # A pinned command (and its exit-code check, or the protected CPU line) kept inside a block
+    # comment while an active replacement disables the floor or can fail the step: the pins
+    # must read the active text, not the comment.
+    $disabledAsciiGate = '(?m)^([ \t]*)(' + [regex]::Escape($gateCmd[0]) + '[ \t]*\r?\n[ \t]*if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \})'
+    $disabledAsciiGateReplacement = '$1<#' + "`n" + '$1$2' + "`n" + '$1#>' + "`n" + '$1' + $gateCmd[0] + ' --min-mb-s=0' + "`n" + '$1if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+    $benchmarkGateMutants.Add(@{ Name = 'the ASCII gate and its exit check in a block comment, beside an active one with its floor disabled'; Text = [regex]::Replace($benchmarkGateJob, $disabledAsciiGate, $disabledAsciiGateReplacement) })
+    $benchmarkGateMutants.Add(@{ Name = 'the protected CPU line in a block comment, beside an unprotected one'; Text = $benchmarkGateJob.Replace($benchmarkGateCpuLine, "<#`n          $benchmarkGateCpuLine`n          #>`n          Write-Host ('runner cpu: ' + (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim())") })
+    # A CPU lookup that can fail the step.
+    $benchmarkGateMutants.Add(@{ Name = 'a CPU lookup without try/catch'; Text = $benchmarkGateJob.Replace($benchmarkGateCpuLine, "Write-Host ('runner cpu: ' + (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim())") })
+    # A command whose exit code is no longer checked.
+    foreach ($command in $gateCmd) {
+        $unchecked = '(' + [regex]::Escape($command) + ')[ \t]*\r?\n[ \t]*if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}'
+        $benchmarkGateMutants.Add(@{ Name = "no exit-code check after '$command'"; Text = [regex]::Replace($benchmarkGateJob, $unchecked, '$1') })
+    }
+    foreach ($mutant in $benchmarkGateMutants) {
+        if ($mutant.Text -ceq $benchmarkGateJob) { throw "Benchmark gate mutation '$($mutant.Name)' changed nothing." }
+        if (Test-BenchmarkGateJob $mutant.Text) { throw "Benchmark gate contract accepted '$($mutant.Name)'." }
+    }
+    # Positive controls: a comment that names the step is not an invocation. The
+    # unfiltered count rejects each of these texts, so they exercise the comment filter.
+    # The last one opens a `<#` inside a line comment and closes a block at the end of
+    # the job: a filter that strips block comments before line comments would pair
+    # them and swallow the four real invocations between.
+    $benchmarkGateCommentedJobs = @(
+        $benchmarkGateJob.Replace($gateCmd[0], "# the floors below run bench:vt-throughput four times`n          $($gateCmd[0])")
+        $benchmarkGateJob.Replace($gateCmd[0], "<# the floors below run bench:vt-throughput four times #>`n          $($gateCmd[0])")
+        $benchmarkGateJob.Replace($gateCmd[0], "<#`n          the floors below run`n          bench:vt-throughput four times`n          #>`n          $($gateCmd[0])")
+        $benchmarkGateJob.Replace($gateCmd[0], "# a note that mentions <# and never closes it`n          $($gateCmd[0])").TrimEnd() + "`n          <# bench:vt-throughput is pinned #>`n"
+    )
+    foreach ($benchmarkGateCommented in $benchmarkGateCommentedJobs) {
+        if ($benchmarkGateCommented -ceq $benchmarkGateJob) { throw 'The benchmark gate comment control changed nothing.' }
+        if ([regex]::IsMatch($benchmarkGateCommented, $benchmarkGateCountPattern)) { throw 'The benchmark gate comment control does not reach the invocation count.' }
+        if (-not (Test-BenchmarkGateJob $benchmarkGateCommented)) { throw 'Benchmark gate contract rejected a comment that names the step.' }
+    }
+}

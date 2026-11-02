@@ -175,9 +175,15 @@ pub const RenderState = struct {
         /// change often.
         arena: ArenaAllocator.State,
 
-        /// The page pin. This is not safe to read unless you can guarantee
-        /// the terminal state hasn't changed since the last `update` call.
+        /// The page pin. Its copied values may be compared, but its node must
+        /// not be dereferenced unless the terminal state is protected from
+        /// changes since the last `update` call.
         pin: PageList.Pin,
+
+        /// The page node generation captured alongside `pin`. This lets
+        /// consumers validate the pin without dereferencing its node after
+        /// the terminal lock has been released.
+        serial: u64,
 
         /// Raw row data.
         raw: page.Row,
@@ -357,6 +363,7 @@ pub const RenderState = struct {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
+                        .serial = undefined,
                         .raw = undefined,
                         .cells = .empty,
                         .dirty = true,
@@ -382,6 +389,7 @@ pub const RenderState = struct {
         const row_data = self.row_data.slice();
         const row_arenas = row_data.items(.arena);
         const row_pins = row_data.items(.pin);
+        const row_serials = row_data.items(.serial);
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
@@ -420,14 +428,17 @@ pub const RenderState = struct {
                 };
             }
 
-            // Store our pin. We have to store these even if we're not dirty
-            // because dirty is only a renderer optimization. It doesn't
-            // apply to memory movement. This will let us remap any cell
-            // pins back to an exact entry in our RenderState.
+            // Store our pin and its node generation. We have to store these
+            // even if we're not dirty because dirty is only a renderer
+            // optimization. It doesn't apply to memory movement. This will
+            // let us remap any cell pins back to an exact entry in our
+            // RenderState and validate them later without dereferencing a
+            // potentially stale node.
             row_pins[y] = row_pin;
+            row_serials[y] = row_pin.node.serial;
 
             // Get all our cells in the page.
-            const p: *page.Page = &row_pin.node.data;
+            const p: *page.Page = row_pin.node.page();
             const page_rac = row_pin.rowAndCell();
 
             dirty: {
@@ -598,7 +609,14 @@ pub const RenderState = struct {
             // Grab the inefficient data we need from the selection. At
             // least we can cache it.
             const tl = s.pages.pointFromPin(.screen, cache.tl_pin).?.screen;
-            const br = s.pages.pointFromPin(.screen, cache.br_pin).?.screen;
+
+            // Not cached since the cell contents may change.
+            const br_pin: PageList.Pin = if (!sel.rectangle and
+                cache.br_pin.rowAndCell().cell.wide == .spacer_head)
+                cache.br_pin.rightWrap(1) orelse cache.br_pin
+            else
+                cache.br_pin;
+            const br = s.pages.pointFromPin(.screen, br_pin).?.screen;
 
             // We need to determine if our selection is within the viewport.
             // The viewport is generally very small so the efficient way to
@@ -607,23 +625,38 @@ pub const RenderState = struct {
             for (
                 row_pins,
                 row_sels,
-            ) |pin, *sel_bounds| {
+                row_dirties,
+            ) |pin, *sel_bounds, *dirty| {
                 const p = s.pages.pointFromPin(.screen, pin).?.screen;
                 const row_sel = sel.containedRowCached(
                     s,
                     cache.tl_pin,
-                    cache.br_pin,
+                    br_pin,
                     pin,
                     tl,
                     br,
                     p,
-                ) orelse continue;
+                ) orelse {
+                    if (sel_bounds.* != null) {
+                        sel_bounds.* = null;
+                        dirty.* = true;
+                        any_dirty = true;
+                    }
+                    continue;
+                };
                 const start = row_sel.start();
                 const end = row_sel.end();
                 assert(start.node == end.node);
                 assert(start.x <= end.x);
                 assert(start.y == end.y);
-                sel_bounds.* = .{ start.x, end.x };
+
+                const start_x = if (start.x > 0 and
+                    start.rowAndCell().cell.wide == .spacer_tail)
+                    start.x - 1
+                else
+                    start.x;
+
+                sel_bounds.* = .{ start_x, end.x };
             }
         }
 
@@ -677,22 +710,28 @@ pub const RenderState = struct {
         const row_arenas = row_data.items(.arena);
         const row_dirties = row_data.items(.dirty);
         const row_pins = row_data.items(.pin);
+        const row_serials = row_data.items(.serial);
         const row_highlights_slice = row_data.items(.highlights);
         for (
             row_arenas,
             row_pins,
+            row_serials,
             row_highlights_slice,
             row_dirties,
-        ) |*row_arena, row_pin, *row_highlights, *dirty| {
+        ) |*row_arena, row_pin, row_serial, *row_highlights, *dirty| {
             for (hls) |hl| {
                 const chunks_slice = hl.chunks.slice();
                 const nodes = chunks_slice.items(.node);
+                const serials = chunks_slice.items(.serial);
                 const starts = chunks_slice.items(.start);
                 const ends = chunks_slice.items(.end);
                 for (0.., nodes) |i, node| {
-                    // If this node doesn't match or we're not within
-                    // the row range, skip it.
+                    // If this node generation doesn't match or we're not
+                    // within the row range, skip it. Both serials are copied
+                    // values, so this never dereferences a node outside the
+                    // terminal lock.
                     if (node != row_pin.node or
+                        serials[i] != row_serial or
                         row_pin.y < starts[i] or
                         row_pin.y >= ends[i]) continue;
 
@@ -824,7 +863,7 @@ pub const RenderState = struct {
 
         // Grab our link ID
         const link_pin: PageList.Pin = row_pins[viewport_point.y];
-        const link_page: *page.Page = &link_pin.node.data;
+        const link_page: *page.Page = link_pin.node.page();
         const link = link: {
             const rac = link_page.getRowAndCell(
                 viewport_point.x,
@@ -853,7 +892,7 @@ pub const RenderState = struct {
             for (0.., cells.items(.raw)) |x, cell| {
                 if (!cell.hyperlink) continue;
 
-                const other_page: *page.Page = &pin.node.data;
+                const other_page: *page.Page = pin.node.page();
                 const other = link: {
                     const rac = other_page.getRowAndCell(x, pin.y);
                     const link_id = other_page.lookupHyperlink(rac.cell) orelse continue;
@@ -1258,6 +1297,96 @@ test "selection multiple lines" {
     );
 }
 
+test "selection starting on wide char spacer tail" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Wide char at x=1 with its spacer tail at x=2.
+    s.nextSlice("a宽b");
+
+    // Start on the spacer tail, as when selecting from the right.
+    const screen: *Screen = t.screens.active;
+    try screen.select(.init(
+        screen.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
+        false,
+    ));
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const sels = row_data.items(.selection);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 1, 3 }, &sels[0].?);
+    try testing.expectEqual(null, sels[1]);
+}
+
+test "selection ending on wide char spacer head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The wide char wraps, leaving a spacer head at x=9.
+    // Position the cursor before rendering so overwriting the spacer
+    // head won't dirty the following row through cursor movement.
+    s.nextSlice("abcdefghi宽\x1b[1;10H");
+
+    // Select up to and including the spacer head.
+    const screen: *Screen = t.screens.active;
+    const sel: Selection = .init(
+        screen.pages.pin(.{ .active = .{ .x = 7, .y = 0 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 9, .y = 0 } }).?,
+        false,
+    );
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // A rectangle selection doesn't unwrap so it doesn't extend.
+    try screen.select(.init(sel.start(), sel.end(), true));
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const sels = row_data.items(.selection);
+    const dirty = row_data.items(.dirty);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 7, 9 }, &sels[0].?);
+    try testing.expectEqual(null, sels[1]);
+
+    // A normal selection includes the wrapped wide char.
+    try screen.select(sel);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 7, 9 }, &sels[0].?);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 0, 0 }, &sels[1].?);
+    try testing.expectEqual(null, sels[2]);
+
+    // Removing the spacer head must unselect and redraw the following row.
+    state.dirty = .false;
+    @memset(dirty, false);
+    s.nextSlice("Z");
+    try state.update(alloc, &t);
+    try testing.expectEqual(null, sels[1]);
+    try testing.expect(dirty[1]);
+    try testing.expect(!dirty[2]);
+}
+
 test "linkCells" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1342,7 +1471,7 @@ test "linkCells with scrollback spanning pages" {
     defer s.deinit();
 
     const pages = &t.screens.active.pages;
-    const first_page_cap = pages.pages.first.?.data.capacity.rows;
+    const first_page_cap = pages.pages.first.?.capacity().rows;
 
     // Fill first page
     for (0..first_page_cap - 1) |_| s.nextSlice("\r\n");
@@ -1401,6 +1530,73 @@ test "linkCells with invalid viewport point" {
         );
         defer cells.deinit(alloc);
         try testing.expectEqual(0, cells.count());
+    }
+}
+
+test "flattened highlights require matching page serial" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    // Capture the live generation while terminal-owned state is in scope so
+    // we can also verify update copies it into the render row.
+    const live_pin = t.screens.active.pages.getTopLeft(.viewport);
+    const live_serial = live_pin.node.serial;
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const pin: PageList.Pin = pin: {
+        const row_data = state.row_data.slice();
+        @memset(row_data.items(.dirty), false);
+        state.dirty = .false;
+        break :pin row_data.items(.pin)[0];
+    };
+    const row_serial = state.row_data.items(.serial)[0];
+    try testing.expectEqual(live_pin.node, pin.node);
+    try testing.expectEqual(live_serial, row_serial);
+
+    // Use the exact node pointer and row captured by the render state, but a
+    // different generation. A reused node address must not make this stale
+    // flattened highlight match.
+    var hl: highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = 2,
+        .bot_x = 4,
+    };
+    defer hl.deinit(alloc);
+    try hl.chunks.append(alloc, .{
+        .node = pin.node,
+        .serial = live_serial ^ 1,
+        .start = pin.y,
+        .end = pin.y + 1,
+    });
+
+    try state.updateHighlightsFlattened(alloc, 42, &.{hl});
+    {
+        const row_data = state.row_data.slice();
+        try testing.expectEqual(0, row_data.items(.highlights)[0].items.len);
+        try testing.expect(!row_data.items(.dirty)[0]);
+        try testing.expectEqual(.false, state.dirty);
+    }
+
+    // The same chunk is accepted once its copied serial also matches.
+    hl.chunks.items(.serial)[0] = live_serial;
+    try state.updateHighlightsFlattened(alloc, 42, &.{hl});
+    {
+        const row_data = state.row_data.slice();
+        const row_highlights = row_data.items(.highlights)[0].items;
+        try testing.expectEqual(1, row_highlights.len);
+        try testing.expectEqual(42, row_highlights[0].tag);
+        try testing.expectEqual([2]size.CellCountInt{ 2, 4 }, row_highlights[0].range);
+        try testing.expect(row_data.items(.dirty)[0]);
+        try testing.expectEqual(.partial, state.dirty);
     }
 }
 

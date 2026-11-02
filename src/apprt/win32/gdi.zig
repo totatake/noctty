@@ -70,9 +70,24 @@ pub fn drawRoundedRect(hdc: HDC, rect: RECT, bg: u32, border: u32, radius: i32) 
     _ = sys.SelectObject(hdc, old_brush);
 }
 
+/// Tabs at a maximized/fullscreen client edge have square upper corners.
+/// Other buttons keep the shared rounded rectangle's physical-pixel inset.
+pub fn drawTabButton(hdc: HDC, rect: RECT, bg: u32, border: u32, radius: i32, flush_top: bool) void {
+    drawRoundedRect(hdc, rect, bg, border, radius);
+    if (!flush_top or rect.right - rect.left <= 2 or rect.bottom - rect.top <= 2) return;
+    // Keep the original lower corners and side inset. Replace only the
+    // rounded upper cap, whose usual one-pixel inset leaves a visible gap
+    // even when the tab HWND starts at the maximized client edge.
+    const cap_bottom = @min(rect.bottom - 1, rect.top + @max(2, radius));
+    fillSolidRect(hdc, .{ .left = rect.left + 1, .top = rect.top, .right = rect.right - 1, .bottom = cap_bottom }, bg);
+    drawRectBorder(hdc, .{ .left = rect.left + 1, .top = rect.top, .right = rect.right - 1, .bottom = cap_bottom + 1 }, border, 1);
+    // The cap is open below: the rounded rectangle already painted there.
+    fillSolidRect(hdc, .{ .left = rect.left + 2, .top = cap_bottom, .right = rect.right - 2, .bottom = cap_bottom + 1 }, bg);
+}
+
 /// Stroke a focus ring without erasing content already painted inside it.
 pub fn drawRoundedOutline(hdc: HDC, rect: RECT, border: u32, radius: i32) void {
-    const brush = sys.GetStockObject(NULL_BRUSH) orelse return;
+    const brush = sys.GetStockObject(c.NULL_BRUSH) orelse return;
     const pen = sys.GetStockObject(c.DC_PEN) orelse return;
     const old_color = sys.SetDCPenColor(hdc, border);
     defer _ = sys.SetDCPenColor(hdc, old_color);
@@ -99,10 +114,6 @@ pub const StatusBadge = union(enum) {
     cross,
 };
 
-const NULL_BRUSH: i32 = 5;
-const NULL_PEN: i32 = 8;
-const PS_SOLID: i32 = 0;
-
 /// Draw `badge` inside the square `rect` in `color`, with lines `stroke`
 /// pixels wide. A progress ring's track is `color` faded into `bg`, or in
 /// high contrast, which allows only system colors, a hairline in `color`.
@@ -117,11 +128,11 @@ pub fn drawStatusBadge(
 ) void {
     const size = rect.right - rect.left;
     if (size < 4 or rect.bottom - rect.top != size) return;
-    const pen = sys.CreatePen(PS_SOLID, stroke, color) orelse return;
+    const pen = sys.CreatePen(c.PS_SOLID, stroke, color) orelse return;
     defer _ = sys.DeleteObject(pen);
     const brush = sys.GetStockObject(c.DC_BRUSH) orelse return;
-    const no_brush = sys.GetStockObject(NULL_BRUSH) orelse return;
-    const no_pen = sys.GetStockObject(NULL_PEN) orelse return;
+    const no_brush = sys.GetStockObject(c.NULL_BRUSH) orelse return;
+    const no_pen = sys.GetStockObject(c.NULL_PEN) orelse return;
     _ = sys.SetDCBrushColor(hdc, color);
     const old_pen = sys.SelectObject(hdc, pen);
     defer _ = sys.SelectObject(hdc, old_pen);
@@ -141,15 +152,13 @@ pub fn drawStatusBadge(
                 .right = rect.right - half,
                 .bottom = rect.bottom - half,
             };
-            const percent = progress orelse {
-                _ = sys.Ellipse(hdc, ring.left, ring.top, ring.right, ring.bottom);
-                return;
-            };
+            // Without a percentage the whole ring is bright, as at 100%.
+            const percent = progress orelse 100;
             if (percent < 100) {
                 const track = if (high_contrast)
-                    sys.CreatePen(PS_SOLID, 1, color) orelse return
+                    sys.CreatePen(c.PS_SOLID, 1, color) orelse return
                 else
-                    sys.CreatePen(PS_SOLID, stroke, blendColorRGB(bg, color, 0.35)) orelse return;
+                    sys.CreatePen(c.PS_SOLID, stroke, blendColorRGB(bg, color, 0.35)) orelse return;
                 defer _ = sys.DeleteObject(track);
                 _ = sys.SelectObject(hdc, track);
                 _ = sys.Ellipse(hdc, ring.left, ring.top, ring.right, ring.bottom);
@@ -240,6 +249,18 @@ fn rectIntersects(a: RECT, b: RECT) bool {
 fn utf16GdiTextLen(text: [:0]const u16) i32 {
     const max_len: usize = @intCast(std.math.maxInt(i32));
     return @intCast(@min(text.len, max_len));
+}
+
+/// An icon font of `face` with a `height_px` device-pixel em.
+pub fn createIconFontForFace(face: [*:0]const u16, height_px: i32) ?*anyopaque {
+    var lf: sys.LOGFONTW = .{};
+    lf.lfHeight = -height_px;
+    lf.lfWeight = c.FW_NORMAL;
+    lf.lfQuality = c.CLEARTYPE_QUALITY;
+    const name = std.mem.span(face);
+    const copy_len = @min(name.len, c.LF_FACESIZE - 1);
+    @memcpy(lf.lfFaceName[0..copy_len], name[0..copy_len]);
+    return sys.CreateFontIndirectW(&lf);
 }
 
 test "win32 rectIntersects only trips on positive overlap" {

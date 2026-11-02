@@ -14,13 +14,6 @@ const c = @import("consts.zig");
 
 const log = std.log.scoped(.save_target);
 
-extern "kernel32" fn GetFinalPathNameByHandleW(
-    handle: windows.HANDLE,
-    path: [*]u16,
-    size: u32,
-    flags: u32,
-) callconv(.winapi) u32;
-
 extern "kernel32" fn GetFileInformationByHandle(
     handle: windows.HANDLE,
     info: *windows.BY_HANDLE_FILE_INFORMATION,
@@ -107,7 +100,7 @@ fn finalPath(alloc: Allocator, handle: windows.HANDLE) error{ OutOfMemory, Unres
     const final = while (true) {
         // Success is the length without the terminator; a buffer that is too
         // small gets the length it needs, terminator included.
-        const length = GetFinalPathNameByHandleW(handle, storage.ptr, @intCast(storage.len), 0);
+        const length = sys.GetFinalPathNameByHandleW(handle, storage.ptr, @intCast(storage.len), 0);
         if (length == 0) return error.Unresolved;
         if (length < storage.len) break storage[0..length];
         storage = try alloc.realloc(storage, length);
@@ -245,15 +238,17 @@ fn rewriteOpened(
     bytes: []const u8,
     kept_copy: ?*?[]u8,
 ) WriteError!void {
-    file.writeAll(bytes) catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
-    file.setEndPos(bytes.len) catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
-    file.sync() catch return incompleteRewrite(alloc, target_path, tmp_path, kept_copy);
+    replaceContents(file, bytes) catch {
+        log.warn("rewriting {s} in place failed; the complete new text is in {s}", .{ target_path, tmp_path });
+        if (kept_copy) |out| out.* = alloc.dupe(u8, tmp_path) catch null;
+        return error.IncompleteWrite;
+    };
 }
 
-fn incompleteRewrite(alloc: Allocator, target_path: []const u8, tmp_path: []const u8, kept_copy: ?*?[]u8) error{IncompleteWrite} {
-    log.warn("rewriting {s} in place failed; the complete new text is in {s}", .{ target_path, tmp_path });
-    if (kept_copy) |out| out.* = alloc.dupe(u8, tmp_path) catch null;
-    return error.IncompleteWrite;
+fn replaceContents(file: std.fs.File, bytes: []const u8) !void {
+    try file.writeAll(bytes);
+    try file.setEndPos(bytes.len);
+    try file.sync();
 }
 
 const testing = std.testing;
@@ -283,10 +278,15 @@ pub const Scratch = struct {
         return std.fs.path.join(testing.allocator, &.{ self.root, name });
     }
 
+    /// `path(name)` as UTF-16, for the Win32 calls.
+    fn pathW(self: *const Scratch, name: []const u8) ![:0]u16 {
+        const p = try self.path(name);
+        defer testing.allocator.free(p);
+        return std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, p);
+    }
+
     pub fn symlink(self: *const Scratch, link: []const u8, target: []const u8) !void {
-        const link_path = try self.path(link);
-        defer testing.allocator.free(link_path);
-        const link_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, link_path);
+        const link_w = try self.pathW(link);
         defer testing.allocator.free(link_w);
         const target_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, target);
         defer testing.allocator.free(target_w);
@@ -298,22 +298,16 @@ pub const Scratch = struct {
     }
 
     pub fn hardlink(self: *const Scratch, link: []const u8, existing: []const u8) !void {
-        const link_path = try self.path(link);
-        defer testing.allocator.free(link_path);
-        const existing_path = try self.path(existing);
-        defer testing.allocator.free(existing_path);
-        const link_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, link_path);
+        const link_w = try self.pathW(link);
         defer testing.allocator.free(link_w);
-        const existing_w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, existing_path);
+        const existing_w = try self.pathW(existing);
         defer testing.allocator.free(existing_w);
         if (CreateHardLinkW(link_w, existing_w, null) == 0) return error.HardLinkFailed;
     }
 
     /// Whether the name itself, not what it reaches, is a reparse point.
     pub fn isLink(self: *const Scratch, name: []const u8) !bool {
-        const p = try self.path(name);
-        defer testing.allocator.free(p);
-        const w = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, p);
+        const w = try self.pathW(name);
         defer testing.allocator.free(w);
         const attributes = windows.kernel32.GetFileAttributesW(w);
         return attributes != windows.INVALID_FILE_ATTRIBUTES and attributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0;

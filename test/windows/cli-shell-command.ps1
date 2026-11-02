@@ -14,6 +14,11 @@ param(
     [string] $BinDir
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-shell-command.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -191,3 +196,7 @@ if (-not $outputText.Contains($ExpectedText)) {
 }
 
 Write-Host "shell launcher validation: PASS (shell=$Shell, args=$argsDisplay)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

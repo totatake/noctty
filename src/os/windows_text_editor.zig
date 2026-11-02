@@ -2,9 +2,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
-const shell = @import("../config/windows_shell.zig");
+const os_path = @import("path.zig");
 const os_windows = @import("windows.zig");
-const local_target = @import("../apprt/win32/local_target.zig");
+const local_path = @import("local_path.zig");
 
 pub const failure_message = "Could not open the config file in a text editor. Check that the file is accessible and a text editor is installed, then try again.";
 
@@ -39,7 +39,6 @@ comptime {
 }
 
 extern "shell32" fn ShellExecuteExW(info: *ShellExecuteInfo) callconv(.winapi) windows.BOOL;
-extern "shlwapi" fn AssocQueryStringW(flags: u32, str: u32, assoc: [*:0]const u16, extra: ?[*:0]const u16, out: ?[*]u16, len: *u32) callconv(.winapi) windows.HRESULT;
 extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, flags: u32) callconv(.winapi) windows.HRESULT;
 extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 
@@ -48,7 +47,7 @@ pub fn open(alloc: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn queryAssociation(flags: u32, str: u32, assoc: [*:0]const u16, extra: ?[*:0]const u16, out: ?[*]u16, len: *u32) !windows.HRESULT {
-    return AssocQueryStringW(flags, str, assoc, extra, out, len);
+    return os_windows.AssocQueryStringW(flags, str, assoc, extra, out, len);
 }
 
 fn execute(info: *ShellExecuteInfo) !bool {
@@ -64,23 +63,22 @@ fn execute(info: *ShellExecuteInfo) !bool {
 fn openWith(alloc: std.mem.Allocator, path: []const u8, comptime query_association: anytype, comptime shell_execute: anytype) !void {
     // Screen before opening anything, including any reparse target. The class
     // override must never make a network or device path acceptable.
-    if (!shell.isSafeWindowsPath(path) or !shell.isDriveAbsolutePath(path) or
-        @import("path.zig").isNetworkOrDevicePath(path) or
+    if (!os_path.isSafeWindowsPath(path) or !os_path.isDriveAbsolutePath(path) or
+        os_path.isNetworkOrDevicePath(path) or
         std.mem.indexOfScalar(u8, path[2..], ':') != null) return error.OpenConfigRejected;
     var components = std.mem.tokenizeAny(u8, path[3..], "/\\");
     while (components.next()) |component| {
         if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) continue;
         if (component[component.len - 1] == '.' or component[component.len - 1] == ' ') return error.OpenConfigRejected;
     }
-    const normalized = try std.fs.path.resolve(alloc, &.{path});
-    defer alloc.free(normalized);
-    if (!shell.isDriveAbsolutePath(normalized) or
-        os_windows.driveTypeForLetter(normalized[0]) == os_windows.DRIVE_REMOTE) return error.OpenConfigRejected;
-    const file = local_target.open(alloc, normalized, false) orelse return error.OpenConfigRejected;
-    defer file.close();
-    if ((try file.stat()).kind != .file) return error.OpenConfigRejected;
+    const found = switch (try local_path.open(alloc, path, .{})) {
+        .found => |hit| hit,
+        .missing, .refused => return error.OpenConfigRejected,
+    };
+    defer found.deinit(alloc);
+    if ((try found.file.stat()).kind != .file) return error.OpenConfigRejected;
 
-    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, normalized);
+    const path_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, found.path);
     defer alloc.free(path_w);
     // SEE_MASK_CLASSNAME requires the association's ProgID, not its extension.
     // Let the shell resolve .txt (including UserChoice), without reading or
@@ -200,9 +198,12 @@ test "SET text editor query failure and invalid bounded ProgID never dispatch th
                 },
                 .unterminated, .embedded_null, .short_count => {
                     @memcpy(out.?[0..4], &[_]u16{ 'A', 'B', 'C', 0 });
-                    len.* = if (mode == .embedded_null) 4 else 3;
+                    len.* = switch (mode) {
+                        .embedded_null => 4,
+                        .short_count => 2,
+                        else => 3,
+                    };
                     if (mode == .embedded_null) out.?[1] = 0;
-                    if (mode == .short_count) len.* = 2;
                 },
             }
             return 0;

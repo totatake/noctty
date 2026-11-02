@@ -3,6 +3,11 @@
 [CmdletBinding()]
 param()
 
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Test-WindowsX64Baseline.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $checker = Join-Path $repoRoot 'scripts/check-windows-x64-baseline.ps1'
@@ -172,4 +177,8 @@ finally {
         (Test-Path -LiteralPath $resolvedRoot)) {
         Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

@@ -8,6 +8,7 @@ const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
 const stream = @import("stream.zig");
 const Action = stream.Action;
+const CursorStyleReq = @import("ansi.zig").CursorStyle;
 const Screen = @import("Screen.zig");
 const modes = @import("modes.zig");
 const osc_color = @import("osc/parsers/color.zig");
@@ -70,7 +71,7 @@ pub const Handler = struct {
         /// valid for the lifetime of the call.
         enquiry: ?*const fn (*Handler) []const u8,
 
-        /// Called in response to XTWINOPS size queries (CSI 14/16/18 t).
+        /// Called in response to XTWINOPS size queries (CSI 14/16/18/19 t).
         /// Returns the current terminal geometry used for encoding.
         /// Return null to silently ignore the query.
         size: ?*const fn (*Handler) ?size_report.Size,
@@ -95,8 +96,12 @@ pub const Handler = struct {
         /// terminal calls this with a `clear` report without an id.
         ///
         /// Setting this also makes the terminal answer the support query,
-        /// `OSC 7501 ; ?`, through `write_pty`. While this is null, the
-        /// query gets no reply, so programs know not to send reports.
+        /// `OSC 7501 ; ?`, through `write_pty`. The reply is
+        /// `osc.program_status.query_reply`, which lists the states and
+        /// kinds the terminal accepts. While this is null, the query gets
+        /// no reply, so a program that asks sees the protocol as
+        /// unsupported. Asking is optional, so reports may still arrive.
+        /// They are dropped.
         program_status: ?*const fn (*Handler, osc.Command.ProgramStatus.Report) void,
 
         /// No effects means that the stream effectively becomes readonly
@@ -157,29 +162,11 @@ pub const Handler = struct {
             .cursor_left => self.terminal.cursorLeft(value.value),
             .cursor_right => self.terminal.cursorRight(value.value),
             .cursor_pos => self.terminal.setCursorPos(value.row, value.col),
-            .cursor_col => self.terminal.setCursorPos(self.terminal.screens.active.cursor.y + 1, value.value),
-            .cursor_row => self.terminal.setCursorPos(value.value, self.terminal.screens.active.cursor.x + 1),
-            .cursor_col_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1,
-                self.terminal.screens.active.cursor.x + 1 +| value.value,
-            ),
-            .cursor_row_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1 +| value.value,
-                self.terminal.screens.active.cursor.x + 1,
-            ),
-            .cursor_style => {
-                const blink = switch (value) {
-                    .default, .steady_block, .steady_bar, .steady_underline => false,
-                    .blinking_block, .blinking_bar, .blinking_underline => true,
-                };
-                const style: Screen.CursorStyle = switch (value) {
-                    .default, .blinking_block, .steady_block => .block,
-                    .blinking_bar, .steady_bar => .bar,
-                    .blinking_underline, .steady_underline => .underline,
-                };
-                self.terminal.modes.set(.cursor_blinking, blink);
-                self.terminal.screens.active.cursor.cursor_style = style;
-            },
+            .cursor_col => self.terminal.setCursorCol(value.value),
+            .cursor_row => self.terminal.setCursorRow(value.value),
+            .cursor_col_relative => self.terminal.cursorColRelative(value.value),
+            .cursor_row_relative => self.terminal.cursorRowRelative(value.value),
+            .cursor_style => self.setCursorStyle(value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
             .erase_display_complete => self.terminal.eraseDisplay(.complete, value),
@@ -244,6 +231,10 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
+            .soft_reset => {
+                self.terminal.softReset();
+                self.setCursorStyle(.default);
+            },
             .full_reset => {
                 self.terminal.fullReset();
                 self.programStatusReport(.{ .state = .clear });
@@ -259,7 +250,7 @@ pub const Handler = struct {
             // APC
             .apc_start => self.apc_handler.start(),
             .apc_put => self.apc_handler.feed(self.terminal.gpa(), value),
-            .apc_end => self.apcEnd(),
+            .apc_end => self.apcEnd(value.terminated),
 
             // Effect-based handlers
             .bell => self.bell(),
@@ -304,12 +295,14 @@ pub const Handler = struct {
             .report => |report| self.programStatusReport(report),
 
             // Only claim support when something handles the reports. The
-            // reply is always the same fixed bytes. The specification
-            // never allows sending report contents back to the program.
+            // reply is always the same fixed bytes: `?` and the lists of
+            // states and kinds we accept. The specification never allows
+            // sending report contents back to the program.
             .query => |terminator| if (self.effects.program_status != null) {
+                const reply = "\x1b]7501;" ++ osc.program_status.query_reply;
                 self.writePty(switch (terminator) {
-                    .st => "\x1b]7501;?\x1b\\",
-                    .bel => "\x1b]7501;?\x07",
+                    .st => reply ++ "\x1b\\",
+                    .bel => reply ++ "\x07",
                 });
             },
         }
@@ -345,24 +338,40 @@ pub const Handler = struct {
         self.writePty(written);
     }
 
+    /// The cursor position for a CPR/DECXCPR report, honoring origin mode
+    /// (relative to the scrolling region when DECOM is set).
+    fn cursorReportPos(self: *Handler) struct { x: usize, y: usize } {
+        return if (self.terminal.modes.get(.origin)) .{
+            .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
+            .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
+        } else .{
+            .x = self.terminal.screens.active.cursor.x,
+            .y = self.terminal.screens.active.cursor.y,
+        };
+    }
+
     fn deviceStatus(self: *Handler, req: device_status.Request) void {
         switch (req) {
             .operating_status => self.writePty("\x1B[0n"),
 
             .cursor_position => {
-                const pos: struct {
-                    x: usize,
-                    y: usize,
-                } = if (self.terminal.modes.get(.origin)) .{
-                    .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
-                    .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
-                } else .{
-                    .x = self.terminal.screens.active.cursor.x,
-                    .y = self.terminal.screens.active.cursor.y,
-                };
+                const pos = self.cursorReportPos();
 
                 var buf: [64]u8 = undefined;
                 const resp = std.fmt.bufPrintZ(&buf, "\x1B[{};{}R", .{
+                    pos.y + 1,
+                    pos.x + 1,
+                }) catch return;
+                self.writePty(resp);
+            },
+
+            // DECXCPR: extended cursor position adds a page number. Ghostty has
+            // no page memory, so the page is always 1.
+            .cursor_position_extended => {
+                const pos = self.cursorReportPos();
+
+                var buf: [64]u8 = undefined;
+                const resp = std.fmt.bufPrintZ(&buf, "\x1B[?{};{};1R", .{
                     pos.y + 1,
                     pos.x + 1,
                 }) catch return;
@@ -422,13 +431,14 @@ pub const Handler = struct {
                 aw.writer.print("\x1b]l{s}\x1b\\", .{title}) catch return;
             },
 
-            .csi_14_t, .csi_16_t, .csi_18_t => {
+            .csi_14_t, .csi_16_t, .csi_18_t, .csi_19_t => {
                 const get_size = self.effects.size orelse return;
                 const s = get_size(self) orelse return;
                 const report_style: size_report.Style = switch (style) {
                     .csi_14_t => .csi_14_t,
                     .csi_16_t => .csi_16_t,
                     .csi_18_t => .csi_18_t,
+                    .csi_19_t => .csi_19_t,
                     .csi_21_t => unreachable,
                 };
                 size_report.encode(
@@ -467,6 +477,20 @@ pub const Handler = struct {
         func(self);
     }
 
+    fn setCursorStyle(self: *Handler, value: CursorStyleReq) void {
+        const blink = switch (value) {
+            .default, .steady_block, .steady_bar, .steady_underline => false,
+            .blinking_block, .blinking_bar, .blinking_underline => true,
+        };
+        const style: Screen.CursorStyle = switch (value) {
+            .default, .blinking_block, .steady_block => .block,
+            .blinking_bar, .steady_bar => .bar,
+            .blinking_underline, .steady_underline => .underline,
+        };
+        self.terminal.modes.set(.cursor_blinking, blink);
+        self.terminal.screens.active.cursor.cursor_style = style;
+    }
+
     fn requestMode(self: *Handler, mode: modes.Mode) void {
         const report = self.terminal.modes.getReport(.fromMode(mode));
         self.sendModeReport(report);
@@ -474,7 +498,7 @@ pub const Handler = struct {
 
     fn requestModeUnknown(self: *Handler, mode_raw: u16, ansi: bool) void {
         const report = self.terminal.modes.getReport(.{
-            .value = @truncate(mode_raw),
+            .value = mode_raw,
             .ansi = ansi,
         });
         self.sendModeReport(report);
@@ -702,10 +726,17 @@ pub const Handler = struct {
         }
     }
 
-    fn apcEnd(self: *Handler) void {
+    /// Finish the current APC and run its command. `terminated` is false
+    /// when the APC was cancelled or aborted, and then nothing runs.
+    fn apcEnd(self: *Handler, terminated: bool) void {
         const alloc = self.terminal.gpa();
         var cmd = self.apc_handler.end() orelse return;
         defer cmd.deinit(alloc);
+
+        // ECMA-48 says a cancelled or aborted string is thrown away, so
+        // its command must not run. end() above still resets the APC
+        // handler and frees what it collected.
+        if (!terminated) return;
 
         switch (cmd) {
             .kitty => |*kitty_cmd| if (comptime build_options.kitty_graphics) {
@@ -2046,7 +2077,7 @@ test "program_status effect callback" {
         var last_id_len: ?usize = null;
         var last_message: [64]u8 = undefined;
         var last_message_len: ?usize = null;
-        var written: [64]u8 = undefined;
+        var written: [128]u8 = undefined;
         var written_len: usize = 0;
 
         fn reset() void {
@@ -2095,12 +2126,15 @@ test "program_status effect callback" {
     var s: Stream = .initAlloc(testing.allocator, handler);
     defer s.deinit();
 
-    // The query is answered once with the same body and terminator.
+    // The query is answered once with `?`, the states and kinds we
+    // accept, and the same terminator the query used.
+    const reply = "\x1b]7501;?:states=idle,working,done,blocked,error" ++
+        ":kinds=permission,question,auth";
     s.nextSlice("\x1b]7501;?\x1b\\");
-    try testing.expectEqualStrings("\x1b]7501;?\x1b\\", S.written[0..S.written_len]);
+    try testing.expectEqualStrings(reply ++ "\x1b\\", S.written[0..S.written_len]);
     S.written_len = 0;
     s.nextSlice("\x1b]7501;?\x07");
-    try testing.expectEqualStrings("\x1b]7501;?\x07", S.written[0..S.written_len]);
+    try testing.expectEqualStrings(reply ++ "\x07", S.written[0..S.written_len]);
     try testing.expectEqual(@as(usize, 0), S.count);
     S.written_len = 0;
 
@@ -2187,6 +2221,7 @@ test "request mode DECRQM with write_pty callback" {
 
         // DECRQM for mode 7 (wraparound) — should be silently ignored
         s.nextSlice("\x1B[?7$p");
+        s.nextSlice("\x1B[4$p");
     }
 
     t.fullReset();
@@ -2218,9 +2253,87 @@ test "request mode DECRQM with write_pty callback" {
         s.nextSlice("\x1B[?7$p");
         try testing.expectEqualStrings("\x1B[?7;2$y", S.last_response.?);
 
+        // A large unknown mode must not alias wraparound mode 7.
+        const before = t.modes;
+        s.nextSlice("\x1B[?32775$p");
+        try testing.expectEqualStrings("\x1B[?32775;0$y", S.last_response.?);
+        try testing.expectEqualDeep(before, t.modes);
+
         // Query an unknown mode
         s.nextSlice("\x1B[?9999$p");
         try testing.expectEqualStrings("\x1B[?9999;0$y", S.last_response.?);
+
+        // Query DECECM, which Ghostty recognizes but does not allow changing
+        s.nextSlice("\x1B[?117$p");
+        try testing.expectEqualStrings("\x1B[?117;4$y", S.last_response.?);
+    }
+}
+
+test "request mode DECRQM ANSI responses" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [32]u8 = undefined;
+        var len: usize = 0;
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            len = data.len;
+            calls += 1;
+        }
+    };
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Runtime loops: the fork's `nextSlice` is inline, and upstream's
+    // `inline for` here exceeds the comptime branch quota.
+    for ([_]struct { []const u8, modes.Mode }{
+        .{ "2", .disable_keyboard },
+        .{ "4", .insert },
+        .{ "12", .send_receive_mode },
+        .{ "20", .linefeed },
+    }) |mode| {
+        for ([_]bool{ false, true, false }) |enabled| {
+            var set_buf: [8]u8 = undefined;
+            s.nextSlice(try std.fmt.bufPrint(&set_buf, "\x1b[{s}{c}", .{ mode[0], @as(u8, if (enabled) 'h' else 'l') }));
+            try testing.expectEqual(enabled, t.modes.get(mode[1]));
+            var query_buf: [8]u8 = undefined;
+            const query = try std.fmt.bufPrint(&query_buf, "\x1b[{s}$p", .{mode[0]});
+            var expected_buf: [16]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{s};{c}$y", .{ mode[0], @as(u8, if (enabled) '1' else '2') });
+            for (0..query.len + 1) |split| {
+                S.calls = 0;
+                S.len = 0;
+                s.nextSlice(query[0..split]);
+                if (split < query.len) try testing.expectEqual(0, S.calls);
+                s.nextSlice(query[split..]);
+                try testing.expectEqual(1, S.calls);
+                try testing.expectEqualStrings(expected, S.response[0..S.len]);
+                try testing.expectEqual(enabled, t.modes.get(mode[1]));
+            }
+        }
+    }
+
+    // The two namespaces must report independent states for mode 4.
+    s.nextSlice("\x1b[4h\x1b[?4l");
+    const cases = [_][2][]const u8{
+        .{ "\x1b[4$p", "\x1b[4;1$y" },
+        .{ "\x1b[?4$p", "\x1b[?4;2$y" },
+        .{ "\x1b[9999$p", "\x1b[9999;0$y" },
+        // Unimplemented ANSI modes report permanently reset (xterm parity).
+        .{ "\x1b[1$p", "\x1b[1;4$y" },
+        .{ "\x1b[19$p", "\x1b[19;4$y" },
+    };
+    for (cases) |case| {
+        S.calls = 0;
+        S.len = 0;
+        s.nextSlice(case[0]);
+        try testing.expectEqual(1, S.calls);
+        try testing.expectEqualStrings(case[1], S.response[0..S.len]);
     }
 }
 
@@ -2393,9 +2506,12 @@ test "kitty_keyboard_query" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
     };
     S.written = null;
@@ -2422,9 +2538,12 @@ test "xtversion default" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
     };
     S.written = null;
@@ -2445,9 +2564,12 @@ test "xtversion with effect" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
         fn xtversion(_: *Handler) []const u8 {
             return "ghostty 1.2.3";
@@ -2471,9 +2593,12 @@ test "xtversion with empty string effect" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
         fn xtversion(_: *Handler) []const u8 {
             return "";
@@ -2575,6 +2700,34 @@ test "size report csi_18_t with effect" {
     s.nextSlice("\x1b[18t");
     defer testing.allocator.free(S.written.?);
     try testing.expectEqualStrings("\x1b[8;24;80t", S.written.?);
+}
+
+test "size report csi_19_t with effect" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+        fn getSize(_: *Handler) ?size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 9, .cell_height = 18 };
+        }
+    };
+    S.written = null;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.size = &S.getSize;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // CSI 19 t - report screen size in characters
+    s.nextSlice("\x1b[19t");
+    defer testing.allocator.free(S.written.?);
+    try testing.expectEqualStrings("\x1b[9;24;80t", S.written.?);
 }
 
 test "size report no effect callback" {
@@ -2789,6 +2942,64 @@ test "device status: cursor position with origin mode" {
     s.nextSlice("\x1B[6n");
     // Should report position relative to the scroll region
     try testing.expectEqualStrings("\x1B[3;5R", S.written.?);
+}
+
+test "device status: extended cursor position" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            if (written) |old| testing.allocator.free(old);
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.written = null;
+    defer if (S.written) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // DECXCPR (CSI ? 6 n) reports CSI ? row ; col ; page R.
+    // Ghostty has no page memory, so page is always 1.
+    s.nextSlice("\x1B[5;3H");
+    s.nextSlice("\x1B[?6n");
+    try testing.expectEqualStrings("\x1B[?5;3;1R", S.written.?);
+}
+
+test "device status: extended cursor position with origin mode" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            if (written) |old| testing.allocator.free(old);
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.written = null;
+    defer if (S.written) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Set scroll region rows 5-20
+    s.nextSlice("\x1B[5;20r");
+    // Enable origin mode
+    s.nextSlice("\x1B[?6h");
+    // Move to row 3, col 5 within the region
+    s.nextSlice("\x1B[3;5H");
+    // DECXCPR reports position relative to the scroll region, plus page 1
+    s.nextSlice("\x1B[?6n");
+    try testing.expectEqualStrings("\x1B[?3;5;1R", S.written.?);
 }
 
 test "device status: color scheme dark" {
@@ -3083,4 +3294,26 @@ test "kitty graphics via APC" {
     const storage = &t.screens.active.kitty_images;
     const img = storage.imageById(1).?;
     try testing.expectEqual(.rgb, img.format);
+}
+
+test "kitty graphics APC cancelled or aborted is discarded" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    // CAN (0x18) and SUB (0x1A) cancel the APC, and CSI (0x9B), like
+    // any 8-bit control other than ST, aborts it. Either way the
+    // transmit command must not run, so image 7 is never stored.
+    for ([_][]const u8{ "\x18", "\x1a", "\x9b" }) |ending| {
+        var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+        defer t.deinit(testing.allocator);
+
+        const handler: Handler = .init(&t);
+        var s: Stream = .initAlloc(testing.allocator, handler);
+        defer s.deinit();
+
+        s.nextSlice("\x1b_Ga=t,f=24,s=1,v=1,i=7;AAAA");
+        s.nextSlice(ending);
+
+        const storage = &t.screens.active.kitty_images;
+        try testing.expect(storage.imageById(7) == null);
+    }
 }

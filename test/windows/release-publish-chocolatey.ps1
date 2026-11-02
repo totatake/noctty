@@ -2,6 +2,11 @@
 [CmdletBinding()]
 param()
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'release-publish-chocolatey.ps1'
+try {
+
+
 # Runs scripts/release-publish-chocolatey.ps1 in child processes against a fake
 # `choco` (first on PATH, logs every call) and a loopback stand-in for the
 # community feed, so the dry run, the skip rule, the resubmission switch and
@@ -185,4 +190,8 @@ finally {
         (Split-Path -Leaf $root) -like 'release-publish-chocolatey-*') {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Ignore
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

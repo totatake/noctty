@@ -2,7 +2,376 @@
   "files": [
     {
       "path": "AGENTS.md",
-      "description": "Repository-specific agent instructions, fork-targeting rules, and Win32 repaint/search pitfalls."
+      "description": "Repository-specific agent instructions: commands, running noctty safely, Win32 FFI, fork-targeting rules, and the index of the Self-Correction Log area files."
+    },
+    {
+      "path": "docs/agents/log/conpty.md",
+      "description": "Self-Correction Log: ConPTY, pty I/O and resize.",
+      "scope": [
+        "src/pty.zig",
+        "src/pty_transport_probe.zig",
+        "src/termio/**",
+        "src/os/main.zig",
+        "src/build/ConptyRedist.zig",
+        "scripts/stage-conpty-redist.ps1",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/surface_presentation.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/process_shared.zig",
+        "src/main_ghostty.zig",
+        "src/terminal/Screen.zig",
+        "src/terminal/resize_replay.zig",
+        "test/windows/interactive-win11-conpty-sync.ps1",
+        "src/os/local_path.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/shell-integration.md",
+      "description": "Self-Correction Log: shell integration scripts and their injection.",
+      "scope": [
+        "src/shell-integration/**",
+        "src/termio/shell_integration.zig",
+        "src/apprt/win32_powershell_install.zig",
+        "test/windows/*shell-integration*.ps1",
+        "test/windows/cmd-clink.*",
+        "src/config/windows_visual_studio.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/terminal-core.md",
+      "description": "Self-Correction Log: terminal core (VT parser, PageList, OSC parsers, search thread, core Surface).",
+      "scope": [
+        "src/terminal/**",
+        "src/inspector/widgets/pagelist.zig",
+        "pkg/wuffs/**",
+        "src/Surface.zig",
+        "src/termio/stream_handler.zig",
+        "src/os/hostname.zig",
+        "src/os/file.zig",
+        "src/os/TempDir.zig",
+        "src/os/local_path.zig",
+        "src/os/path.zig",
+        "src/config/windows_shell.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32_elevation.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/renderer.md",
+      "description": "Self-Correction Log: renderer, GPU, pacing and fonts.",
+      "scope": [
+        "src/renderer/**",
+        "src/renderer.zig",
+        "src/font/**",
+        "src/apprt/win32/pixel_format.zig",
+        "src/apprt/win32/wgl.zig",
+        "src/apprt/win32/gl_startup.zig",
+        "src/apprt/win32_compositor*.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/surface_presentation.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32_power.zig",
+        "src/os/monotonic.zig",
+        "build.zig.zon",
+        "src/termio/Thread.zig",
+        "src/Surface.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/window-frame.md",
+      "description": "Self-Correction Log: window frame, non-client area, DPI, placement, opacity and the quick terminal.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/registry.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/quick_terminal_host.zig",
+        "src/apprt/win32/session.zig",
+        "src/apprt/win32/surface_presentation.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32/window_state.zig",
+        "src/apprt/win32_nc_layout.zig",
+        "src/apprt/win32_quick_terminal.zig",
+        "src/apprt/win32/chrome_layout.zig",
+        "src/apprt/win32_session_state.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/chrome-tabs-paint.md",
+      "description": "Self-Correction Log: tab strip, chrome theme and accent, focus cues, icons, chrome repaint and text caches.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/overlay_session.zig",
+        "src/apprt/win32/palette_controller.zig",
+        "src/apprt/win32/search_controls.zig",
+        "src/apprt/win32/surface_presentation.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32_theme.zig",
+        "src/apprt/win32_tab_*.zig",
+        "src/apprt/win32_icons.zig",
+        "src/apprt/win32_tween.zig",
+        "src/apprt/win32/focus_cue.zig",
+        "src/apprt/win32/gdi.zig",
+        "src/apprt/win32/child_window.zig",
+        "src/apprt/win32/text.zig",
+        "src/apprt/win32/labels.zig",
+        "src/apprt/win32/chrome_layout.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/chrome-overlays.md",
+      "description": "Self-Correction Log: command palette, confirm and profile overlays, host banners.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/overlay_session.zig",
+        "src/apprt/win32/palette_controller.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32_palette*.zig",
+        "src/apprt/win32_universal_palette.zig",
+        "src/apprt/win32/child_window.zig",
+        "src/apprt/win32/text.zig",
+        "src/apprt/win32/labels.zig",
+        "build.zig.zon"
+      ]
+    },
+    {
+      "path": "docs/agents/log/search-scrollbar.md",
+      "description": "Self-Correction Log: docked search bar and overlay scrollbar.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/search_controls.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32/docked_search.zig",
+        "src/apprt/win32_scrollbar_geometry.zig",
+        "src/Surface.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/tabs-panes.md",
+      "description": "Self-Correction Log: tabs, splits, close flows, focus, shell reducer and undo/redo.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/registry.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/overlay_session.zig",
+        "src/apprt/win32/session.zig",
+        "src/apprt/win32/surface_presentation.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32/window_state.zig",
+        "src/apprt/win32_undo.zig",
+        "src/apprt/win32_structural_history.zig",
+        "src/apprt/win32_shell.zig",
+        "src/apprt/win32_shell/**"
+      ]
+    },
+    {
+      "path": "docs/agents/log/input.md",
+      "description": "Self-Correction Log: keyboard, mouse, IME and default keybindings.",
+      "scope": [
+        "src/apprt/win32/input.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/palette_controller.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/input/**",
+        "src/config/Config.zig",
+        "src/Surface.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/launch-and-paths.md",
+      "description": "Self-Correction Log: default shell, process launch, WSL, terminfo, path safety and links.",
+      "scope": [
+        "src/config/windows_shell.zig",
+        "src/termio/Exec.zig",
+        "src/termio/wsl_env.zig",
+        "src/apprt/win32_terminfo.zig",
+        "src/terminfo/**",
+        "src/os/**",
+        "src/apprt/win32_link_preview.zig",
+        "src/Surface.zig",
+        "src/config/url.zig",
+        "test/windows/link-opener-pathext-probe.ps1",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/session.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/terminal/kitty/graphics_image.zig",
+        "src/terminal/kitty/windows.zig",
+        "src/config/Config.zig",
+        "src/config/pane_launch.zig",
+        "src/config/windows_visual_studio.zig",
+        "src/apprt/win32_elevation.zig",
+        "src/cli/list_profiles.zig",
+        "src/config/command.zig",
+        "src/apprt/win32/labels.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/clipboard.md",
+      "description": "Self-Correction Log: clipboard, CF_HTML, OSC 52, paste protection and drag-and-drop.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/overlay_session.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32_clipboard_html.zig",
+        "src/apprt/win32_paste_protection.zig",
+        "src/apprt/win32_surface_drop*.zig",
+        "src/Surface.zig",
+        "src/apprt/win32_ole.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/settings.md",
+      "description": "Self-Correction Log: the Settings window and its save path.",
+      "scope": [
+        "src/apprt/win32_settings*.zig",
+        "src/apprt/win32/save_target.zig",
+        "src/config/Config.zig",
+        "src/config/origin.zig",
+        "src/config/pane_launch.zig",
+        "src/os/local_path.zig",
+        "test/windows/settings-uia-*.ps1",
+        "test/windows/settings-open-readiness.psm1",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32/bench_trace.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/accessibility.md",
+      "description": "Self-Correction Log: UI Automation providers and terminal accessibility.",
+      "scope": [
+        "src/apprt/win32_uia/**",
+        "src/apprt/win32_terminal_accessibility.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/overlay_session.zig",
+        "src/apprt/win32/palette_controller.zig",
+        "src/apprt/win32/search_controls.zig",
+        "src/apprt/win32/terminal_window.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/config.md",
+      "description": "Self-Correction Log: config loading, reload and diagnostics.",
+      "scope": [
+        "src/config/**",
+        "src/cli/**",
+        "src/apprt/win32/config_problems.zig",
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/input/command.zig",
+        "src/Surface.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/app-lifecycle.md",
+      "description": "Self-Correction Log: startup, safe mode, state files, IPC, identity, jump list, notifications, crash dumps, handoff and the CLI.",
+      "scope": [
+        "src/apprt/win32.zig",
+        "src/apprt/win32/app.zig",
+        "src/apprt/win32/registry.zig",
+        "src/apprt/win32/chrome_scene.zig",
+        "src/apprt/win32/host.zig",
+        "src/apprt/win32/quick_terminal_host.zig",
+        "src/apprt/win32/session.zig",
+        "src/apprt/win32/terminal_window.zig",
+        "src/apprt/win32/window_state.zig",
+        "src/apprt/win32_aumid.zig",
+        "src/apprt/win32_jump_list.zig",
+        "src/apprt/win32_toast*.zig",
+        "src/apprt/win32_session*.zig",
+        "src/apprt/win32_ipc.zig",
+        "src/apprt/win32/ipc_server.zig",
+        "src/apprt/win32_bell.zig",
+        "src/apprt/win32_taskbar_progress.zig",
+        "src/apprt/win32_terminal_handoff*",
+        "src/crash/**",
+        "src/cli/**",
+        "src/main*.zig",
+        "src/font/face/freetype.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/build-release-ci.md",
+      "description": "Self-Correction Log: build, packaging, signing, updater, release and CI.",
+      "scope": [
+        "build.zig",
+        "build.zig.zon",
+        "src/build/**",
+        "src/update/**",
+        "pkg/wuffs/**",
+        "scripts/**",
+        "dist/**",
+        ".github/**"
+      ]
+    },
+    {
+      "path": "docs/agents/log/docs-and-site.md",
+      "description": "Self-Correction Log: site edits and the generated asset hashes, and claims in docs, README, PRIVACY, PACKAGING and install copy.",
+      "scope": [
+        "README.md",
+        "PRIVACY.md",
+        "docs/**",
+        "site/**",
+        "PACKAGING.md"
+      ]
+    },
+    {
+      "path": "docs/agents/log/test-harnesses.md",
+      "description": "Self-Correction Log: writing or running test/windows harnesses, CI test steps, and test counts that contradict the code.",
+      "scope": [
+        "test/**",
+        "scripts/dev-windows.cmd",
+        "scripts/interactive-win11*",
+        ".github/workflows/**",
+        "src/pty_transport_probe.zig",
+        "src/terminal/search/Thread.zig",
+        "scripts/windows-harness-history.ps1",
+        "src/apprt/win32/test_support.zig",
+        "src/apprt/win32/registry.zig",
+        "src/apprt/win32_compositor_native.zig",
+        "src/apprt/win32/sys.zig"
+      ]
+    },
+    {
+      "path": "docs/agents/log/tooling.md",
+      "description": "Self-Correction Log: Zig, PowerShell and Win32 FFI traps; git, gh and agent tooling.",
+      "scope": [
+        "**/*.zig",
+        "**/*.ps1",
+        ".github/**"
+      ]
     }
   ]
 }

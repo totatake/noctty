@@ -43,11 +43,12 @@ $summary = $null
 $parsed = [Collections.Generic.List[object]]::new()
 $pending = $null
 $problems = [Collections.Generic.List[string]]::new()
+$resultPattern = '^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$'
 foreach ($line in Get-Content -LiteralPath $TestLog) {
     # The runner prints `N/M name...` and then OK, SKIP or FAIL, on the same line unless the test logged
     # in between: the log lines follow the header and the result stands alone on a later line.
     if ($null -ne $pending) {
-        if ($line -match '^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') {
+        if ($line -match $resultPattern) {
             $parsed.Add([pscustomobject]@{ Index = $pending.Index; Name = $pending.Name; Result = $Matches[1] })
             $pending = $null
             continue
@@ -62,8 +63,7 @@ foreach ($line in Get-Content -LiteralPath $TestLog) {
         if ($announced -ne 0 -and $count -ne $announced) { $problems.Add('Per-test announced totals changed within the run.') }
         if ($announced -eq 0) { $announced = $count }
         $item = [pscustomobject]@{ Index = [int]$header.Groups[1].Value; Name = $header.Groups[3].Value }
-        $rest = $header.Groups[4].Value
-        if ($rest -match '^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') { $parsed.Add([pscustomobject]@{ Index = $item.Index; Name = $item.Name; Result = $Matches[1] }); $pending = $null }
+        if ($header.Groups[4].Value -match $resultPattern) { $parsed.Add([pscustomobject]@{ Index = $item.Index; Name = $item.Name; Result = $Matches[1] }); $pending = $null }
         else { $pending = $item }
         continue
     }
@@ -75,7 +75,7 @@ foreach ($line in Get-Content -LiteralPath $TestLog) {
         $summary = if ($total.Success) { @{ Passed = [int]$total.Groups[1].Value; Skipped = [int]$total.Groups[2].Value; Failed = [int]$total.Groups[3].Value } }
             else { @{ Passed = [int]$allPassed.Groups[1].Value; Skipped = 0; Failed = 0 } }
     }
-    elseif ($line -match '^\d+/\d+\b|^(OK|SKIP|FAIL)(?: \([^)]+\))?\s*$') { $problems.Add('Malformed per-test header or result without a pending test.') }
+    elseif ($line -match '^\d+/\d+\b' -or $line -match $resultPattern) { $problems.Add('Malformed per-test header or result without a pending test.') }
 }
 if ($parsed.Count -eq 0) { $problems.Add('The log holds no per-test lines; run ghostty-test.exe directly and pass its output.') }
 elseif ($null -eq $summary) { $problems.Add("The log has no closing 'N passed; N skipped; N failed.' line, so the run did not finish ($($parsed.Count) of $announced tests reported).") }

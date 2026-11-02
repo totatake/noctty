@@ -18,6 +18,12 @@ pub const Options = struct {
     /// Terminal DEC mode 66
     keypad_key_application: bool = false,
 
+    // DEC Backarrow Key Mode (DECBKM)
+    // See https://vt100.net/dec/ek-vt3xx-tp-002.pdf page 170
+    // If `false` (the default), `backspace` emits 0x7f
+    // If `true`, `backspace` emits 0x08
+    backarrow_key_mode: bool = false,
+
     /// Terminal DEC mode 1035
     ignore_keypad_with_numlock: bool = false,
 
@@ -64,6 +70,7 @@ pub const Options = struct {
             .alt_esc_prefix = t.modes.get(.alt_esc_prefix),
             .cursor_key_application = t.modes.get(.cursor_keys),
             .keypad_key_application = t.modes.get(.keypad_keys),
+            .backarrow_key_mode = t.modes.get(.backarrow_key_mode),
             .ignore_keypad_with_numlock = t.modes.get(.ignore_keypad_with_numlock),
             .modify_other_keys_state_2 = t.flags.modify_other_keys_2,
             .kitty_flags = t.screens.active.kitty_keyboard.current(),
@@ -499,6 +506,7 @@ fn legacy(
         opts.keypad_key_application,
         opts.ignore_keypad_with_numlock,
         opts.modify_other_keys_state_2,
+        opts.backarrow_key_mode,
     )) |sequence| pc_style: {
         // If we have UTF-8 text, then we never emit PC style function
         // keys. Many function keys (escape, enter, backspace) have
@@ -525,86 +533,49 @@ fn legacy(
                     break :pc_style;
                 },
             }
+
+            // The normal keypad row (upstream #14145) is the character a US
+            // layout types, but another layout can type something else
+            // there: the numpad decimal types ',' on German. The layout's
+            // text takes the row's place: on the ConPTY path through the
+            // text encoding (Alt's ESC prefix included), elsewhere in the
+            // row's encoding. A numpad key without text (Ctrl, an Alt-code
+            // digit) keeps the row, and application keypad rows start with
+            // ESC.
+            if (event.key.keypad() and sequence[0] != 0x1b and
+                !isControlUtf8(event.utf8))
+            {
+                if (windows_legacy) break :pc_style;
+                return try writer.writeAll(event.utf8);
+            }
         }
 
         // ConPTY cannot decode the CSI 27 modifier forms for these keys.
         // Keep committed IME text above and negotiated keyboard modes intact.
+        // Backspace ignores DECBKM: ConPTY's input parser decodes DEL as
+        // Backspace and BS as Ctrl+Backspace, and conhost applies the
+        // program's DECBKM itself when it encodes the key for the program.
         if (windows_legacy) {
-            const byte: ?u8 = switch (event.key) {
-                .enter => '\r',
-                .escape => 0x1b,
-                .tab => if (all_mods.shift) null else '\t',
-                .backspace => if (all_mods.ctrl) 0x08 else 0x7f,
+            const legacy_sequence: ?[]const u8 = switch (event.key) {
+                .enter => "\r",
+                .escape => "\x1b",
+                .tab => if (all_mods.shift) "\x1b[Z" else "\t",
+                .backspace => if (all_mods.ctrl) "\x08" else "\x7f",
                 else => null,
             };
-            if (byte) |char| {
+            if (legacy_sequence) |bytes| {
                 if (all_mods.alt) try writer.writeByte(0x1b);
-                return try writer.writeByte(char);
-            }
-            if (event.key == .tab) {
-                if (all_mods.alt) try writer.writeByte(0x1b);
-                return try writer.writeAll("\x1b[Z");
+                return try writer.writeAll(bytes);
             }
         }
 
         return try writer.writeAll(sequence);
     }
 
-    // If we match a control sequence, we output that directly. For
-    // ctrlSeq we have to use all mods because we want it to only
-    // match ctrl+<char>.
-    if (ctrlSeq(
-        event.key,
-        event.utf8,
-        event.unshifted_codepoint,
-        all_mods,
-    )) |char| {
-        // C0 sequences support alt-as-esc prefixing.
-        if (binding_mods.alt) {
-            try writer.writeByte(0x1B);
-            try writer.writeByte(char);
-            return;
-        }
-
-        try writer.writeByte(char);
-        return;
-    }
-
-    // Complete the Windows C0 table after the shared Ctrl mappings. Shift
-    // does not request fixterms in a console client; unsupported punctuation
-    // falls through to its text instead of an undecodable CSI sequence.
-    if (windows_legacy and all_mods.ctrl) {
-        const cp: ?u21 = if (event.utf8.len == 1)
-            event.utf8[0]
-        else if (event.utf8.len == 0)
-            event.key.codepoint()
-        else
-            null;
-        if (cp) |char| {
-            if (char >= '@' and char <= '~') {
-                if (binding_mods.alt) try writer.writeByte(0x1b);
-                return try writer.writeByte(@intCast(char & 0x1f));
-            }
-        }
-    }
-
-    // If we have no UTF8 text then the only possibility is the
-    // alt-prefix handling of unshifted codepoints... so we process that.
-    const utf8 = event.utf8;
-    if (utf8.len == 0) {
-        if (try legacyAltPrefix(
-            writer,
-            event,
-            binding_mods,
-            all_mods,
-            opts,
-        )) return;
-        return;
-    }
-
     // In modify other keys state 2, we send the CSI 27 sequence
-    // for any char with a modifier. Ctrl sequences like Ctrl+a
-    // are already handled above.
+    // for any char with a modifier. This must happen before converting
+    // Ctrl+<char> to a C0 byte because mode 2 encodes those keys, too.
+    const utf8 = event.utf8;
     if (opts.modify_other_keys_state_2) modify_other: {
         const view = std.unicode.Utf8View.init(utf8) catch {
             // Assume invalid UTF-8 means we no UTF-8.
@@ -664,6 +635,57 @@ fn legacy(
                 );
             }
         }
+    }
+
+    // If we match a control sequence, we output that directly. For
+    // ctrlSeq we have to use all mods because we want it to only
+    // match ctrl+<char>.
+    if (ctrlSeq(
+        event.key,
+        event.utf8,
+        event.unshifted_codepoint,
+        all_mods,
+    )) |char| {
+        // C0 sequences support alt-as-esc prefixing.
+        if (binding_mods.alt) {
+            try writer.writeByte(0x1B);
+            try writer.writeByte(char);
+            return;
+        }
+
+        try writer.writeByte(char);
+        return;
+    }
+
+    // Complete the Windows C0 table after the shared Ctrl mappings. Shift
+    // does not request fixterms in a console client; unsupported punctuation
+    // falls through to its text instead of an undecodable CSI sequence.
+    if (windows_legacy and all_mods.ctrl) {
+        const cp: ?u21 = if (event.utf8.len == 1)
+            event.utf8[0]
+        else if (event.utf8.len == 0)
+            event.key.codepoint()
+        else
+            null;
+        if (cp) |char| {
+            if (char >= '@' and char <= '~') {
+                if (binding_mods.alt) try writer.writeByte(0x1b);
+                return try writer.writeByte(@intCast(char & 0x1f));
+            }
+        }
+    }
+
+    // If we have no UTF8 text then the only possibility is the
+    // alt-prefix handling of unshifted codepoints... so we process that.
+    if (utf8.len == 0) {
+        _ = try legacyAltPrefix(
+            writer,
+            event,
+            binding_mods,
+            all_mods,
+            opts,
+        );
+        return;
     }
 
     // Let's see if we should apply fixterms to this codepoint.
@@ -786,6 +808,7 @@ fn pcStyleFunctionKey(
     keypad_key_application_req: bool,
     ignore_keypad_with_numlock: bool,
     modify_other_keys: bool, // True if state 2
+    backarrow_key_mode: bool,
 ) ?[]const u8 {
     // We only want binding-sensitive mods because lock keys
     // and directional modifiers (left/right) don't matter for
@@ -837,6 +860,10 @@ fn pcStyleFunctionKey(
             // any set mods require an exact match
             continue;
         }
+
+        if (backarrow_key_mode)
+            if (entry.sequence_decbkm) |sequence|
+                return sequence;
 
         return entry.sequence;
     }
@@ -1430,9 +1457,20 @@ test "kitty: enter, backspace, tab" {
         try testing.expectEqualStrings("\r", writer.buffered());
     }
     {
+        // DECBKM reset
         var writer: std.Io.Writer = .fixed(&buf);
         try kitty(&writer, .{ .key = .backspace, .mods = .{}, .utf8 = "" }, .{
             .kitty_flags = .{ .disambiguate = true },
+            .backarrow_key_mode = false,
+        });
+        try testing.expectEqualStrings("\x7f", writer.buffered());
+    }
+    {
+        // DECBKM set (Kitty does not support DECBKM so there should be no change)
+        var writer: std.Io.Writer = .fixed(&buf);
+        try kitty(&writer, .{ .key = .backspace, .mods = .{}, .utf8 = "" }, .{
+            .kitty_flags = .{ .disambiguate = true },
+            .backarrow_key_mode = true,
         });
         try testing.expectEqualStrings("\x7f", writer.buffered());
     }
@@ -1516,6 +1554,22 @@ test "kitty: shift+backspace emits CSI u" {
         .kitty_flags = .{ .disambiguate = true },
     });
     try testing.expectEqualStrings("\x1b[127;2u", writer.buffered());
+}
+
+test "kitty: alt+backspace emits CSI u" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+        .mods = .{ .alt = true },
+        // macOS may mark Option as consumed while translating the key. With
+        // no attached control text, all modifiers must remain effective.
+        .consumed_mods = .{ .alt = true },
+        .utf8 = "",
+    }, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try testing.expectEqualStrings("\x1b[127;3u", writer.buffered());
 }
 
 test "kitty: shift+enter emits CSI u" {
@@ -2117,6 +2171,43 @@ test "legacy: backspace with utf8 (dead key state)" {
     try testing.expectEqualStrings("", writer.buffered());
 }
 
+test "kitty: backspace (DECBKM reset) (report_all: true)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+        .backarrow_key_mode = false,
+    });
+    try testing.expectEqualStrings("\x1b[127u", writer.buffered());
+}
+
+test "kitty: backspace (DECBKM set) (report_all: true)" {
+    // Kitty does not support DECBKM so there should be no difference.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+        .backarrow_key_mode = true,
+    });
+    try testing.expectEqualStrings("\x1b[127u", writer.buffered());
+}
+
 test "legacy: enter with utf8 (dead key state)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2137,6 +2228,28 @@ test "legacy: esc with utf8 (dead key state)" {
         .unshifted_codepoint = 0x0D,
     }, .{});
     try testing.expectEqualStrings("A", writer.buffered());
+}
+
+test "legacy: alt+escape with modify other state 2" {
+    var buf: [128]u8 = undefined;
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .escape,
+            .mods = .{ .alt = true },
+        }, .{});
+        try testing.expectEqualStrings("\x1b\x1b", writer.buffered());
+    }
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .escape,
+            .mods = .{ .alt = true },
+        }, .{ .modify_other_keys_state_2 = true });
+        try testing.expectEqualStrings("\x1b[27;3;27~", writer.buffered());
+    }
 }
 
 test "legacy: Windows console control table" {
@@ -2186,6 +2299,27 @@ test "legacy: Windows console Tab and Backspace modifiers" {
             } else try expected.writeByte(if (mods.ctrl) 0x08 else 0x7f);
             try encode(&writer, .{ .key = input, .mods = mods }, .{ .windows_legacy = true });
             try testing.expectEqualStrings(expected.buffered(), writer.buffered());
+        }
+    }
+}
+
+test "legacy: Windows console Backspace ignores DECBKM" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    // ConPTY's VT input parser reads these bytes, not the program: it
+    // decodes DEL as Backspace and BS as Ctrl+Backspace, and encodes the
+    // key for the program under the program's own DECBKM. Applying DECBKM
+    // here as well would give the program the other key.
+    var buf: [128]u8 = undefined;
+    for ([_]bool{ false, true }) |backarrow_key_mode| {
+        const opts: Options = .{ .windows_legacy = true, .backarrow_key_mode = backarrow_key_mode };
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .backspace }, opts);
+        try testing.expectEqualStrings("\x7f", writer.buffered());
+        for (function_keys.modifiers) |mods| {
+            writer = .fixed(&buf);
+            try encode(&writer, .{ .key = .backspace, .mods = mods }, opts);
+            const expected = [_]u8{ 0x1b, if (mods.ctrl) 0x08 else 0x7f };
+            try testing.expectEqualStrings(if (mods.alt) &expected else expected[1..], writer.buffered());
         }
     }
 }
@@ -2401,6 +2535,56 @@ test "legacy: Windows console F13 through F24 aliases shifted function keys" {
     try testing.expectEqualStrings("\x1b[24;8~", writer.buffered());
 }
 
+test "legacy: Windows console modified numpad keys and the Menu key use the shared table" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    // An Alt-code digit reaches the encoder with no text. The normal keypad
+    // row sends a modified numpad key's own character, so Alt-code entry
+    // sends its digits bare where it sent ESC and each digit. A numpad key
+    // with text sends the layout's text, not the row's US character: the
+    // numpad decimal types ',' on German. The Menu key is CSI 29~, F16's
+    // distinct code, which PKG-15 saw ConPTY drop.
+    const cases = [_]struct { event: key.KeyEvent, output: []const u8 }{
+        .{ .event = .{ .key = .numpad_1, .mods = .{ .ctrl = true }, .unshifted_codepoint = '1' }, .output = "1" },
+        .{ .event = .{ .key = .numpad_1, .mods = .{ .alt = true }, .unshifted_codepoint = '1' }, .output = "1" },
+        .{ .event = .{ .key = .numpad_add, .mods = .{ .alt = true }, .unshifted_codepoint = '+' }, .output = "+" },
+        .{ .event = .{ .key = .numpad_decimal, .utf8 = ",", .unshifted_codepoint = ',' }, .output = "," },
+        .{ .event = .{ .key = .numpad_decimal, .utf8 = ".", .unshifted_codepoint = '.' }, .output = "." },
+        .{ .event = .{ .key = .numpad_7, .utf8 = "7", .unshifted_codepoint = '7' }, .output = "7" },
+        .{ .event = .{ .key = .context_menu }, .output = "\x1b[29~" },
+        .{ .event = .{ .key = .context_menu, .mods = .{ .shift = true } }, .output = "\x1b[29;2~" },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, case.event, .{ .windows_legacy = true, .alt_esc_prefix = true });
+        try testing.expectEqualStrings(case.output, writer.buffered());
+    }
+    // Application keypad mode keeps its sequence over the layout's text.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .numpad_decimal, .utf8 = ",", .unshifted_codepoint = ',' }, .{ .windows_legacy = true, .keypad_key_application = true });
+    try testing.expectEqualStrings("\x1bOn", writer.buffered());
+    // Ctrl+Alt still types the layout's text (translation masks both), and
+    // Alt prefixes it with ESC as it does any other text.
+    writer = .fixed(&buf);
+    try encode(&writer, .{ .key = .numpad_decimal, .mods = .{ .ctrl = true, .alt = true }, .utf8 = ",", .unshifted_codepoint = ',' }, .{ .windows_legacy = true, .alt_esc_prefix = true });
+    try testing.expectEqualStrings("\x1b,", writer.buffered());
+}
+
+test "modify other keys 2: a numpad key sends the layout's text" {
+    // modifyOtherKeys 2 turns the ConPTY encoder off, and the default
+    // encoder never had it, but the normal keypad row applies to both.
+    for ([_]Options{
+        .{ .modify_other_keys_state_2 = true },
+        .{ .modify_other_keys_state_2 = true, .windows_legacy = true },
+    }) |opts| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .numpad_decimal, .utf8 = ",", .unshifted_codepoint = ',' }, opts);
+        try testing.expectEqualStrings(",", writer.buffered());
+    }
+}
+
 test "legacy: ctrl+shift+minus (underscore on US)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2530,6 +2714,66 @@ test "legacy: ctrl+shift+backspace" {
     try testing.expectEqualStrings("\x08", writer.buffered());
 }
 
+test "legacy: ctrl+alt+shift+backspace" {
+    const event: key.KeyEvent = .{
+        .key = .backspace,
+        .mods = .{ .ctrl = true, .alt = true, .shift = true },
+    };
+
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, event, .{});
+    try testing.expectEqualStrings("\x1b\x08", writer.buffered());
+
+    writer = .fixed(&buf);
+    try legacy(&writer, event, .{ .modify_other_keys_state_2 = true });
+    try testing.expectEqualStrings("\x1b[27;8;127~", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM reset)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{},
+    }, .{ .backarrow_key_mode = false });
+    try testing.expectEqualStrings("\x7f", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM reset, with ctrl)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{
+            .ctrl = true,
+        },
+    }, .{ .backarrow_key_mode = false });
+    try testing.expectEqualStrings("\x08", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM set)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{},
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x08", writer.buffered());
+}
+
+test "legacy: backspace (DECBKM set, with ctrl)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .mods = .{
+            .ctrl = true,
+        },
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x7f", writer.buffered());
+}
+
 test "legacy: ctrl+shift+char with modify other state 2" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2541,6 +2785,30 @@ test "legacy: ctrl+shift+char with modify other state 2" {
         .modify_other_keys_state_2 = true,
     });
     try testing.expectEqualStrings("\x1b[27;6;72~", writer.buffered());
+}
+
+test "legacy: ctrl+char with modify other state 2" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .key_p,
+        .mods = .{ .ctrl = true },
+        .utf8 = "p",
+    }, .{
+        .modify_other_keys_state_2 = true,
+    });
+    try testing.expectEqualStrings("\x1b[27;5;112~", writer.buffered());
+}
+
+test "legacy: ctrl+char without modify other state 2" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .key_p,
+        .mods = .{ .ctrl = true },
+        .utf8 = "p",
+    }, .{});
+    try testing.expectEqualStrings("\x10", writer.buffered());
 }
 
 test "legacy: ctrl+shift+char with modify other state 2 and consumed mods" {
@@ -2679,6 +2947,35 @@ test "legacy: keypad 1" {
     try testing.expectEqualStrings("1", writer.buffered());
 }
 
+test "legacy: keypad 1 with modify other state 2" {
+    var buf: [128]u8 = undefined;
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .numpad_1,
+            .mods = .{ .ctrl = true },
+            .utf8 = "1",
+        }, .{
+            .modify_other_keys_state_2 = true,
+        });
+        try testing.expectEqualStrings("1", writer.buffered());
+    }
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .numpad_1,
+            .mods = .{ .ctrl = true },
+            .utf8 = "1",
+        }, .{
+            .keypad_key_application = true,
+            .modify_other_keys_state_2 = true,
+        });
+        try testing.expectEqualStrings("\x1bO5q", writer.buffered());
+    }
+}
+
 test "legacy: keypad 1 with application keypad" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2781,6 +3078,91 @@ test "legacy: f1" {
     }
 }
 
+test "legacy: f13 through f25" {
+    const Case = struct { key: key.Key, code: u8 };
+    const cases = [_]Case{
+        .{ .key = .f13, .code = 25 },
+        .{ .key = .f14, .code = 26 },
+        .{ .key = .f15, .code = 28 },
+        .{ .key = .f16, .code = 29 },
+        .{ .key = .f17, .code = 31 },
+        .{ .key = .f18, .code = 32 },
+        .{ .key = .f19, .code = 33 },
+        .{ .key = .f20, .code = 34 },
+        .{ .key = .f21, .code = 42 },
+        .{ .key = .f22, .code = 43 },
+        .{ .key = .f23, .code = 44 },
+        .{ .key = .f24, .code = 45 },
+        .{ .key = .f25, .code = 46 },
+    };
+
+    var buf: [128]u8 = undefined;
+    var expected_buf: [32]u8 = undefined;
+    for (cases) |case| {
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{ .key = case.key }, .{});
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{}~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{
+                .key = case.key,
+                .mods = .{ .ctrl = true },
+            }, .{ .modify_other_keys_state_2 = true });
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{};5~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+    }
+}
+
+test "legacy: help and context menu" {
+    const Case = struct { key: key.Key, code: u8 };
+    const cases = [_]Case{
+        .{ .key = .help, .code = 28 },
+        .{ .key = .context_menu, .code = 29 },
+    };
+
+    var buf: [128]u8 = undefined;
+    var expected_buf: [32]u8 = undefined;
+    for (cases) |case| {
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{ .key = case.key }, .{});
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{}~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{
+                .key = case.key,
+                .mods = .{ .ctrl = true },
+            }, .{ .modify_other_keys_state_2 = true });
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{};5~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+    }
+}
+
 test "legacy: left_shift+tab" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2846,15 +3228,26 @@ test "legacy: super and other mods on macOS with text" {
     try testing.expectEqualStrings("", writer.buffered());
 }
 
-test "legacy: backspace with DEL utf8" {
+test "legacy: backspace with DEL utf8 (DECBKM reset)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try legacy(&writer, .{
         .key = .backspace,
         .utf8 = &.{0x7F},
         .unshifted_codepoint = 0x08,
-    }, .{});
+    }, .{ .backarrow_key_mode = false });
     try testing.expectEqualStrings("\x7F", writer.buffered());
+}
+
+test "legacy: backspace with DEL utf8 (DECBKM set)" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .backspace,
+        .utf8 = &.{0x7F},
+        .unshifted_codepoint = 0x08,
+    }, .{ .backarrow_key_mode = true });
+    try testing.expectEqualStrings("\x08", writer.buffered());
 }
 
 test "ctrlseq: normal ctrl c" {

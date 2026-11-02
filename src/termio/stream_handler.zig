@@ -140,8 +140,10 @@ pub const StreamHandler = struct {
             log.warn("failed to set default cursor style: {}", .{err});
         };
 
-        // The config could have changed any of our colors so update mode 2031
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        // The config could have changed any of our colors, but the mode
+        // 2031 report is sent by Termio.changeConfig. This runs on the io
+        // thread, which is the only reader of the termio mailbox, so
+        // sending to it here would deadlock if the mailbox were full.
     }
 
     inline fn surfaceMessageWriter(
@@ -277,16 +279,10 @@ pub const StreamHandler = struct {
                 @branchHint(.likely);
                 self.terminal.setCursorPos(value.row, value.col);
             },
-            .cursor_col => self.terminal.setCursorPos(self.terminal.screens.active.cursor.y + 1, value.value),
-            .cursor_row => self.terminal.setCursorPos(value.value, self.terminal.screens.active.cursor.x + 1),
-            .cursor_col_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1,
-                self.terminal.screens.active.cursor.x + 1 +| value.value,
-            ),
-            .cursor_row_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1 +| value.value,
-                self.terminal.screens.active.cursor.x + 1,
-            ),
+            .cursor_col => self.terminal.setCursorCol(value.value),
+            .cursor_row => self.terminal.setCursorRow(value.value),
+            .cursor_col_relative => self.terminal.cursorColRelative(value.value),
+            .cursor_row_relative => self.terminal.cursorRowRelative(value.value),
             .cursor_style => try self.setCursorStyle(value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
@@ -320,6 +316,10 @@ pub const StreamHandler = struct {
                     return err;
                 };
                 self.semantic_output.resetForFullReset();
+            },
+            .soft_reset => {
+                self.terminal.softReset();
+                try self.setCursorStyle(.default);
             },
             .set_mode => try self.setMode(value.mode, true),
             .reset_mode => try self.setMode(value.mode, false),
@@ -416,7 +416,7 @@ pub const StreamHandler = struct {
             .dcs_put => try self.dcsPut(value),
             .dcs_unhook => try self.dcsUnhook(),
             .apc_start => self.apc.start(),
-            .apc_end => try self.apcEnd(),
+            .apc_end => try self.apcEnd(value.terminated),
             .apc_put => self.apc.feed(self.alloc, value),
 
             // Unimplemented
@@ -601,9 +601,16 @@ pub const StreamHandler = struct {
         }
     }
 
-    pub fn apcEnd(self: *StreamHandler) !void {
+    /// Finish the current APC and run its command. `terminated` is false
+    /// when the APC was cancelled or aborted, and then nothing runs.
+    pub fn apcEnd(self: *StreamHandler, terminated: bool) !void {
         var cmd = self.apc.end() orelse return;
         defer cmd.deinit(self.alloc);
+
+        // ECMA-48 says a cancelled or aborted string is thrown away, so
+        // its command must not run. end() above still resets the APC
+        // handler and frees what it collected.
+        if (!terminated) return;
 
         // log.warn("APC command: {}", .{cmd});
         switch (cmd) {
@@ -707,7 +714,7 @@ pub const StreamHandler = struct {
     }
 
     fn requestModeUnknown(self: *StreamHandler, mode_raw: u16, ansi: bool) !void {
-        self.sendModeReport(self.terminal.modes.getReport(.{ .value = @truncate(mode_raw), .ansi = ansi }));
+        self.sendModeReport(self.terminal.modes.getReport(.{ .value = mode_raw, .ansi = ansi }));
     }
 
     fn sendModeReport(self: *StreamHandler, report: terminal.modes.Report) void {
@@ -943,6 +950,18 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// The cursor position for a CPR/DECXCPR report, honoring origin mode
+    /// (relative to the scrolling region when DECOM is set).
+    fn cursorReportPos(self: *StreamHandler) struct { x: usize, y: usize } {
+        return if (self.terminal.modes.get(.origin)) .{
+            .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
+            .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
+        } else .{
+            .x = self.terminal.screens.active.cursor.x,
+            .y = self.terminal.screens.active.cursor.y,
+        };
+    }
+
     pub fn deviceStatusReport(
         self: *StreamHandler,
         req: terminal.device_status.Request,
@@ -951,22 +970,28 @@ pub const StreamHandler = struct {
             .operating_status => self.messageWriter(.{ .write_stable = "\x1B[0n" }),
 
             .cursor_position => {
-                const pos: struct {
-                    x: usize,
-                    y: usize,
-                } = if (self.terminal.modes.get(.origin)) .{
-                    .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
-                    .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
-                } else .{
-                    .x = self.terminal.screens.active.cursor.x,
-                    .y = self.terminal.screens.active.cursor.y,
-                };
+                const pos = self.cursorReportPos();
 
                 // Response always is at least 4 chars, so this leaves the
                 // remainder for the row/column as base-10 numbers. This
                 // will support a very large terminal.
                 var msg: termio.Message = .{ .write_small = .{} };
                 const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[{};{}R", .{
+                    pos.y + 1,
+                    pos.x + 1,
+                });
+                msg.write_small.len = @intCast(resp.len);
+
+                self.messageWriter(msg);
+            },
+
+            // DECXCPR: extended cursor position adds a page number. Ghostty has
+            // no page memory, so the page is always 1.
+            .cursor_position_extended => {
+                const pos = self.cursorReportPos();
+
+                var msg: termio.Message = .{ .write_small = .{} };
+                const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[?{};{};1R", .{
                     pos.y + 1,
                     pos.x + 1,
                 });
@@ -1252,9 +1277,25 @@ pub const StreamHandler = struct {
         // ConEmu's OSC 9;9 usually carries a plain Windows path (the form
         // Windows Terminal documents, oh-my-posh's `osc99` and nushell send),
         // which is not a URI. OSC 7 stays strict and never takes this branch.
-        if (comptime builtin.os.tag == .windows) {
-            if (conemu and try self.reportConemuPwd(url)) return;
-        }
+        // 9;9 carries no host, so there is no locality check, as in Windows
+        // Terminal; the path is screened as an OSC 7 path is. Its scratch is
+        // its own, so upstream's below stays where upstream has it.
+        if (comptime builtin.os.tag == .windows) if (conemu) plain: {
+            var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+            var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
+            defer arena_alloc.deinit();
+            const path = internal_os.local_path.pwd(stack_alloc.get(), .{ .conemu = url }) catch |err| switch (err) {
+                // Not a plain path: a URL, read below (noctty's cmd
+                // integration sends `kitty-shell-cwd://localhost/%P`).
+                error.NotPlainPath => break :plain,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("OSC 9;9 pwd refused: {t}", .{err});
+                    return;
+                },
+            };
+            return self.setReportedPwd(path);
+        };
 
         // Attempt to parse this file-style URI using options appropriate
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
@@ -1308,44 +1349,24 @@ pub const StreamHandler = struct {
         var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
         defer arena_alloc.deinit();
         const scratch = stack_alloc.get();
-        const path = decodeOsc7PathForPwd(scratch, uri) catch |err| switch (err) {
-            error.InvalidOsc7Path => {
-                log.warn("OSC 7 path is a network or device path or contains unsafe bytes", .{});
-                return;
-            },
-            else => return err,
-        };
+        const raw = try uri.path.toRawMaybeAlloc(scratch);
+        const path = if (comptime builtin.os.tag == .windows)
+            internal_os.local_path.pwd(scratch, .{ .url_path = raw }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("OSC 7 pwd refused: {t}", .{err});
+                    return;
+                },
+            }
+        else
+            raw;
 
         try self.setReportedPwd(path);
-    }
-
-    /// The plain-path form of ConEmu's OSC 9;9. Returns false when `value` is
-    /// not a drive-absolute path, so that the caller reads it as a URL (noctty's
-    /// cmd integration sends `kitty-shell-cwd://localhost/%P`); true when it
-    /// handled the report, including by refusing it.
-    ///
-    /// 9;9 carries no host, so there is no locality check here, as in Windows
-    /// Terminal; the path gets the same screening as an OSC 7 path.
-    fn reportConemuPwd(self: *StreamHandler, value: []const u8) !bool {
-        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
-        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
-        defer arena_alloc.deinit();
-        const scratch = stack_alloc.get();
-
-        const local = (try configpkg.windows_shell.conemuPathToLocal(scratch, value)) orelse return false;
-        const path = screenWindowsPwd(local) catch |err| switch (err) {
-            error.InvalidOsc7Path => {
-                log.warn("OSC 9;9 path contains unsafe bytes", .{});
-                return true;
-            },
-        };
-        try self.setReportedPwd(path);
-        return true;
     }
 
     /// Record `path` as the working directory and tell the surface.
     fn setReportedPwd(self: *StreamHandler, path: []const u8) !void {
-        log.debug("terminal pwd: {s}", .{path});
+        log.debug("terminal pwd: {f}", .{internal_os.redact.bytes(path)});
         try self.terminal.setPwd(path);
 
         // Report it to the surface. If creating our write request fails
@@ -1361,30 +1382,6 @@ pub const StreamHandler = struct {
             try self.windowTitle(path);
             self.seen_title = false;
         }
-    }
-
-    fn decodeOsc7PathForPwd(
-        alloc: Allocator,
-        uri: std.Uri,
-    ) ![]const u8 {
-        const raw_path = try uri.path.toRawMaybeAlloc(alloc);
-        if (builtin.os.tag != .windows) return raw_path;
-
-        return try screenWindowsPwd(try configpkg.windows_shell.osc7PathToLocal(alloc, raw_path));
-    }
-
-    /// Refuse a Windows path that is not safe to keep as the working directory.
-    ///
-    /// A network share or device path is not a working directory this
-    /// terminal acts on: spawning already replaces it with the home folder
-    /// and links to such paths are never opened. Keeping it as the pwd would
-    /// let later consumers (relative link resolution, session files) touch
-    /// it, so refuse it here, like the link opener does. WSL paths are
-    /// normalized to `/...` before this and are unaffected.
-    fn screenWindowsPwd(path: []const u8) error{InvalidOsc7Path}![]const u8 {
-        if (!configpkg.windows_shell.isSafeWindowsPath(path)) return error.InvalidOsc7Path;
-        if (internal_os.path.isNetworkOrDevicePath(path)) return error.InvalidOsc7Path;
-        return path;
     }
 
     fn colorOperation(
@@ -1648,6 +1645,7 @@ pub const StreamHandler = struct {
             .csi_14_t => self.messageWriter(.{ .size_report = .csi_14_t }),
             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),
             .csi_18_t => self.messageWriter(.{ .size_report = .csi_18_t }),
+            .csi_19_t => self.messageWriter(.{ .size_report = .csi_19_t }),
             .csi_21_t => self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
         }
     }
@@ -1755,15 +1753,19 @@ pub const StreamHandler = struct {
         cmd: terminal.osc.Command.ProgramStatus,
     ) void {
         switch (cmd) {
-            // The reply is always the same fixed bytes, ended the way the
-            // query was. The specification never allows sending anything a
-            // program reported back to it.
-            .query => |terminator| self.messageWriter(.{
-                .write_stable = switch (terminator) {
-                    .st => "\x1b]7501;?\x1b\\",
-                    .bel => "\x1b]7501;?\x07",
-                },
-            }),
+            // The reply is always the same fixed bytes, `?` and the lists
+            // of states and kinds we accept, ended the way the query was.
+            // The specification never allows sending anything a program
+            // reported back to it.
+            .query => |terminator| {
+                const reply = "\x1b]7501;" ++ terminal.osc.program_status.query_reply;
+                self.messageWriter(.{
+                    .write_stable = switch (terminator) {
+                        .st => reply ++ "\x1b\\",
+                        .bel => reply ++ "\x07",
+                    },
+                });
+            },
 
             .report => |report| {
                 const data = apprt.surface.Message.WriteReq.init(
@@ -1797,7 +1799,6 @@ test "semantic output capture follows real stream handler parser" {
     renderer_state.mutex = &renderer_mutex;
     renderer_state.terminal = &term;
     var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
     const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
@@ -1930,48 +1931,9 @@ test "semantic output capture follows real stream handler parser" {
 }
 
 test "semantic output capture asks the consumer to forget typed input on a screen switch" {
-    var term = try terminal.Terminal.init(std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(std.testing.allocator);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(std.testing.allocator);
-    defer termio_mailbox.deinit(std.testing.allocator);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
-    defer app_queue.destroy(std.testing.allocator);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(std.testing.allocator, .{
-        .alloc = std.testing.allocator,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(std.testing.allocator, .{ .seen_title = false });
+    defer h.deinit(std.testing.allocator);
 
     // Typed input that the print stream was still waiting to see echoed is
     // stale once the screen changes: a full-screen program's own redraws no
@@ -1981,41 +1943,41 @@ test "semantic output capture asks the consumer to forget typed input on a scree
     // at that point of the stream, so what was printed before the switch in
     // the same batch (the echo of what was typed) is still matched against it.
     inline for (.{ "47", "1047", "1049" }) |mode| {
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("ls\x1b[?" ++ mode ++ "h");
-        const enter = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("ls\x1b[?" ++ mode ++ "h");
+        const enter = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, 2), enter.reset_at);
         try std.testing.expectEqualStrings("ls", enter.slice());
 
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("\x1b[2J\x1b[1;1Hredraw");
-        const redraw = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("\x1b[2J\x1b[1;1Hredraw");
+        const redraw = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, null), redraw.reset_at);
 
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("\x1b[?" ++ mode ++ "lls foo");
-        const leave = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("\x1b[?" ++ mode ++ "lls foo");
+        const leave = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, 0), leave.reset_at);
         try std.testing.expectEqualStrings("ls foo", leave.slice());
 
         // Leaving the screen the program is not on switches nothing.
-        stream.handler.semantic_output.begin(true);
-        stream.nextSlice("x\x1b[?" ++ mode ++ "ly");
-        const unchanged = stream.handler.semantic_output.finish();
+        h.stream.handler.semantic_output.begin(true);
+        h.stream.nextSlice("x\x1b[?" ++ mode ++ "ly");
+        const unchanged = h.stream.handler.semantic_output.finish();
         try std.testing.expectEqual(@as(?usize, null), unchanged.reset_at);
         try std.testing.expectEqualStrings("xy", unchanged.slice());
     }
 
     // Both switches of a batch, with output on each side of them.
-    stream.handler.semantic_output.begin(true);
-    stream.nextSlice("a\x1b[?1049hhidden\x1b[?1049lb");
-    const round_trip = stream.handler.semantic_output.finish();
+    h.stream.handler.semantic_output.begin(true);
+    h.stream.nextSlice("a\x1b[?1049hhidden\x1b[?1049lb");
+    const round_trip = h.stream.handler.semantic_output.finish();
     try std.testing.expectEqual(@as(?usize, 1), round_trip.reset_at);
     try std.testing.expectEqualStrings("ab", round_trip.slice());
 
-    stream.handler.semantic_output.begin(true);
-    stream.nextSlice("\x1b[?25h\x1b[?2004hplain\x1b[?25l");
-    const other_modes = stream.handler.semantic_output.finish();
+    h.stream.handler.semantic_output.begin(true);
+    h.stream.nextSlice("\x1b[?25h\x1b[?2004hplain\x1b[?25l");
+    const other_modes = h.stream.handler.semantic_output.finish();
     try std.testing.expectEqual(@as(?usize, null), other_modes.reset_at);
     try std.testing.expectEqualStrings("plain", other_modes.slice());
 }
@@ -2047,11 +2009,11 @@ fn countIssue149ColorSchemeReports(mailbox: *termio.Mailbox) usize {
     return count;
 }
 
-test "issue149 config change queues exactly one color scheme report" {
-    // `Termio.changeConfig` installs the new derived config and then calls
-    // this, which queues the mode 2031 report. That queued message is the
-    // single source of the report bytes: a second direct write here would
-    // deliver every OS scheme flip twice.
+test "issue149 config change queues no color scheme report, even into a full mailbox" {
+    // `Termio.changeConfig` calls this on the IO thread, the only reader of
+    // the termio mailbox, and then writes the mode 2031 report itself. A
+    // report queued here would arrive twice, and with the mailbox full the
+    // send would wait for the IO thread, which is this thread, forever.
     var term = try terminal.Terminal.init(std.testing.allocator, .{
         .cols = 80,
         .rows = 24,
@@ -2071,7 +2033,6 @@ test "issue149 config change queues exactly one color scheme report" {
     renderer_state.mutex = &renderer_mutex;
     renderer_state.terminal = &term;
     var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
     const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
@@ -2109,18 +2070,19 @@ test "issue149 config change queues exactly one color scheme report" {
 
     stream.handler.changeConfig(&dark);
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         countIssue149ColorSchemeReports(&termio_mailbox),
     );
 
-    // An unrelated reload still reports once, not zero and not twice. This is
-    // deliberate and predates issue #149: any config change can move the
-    // palette, so mode 2031 subscribers are re-notified. See `changeConfig`.
+    // A burst of query replies from the reader can fill the mailbox before a
+    // reload reaches the IO thread.
+    const queue = termio_mailbox.spsc.queue;
+    while (queue.push(.{ .inspector = false }, .{ .instant = {} }) > 0) {}
     var light = try termio.DerivedConfig.init(std.testing.allocator, &config, .{ .theme = .light });
     defer light.deinit();
     stream.handler.changeConfig(&light);
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         countIssue149ColorSchemeReports(&termio_mailbox),
     );
 }
@@ -2145,7 +2107,6 @@ test "issue149 OSC 10 and 11 queries format replies and preserve terminators" {
     renderer_state.mutex = &renderer_mutex;
     renderer_state.terminal = &term;
     var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
     const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
@@ -2184,57 +2145,22 @@ test "issue149 OSC 10 and 11 queries format replies and preserve terminators" {
 }
 
 test "a stopped reader gives up waiting on a full mailbox and sends nothing after" {
-    var term = try terminal.Terminal.init(std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(std.testing.allocator);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(std.testing.allocator);
-    defer termio_mailbox.deinit(std.testing.allocator);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(std.testing.allocator);
-    defer app_queue.destroy(std.testing.allocator);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
     // Set when the IO thread tears the terminal down. By then nothing drains
     // either mailbox: the IO thread is joining the reader, and the app thread
     // is joining the IO thread.
     var stop: std.atomic.Value(bool) = .init(false);
-    var stream = StreamHandler.Stream.initAlloc(std.testing.allocator, .{
-        .alloc = std.testing.allocator,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
+    var h: TestStream = undefined;
+    try h.init(std.testing.allocator, .{
         .stopping = &stop,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
         // Longer than a small write, so the reply owns its bytes.
         .enquiry_response = "x" ** 60,
         .osc_color_report_format = .@"16-bit",
-        .clipboard_write = .allow,
+        .seen_title = false,
     });
-    defer stream.deinit();
+    defer h.deinit(std.testing.allocator);
 
-    while (app_queue.push(.{ .quit = {} }, .{ .instant = {} }) != 0) {}
-    const termio_queue = termio_mailbox.spsc.queue;
+    while (h.app_queue.push(.{ .quit = {} }, .{ .instant = {} }) != 0) {}
+    const termio_queue = h.termio_mailbox.spsc.queue;
     while (termio_queue.push(.{ .linefeed_mode = false }, .{ .instant = {} }) != 0) {}
 
     // An OSC 52 write longer than a small surface message, so it owns its
@@ -2280,102 +2206,30 @@ test "a stopped reader gives up waiting on a full mailbox and sends nothing afte
         }
     };
 
-    var to_surface: Feed = .{ .stream = &stream, .mutex = &renderer_mutex, .input = clipboard };
-    try to_surface.stoppedWhileWaiting(app_queue, &stop);
-    var to_termio: Feed = .{ .stream = &stream, .mutex = &renderer_mutex, .input = "\x05" };
+    var to_surface: Feed = .{ .stream = &h.stream, .mutex = &h.renderer_mutex, .input = clipboard };
+    try to_surface.stoppedWhileWaiting(h.app_queue, &stop);
+    var to_termio: Feed = .{ .stream = &h.stream, .mutex = &h.renderer_mutex, .input = "\x05" };
     try to_termio.stoppedWhileWaiting(termio_queue, &stop);
 
     // Once stopped, a title, a status report, a clipboard write and an
     // answerback are all dropped at once, and both queues keep what they held.
     var after: Feed = .{
-        .stream = &stream,
-        .mutex = &renderer_mutex,
+        .stream = &h.stream,
+        .mutex = &h.renderer_mutex,
         .input = "\x1b]2;closing\x07\x1b[5n" ++ clipboard ++ "\x05",
     };
     after.run();
-    try std.testing.expectEqual(@as(AppMailbox.Queue.Size, 64), app_queue.len);
+    try std.testing.expectEqual(@as(TestStream.AppMailbox.Queue.Size, 64), h.app_queue.len);
     try std.testing.expectEqual(@as(@TypeOf(termio_queue.len), 64), termio_queue.len);
-}
-
-test "decodeOsc7PathForPwd handles Windows file URI with a single fallback allocator" {
-    const uri = try internal_os.uri.parse("file://localhost/C:/Users/test/project", .{
-        .mac_address = false,
-        .raw_path = false,
-    });
-
-    var arena_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_alloc.deinit();
-    var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
-    const path = try StreamHandler.decodeOsc7PathForPwd(stack_alloc.get(), uri);
-
-    if (builtin.os.tag == .windows) {
-        try std.testing.expectEqualStrings("C:\\Users\\test\\project", path);
-    } else {
-        try std.testing.expectEqualStrings("/C:/Users/test/project", path);
-    }
-}
-
-test "security regression OSC 7 pwd rejects percent-decoded Windows controls" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const uri = try internal_os.uri.parse("file://localhost/C:/evil%00INJ=1%0Ab", .{
-        .mac_address = false,
-        .raw_path = false,
-    });
-    try std.testing.expectError(
-        error.InvalidOsc7Path,
-        StreamHandler.decodeOsc7PathForPwd(arena.allocator(), uri),
-    );
 }
 
 test "PKG16 integrated cmd prompt clears stale keyboard modes" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
-        .cols = 80,
-        .rows = 24,
-    });
-    defer term.deinit(alloc);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
 
     // Use the production integration to construct PROMPT, then expand the
     // default cmd prompt codes into the bytes ConPTY forwards to this handler.
@@ -2408,21 +2262,16 @@ test "PKG16 integrated cmd prompt clears stale keyboard modes" {
             else => return error.UnexpectedPromptCode,
         }
     }
-    stream.handler.seen_title = true;
     // A generic prompt mark must leave a Kitty-aware shell's modes alone.
-    stream.nextSlice("\x1b[>1u\x1b[>31u\x1b[>4;2m\x1b]133;A\x07");
-    try std.testing.expectEqual(@as(u5, 31), term.screens.active.kitty_keyboard.current().int());
-    try std.testing.expect(term.flags.modify_other_keys_2);
-    stream.nextSlice(drawn.items);
-    try std.testing.expectEqual(@as(u5, 0), term.screens.active.kitty_keyboard.current().int());
-    try std.testing.expect(!term.flags.modify_other_keys_2);
+    h.stream.nextSlice("\x1b[>1u\x1b[>31u\x1b[>4;2m\x1b]133;A\x07");
+    try std.testing.expectEqual(@as(u5, 31), h.term.screens.active.kitty_keyboard.current().int());
+    try std.testing.expect(h.term.flags.modify_other_keys_2);
+    h.stream.nextSlice(drawn.items);
+    try std.testing.expectEqual(@as(u5, 0), h.term.screens.active.kitty_keyboard.current().int());
+    try std.testing.expect(!h.term.flags.modify_other_keys_2);
     // Pop every entry, not just the most recent pushed flags.
-    term.screens.active.kitty_keyboard.pop(1);
-    try std.testing.expectEqual(@as(u5, 0), term.screens.active.kitty_keyboard.current().int());
-    while (app_queue.pop()) |value| {
-        var message = value;
-        message.deinit(alloc);
-    }
+    h.term.screens.active.kitty_keyboard.pop(1);
+    try std.testing.expectEqual(@as(u5, 0), h.term.screens.active.kitty_keyboard.current().int());
 }
 
 test "cmd OSC 9;9 URI updates terminal pwd" {
@@ -2442,7 +2291,6 @@ test "cmd OSC 9;9 URI updates terminal pwd" {
     renderer_state.mutex = &renderer_mutex;
     renderer_state.terminal = &term;
     var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
     rt_app.ui_thread_id = 0;
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
     const app_queue = try AppMailbox.Queue.create(alloc);
@@ -2491,60 +2339,22 @@ test "cmd OSC 9;9 URI updates terminal pwd" {
 
 test "OSC 7 pwd refuses network and device paths" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
 
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
 
-    const refused = [_][]const u8{
-        "kitty-shell-cwd://localhost/\\\\server\\share",
-        "kitty-shell-cwd://localhost/\\\\server\\share\\dir",
-        "kitty-shell-cwd://localhost/\\\\?\\UNC\\server\\share\\dir",
-        "kitty-shell-cwd://localhost/\\\\?\\C:\\Users\\me",
-        "kitty-shell-cwd://localhost/\\\\.\\pipe\\x",
-        "kitty-shell-cwd://localhost/\\\\.\\GLOBALROOT\\Device\\Mup\\server\\share",
-        "kitty-shell-cwd://localhost/\\\\server/share",
-        "kitty-shell-cwd://localhost//server/share",
-        "kitty-shell-cwd://localhost/\\/server/share",
-        "file://localhost/%5C%5Cserver%5Cshare",
-        "file://localhost/%5C%5C%3F%5CUNC%5Cserver%5Cshare",
-        "file://localhost/%5C%5C.%5Cpipe%5Cx",
-        "file://localhost//server/share",
-        "file://localhost/%2F%2Fserver/share",
-        "file://localhost/%2F/server/share",
-        "file://localhost/%5C/server/share",
-        "file://localhost/%3F%3F/UNC/server/share",
-        "file://localhost/%3F%3F/GLOBALROOT/Device/Mup/server/share",
-        "kitty-shell-cwd://localhost//??/UNC/server/share",
-    };
-    for (refused) |url| {
-        const uri = try internal_os.uri.parse(url, .{
-            .mac_address = false,
-            .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
-        });
-        std.testing.expectError(
-            error.InvalidOsc7Path,
-            StreamHandler.decodeOsc7PathForPwd(arena.allocator(), uri),
-        ) catch |err| {
-            std.debug.print("accepted: {s}\n", .{url});
-            return err;
-        };
-    }
+    h.stream.nextSlice("\x1b]7;file://localhost/C:/Users/test\x1b\\");
+    try h.expectPwd("C:\\Users\\test");
+    var first = try h.expectSurfaceMessage();
+    first.deinit();
 
-    // Local drive and WSL paths are unaffected.
-    const accepted = [_]struct { []const u8, []const u8 }{
-        .{ "kitty-shell-cwd://localhost/C:\\Users\\me", "C:\\Users\\me" },
-        .{ "file://localhost/C:/Users/me", "C:\\Users\\me" },
-        .{ "file://localhost/home/me", "/home/me" },
-        .{ "kitty-shell-cwd://localhost/\\\\wsl.localhost\\Ubuntu\\home\\me", "/home/me" },
-    };
-    for (accepted) |case| {
-        const uri = try internal_os.uri.parse(case[0], .{
-            .mac_address = false,
-            .raw_path = std.mem.startsWith(u8, case[0], "kitty-shell-cwd://"),
-        });
-        const path = try StreamHandler.decodeOsc7PathForPwd(arena.allocator(), uri);
-        try std.testing.expectEqualStrings(case[1], path);
-    }
+    // A share, percent-encoded: the previous pwd stays and the surface hears
+    // nothing (`local_path.pwd` has every spelling).
+    h.stream.nextSlice("\x1b]7;file://localhost/%5C%5Cserver%5Cshare\x1b\\");
+    try h.expectPwd("C:\\Users\\test");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 }
 
 /// A stream handler wired to a real terminal and an app mailbox, for tests
@@ -2560,8 +2370,18 @@ const TestStream = struct {
 
     const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
 
+    /// The handler settings a test can change; the rest are the same for all.
+    const Options = struct {
+        stopping: *const std.atomic.Value(bool) = &never_stopped,
+        enquiry_response: []const u8 = "",
+        osc_color_report_format: configpkg.Config.OSCColorReportFormat = .none,
+        /// As if a program had set a title, so a reported pwd does not
+        /// become one.
+        seen_title: bool = true,
+    };
+
     /// `self` holds pointers into itself, so it must not move after this.
-    fn init(self: *TestStream, alloc: Allocator) !void {
+    fn init(self: *TestStream, alloc: Allocator, options: Options) !void {
         self.term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
         errdefer self.term.deinit(alloc);
         self.termio_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -2571,7 +2391,6 @@ const TestStream = struct {
         self.renderer_state.mutex = &self.renderer_mutex;
         self.renderer_state.terminal = &self.term;
         self.rt_app = undefined;
-        self.rt_app.windows = .empty;
         self.rt_app.ui_thread_id = 0;
         self.app_queue = try AppMailbox.Queue.create(alloc);
         errdefer self.app_queue.destroy(alloc);
@@ -2581,6 +2400,7 @@ const TestStream = struct {
             .size = undefined,
             .terminal = &self.term,
             .termio_mailbox = &self.termio_mailbox,
+            .stopping = options.stopping,
             .surface_mailbox = .{
                 .surface = undefined,
                 .app = .{ .rt_app = &self.rt_app, .mailbox = self.app_queue },
@@ -2590,11 +2410,11 @@ const TestStream = struct {
             .renderer_wakeup = undefined,
             .default_cursor_style = .block,
             .default_cursor_blink = true,
-            .enquiry_response = "",
-            .osc_color_report_format = .none,
+            .enquiry_response = options.enquiry_response,
+            .osc_color_report_format = options.osc_color_report_format,
             .clipboard_write = .allow,
         });
-        self.stream.handler.seen_title = true;
+        self.stream.handler.seen_title = options.seen_title;
     }
 
     fn deinit(self: *TestStream, alloc: Allocator) void {
@@ -2608,9 +2428,15 @@ const TestStream = struct {
         self.term.deinit(alloc);
     }
 
-    /// The next surface message, or null when none is left.
+    /// The next surface message, or null when none is left. Skips the mouse
+    /// shape a full reset sends.
     fn nextSurfaceMessage(self: *TestStream) ?apprt.surface.Message {
-        return popProgramStatusTestSurfaceMessage(self.app_queue);
+        while (self.app_queue.pop()) |message| {
+            const payload = message.surface_message.message;
+            if (payload == .set_mouse_shape) continue;
+            return payload;
+        }
+        return null;
     }
 
     /// Like `nextSurfaceMessage`, but a missing message fails the test
@@ -2628,7 +2454,7 @@ const TestStream = struct {
 
 test "ConPTY window visibility reaches the surface mailbox in order" {
     var fixture: TestStream = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .{});
     defer fixture.deinit(std.testing.allocator);
     fixture.stream.nextSlice("\x1b[2t\x1b[1t");
     try std.testing.expectEqual(false, (try fixture.expectSurfaceMessage()).window_visibility);
@@ -2638,7 +2464,7 @@ test "ConPTY window visibility reaches the surface mailbox in order" {
 
 test "OSC 133 D carries the whole 32-bit exit code to the surface" {
     var fixture: TestStream = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .{});
     defer fixture.deinit(std.testing.allocator);
 
     // A code past a byte (msiexec's 1603), an NTSTATUS crash and the extremes
@@ -2668,29 +2494,17 @@ test "OSC 9;9 sets the pwd from a plain Windows path" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
-    // The forms Windows Terminal's docs, oh-my-posh's `osc99` and nushell send:
-    // a plain path, quoted or not, with either separator.
-    const accepted = [_]struct { []const u8, []const u8 }{
-        .{ "C:\\Users\\test\\project", "C:\\Users\\test\\project" },
-        .{ "\"C:\\Users\\test\\my project\"", "C:\\Users\\test\\my project" },
-        .{ "D:/work/noctty", "D:\\work\\noctty" },
-        .{ "C:\\", "C:\\" },
-    };
-    for (accepted) |case| {
-        var seq: std.ArrayList(u8) = .empty;
-        defer seq.deinit(alloc);
-        try seq.writer(alloc).print("\x1b]9;9;{s}\x1b\\", .{case[0]});
-        h.stream.nextSlice(seq.items);
-
-        try h.expectPwd(case[1]);
-        var message = try h.expectSurfaceMessage();
-        defer message.deinit();
-        try std.testing.expect(message == .pwd_change);
-        try std.testing.expect(h.nextSurfaceMessage() == null);
-    }
+    // A plain path, as Windows Terminal's docs, oh-my-posh's `osc99` and
+    // nushell send it (`local_path.pwd` has every form).
+    h.stream.nextSlice("\x1b]9;9;\"C:\\Users\\test\\my project\"\x1b\\");
+    try h.expectPwd("C:\\Users\\test\\my project");
+    var message = try h.expectSurfaceMessage();
+    defer message.deinit();
+    try std.testing.expect(message == .pwd_change);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // The UNC form `wslpath -w` prints, the recipe Windows Terminal documents
     // for WSL, is the distro's own path, as in an OSC 7 URL.
@@ -2711,7 +2525,7 @@ test "OSC 9;9 pwd keeps the network and device screening" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     h.stream.nextSlice("\x1b]9;9;C:\\Users\\test\x1b\\");
@@ -2719,31 +2533,11 @@ test "OSC 9;9 pwd keeps the network and device screening" {
     var first = try h.expectSurfaceMessage();
     first.deinit();
 
-    // None of these is a drive-absolute path, or each is a network or device
-    // path after conversion: the previous pwd stays and the surface hears
+    // A share falls through to the URL parse, which refuses it; a drive path
+    // with DEL, the one control byte the OSC parser passes on, is refused by
+    // the screening. Either way the previous pwd stays and the surface hears
     // nothing, the same as for OSC 7.
-    const refused = [_][]const u8{
-        "\\\\server\\share",
-        "\\\\server\\share\\dir",
-        "\"\\\\server\\share\"",
-        "\\\\?\\C:\\Users\\me",
-        "\\\\?\\UNC\\server\\share",
-        "\\\\.\\pipe\\x",
-        "\\\\.\\GLOBALROOT\\Device\\Mup\\server\\share",
-        "//server/share",
-        // Drive-absolute, but with a control byte. The parser drops most C0
-        // bytes from an OSC; DEL goes through.
-        "C:\\a\x7fb",
-        // Not drive-absolute.
-        "C:Users\\me",
-        "Users\\me",
-        "\\Users\\me",
-        "/mnt/c/Users/me",
-        "\"C:\\Users\\me",
-        "C:\\Users\\me\"",
-        "\"\"C:\\Users\\me\"\"",
-    };
-    for (refused) |value| {
+    for ([_][]const u8{ "\\\\server\\share", "C:\\a\x7fb" }) |value| {
         var seq: std.ArrayList(u8) = .empty;
         defer seq.deinit(alloc);
         try seq.writer(alloc).print("\x1b]9;9;{s}\x1b\\", .{value});
@@ -2754,12 +2548,6 @@ test "OSC 9;9 pwd keeps the network and device screening" {
         };
         try std.testing.expect(h.nextSurfaceMessage() == null);
     }
-
-    // The screening itself, for what cannot reach it through an OSC: the
-    // parser drops or ends the sequence on most control bytes.
-    try std.testing.expectError(error.InvalidOsc7Path, StreamHandler.screenWindowsPwd("C:\\a\x01b"));
-    try std.testing.expectError(error.InvalidOsc7Path, StreamHandler.screenWindowsPwd("\\\\server\\share"));
-    try std.testing.expectEqualStrings("C:\\a", try StreamHandler.screenWindowsPwd("C:\\a"));
 }
 
 test "OSC 7 stays strict: a plain path or a host that is not this machine" {
@@ -2767,7 +2555,7 @@ test "OSC 7 stays strict: a plain path or a host that is not this machine" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     h.stream.nextSlice("\x1b]7;file://localhost/C:/Users/test\x1b\\");
@@ -2792,7 +2580,7 @@ test "OSC 7 accepts this machine's name in any letter case" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     // Git Bash, WSL, fish and nushell send the real-case DNS name where the
@@ -2861,7 +2649,7 @@ test "desktop notifications are cut on a code point boundary" {
     const alloc = std.testing.allocator;
 
     var h: TestStream = undefined;
-    try h.init(alloc);
+    try h.init(alloc, .{});
     defer h.deinit(alloc);
 
     // A 63-byte title and 255-byte body cannot end inside a two-byte letter.
@@ -2899,86 +2687,41 @@ fn popProgramStatusTestWrite(mailbox: *termio.Mailbox) ?[]const u8 {
     }
 }
 
-/// The next surface message, skipping the mouse shape a full reset sends.
-fn popProgramStatusTestSurfaceMessage(
-    queue: anytype,
-) ?apprt.surface.Message {
-    while (queue.pop()) |message| {
-        const payload = message.surface_message.message;
-        if (payload == .set_mouse_shape) continue;
-        return payload;
-    }
-    return null;
-}
-
 test "OSC 7501 answers the query once and forwards reports, prompts and resets" {
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
-    defer term.deinit(alloc);
+    var h: TestStream = undefined;
+    try h.init(alloc, .{ .seen_title = false });
+    defer h.deinit(alloc);
 
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
-
-    // The query gets exactly one fixed reply, ended the way it was, and
-    // the surface hears nothing.
-    stream.nextSlice("\x1b]7501;?\x1b\\");
-    try std.testing.expectEqualStrings("\x1b]7501;?\x1b\\", popProgramStatusTestWrite(&termio_mailbox).?);
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
-    stream.nextSlice("\x1b]7501;?\x07");
-    try std.testing.expectEqualStrings("\x1b]7501;?\x07", popProgramStatusTestWrite(&termio_mailbox).?);
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    // The query gets exactly one fixed reply, `?` and the states and
+    // kinds we accept, ended the way it was, and the surface hears
+    // nothing.
+    const reply = "\x1b]7501;?:states=idle,working,done,blocked,error" ++
+        ":kinds=permission,question,auth";
+    h.stream.nextSlice("\x1b]7501;?\x1b\\");
+    try std.testing.expectEqualStrings(reply ++ "\x1b\\", popProgramStatusTestWrite(&h.termio_mailbox).?);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
+    h.stream.nextSlice("\x1b]7501;?\x07");
+    try std.testing.expectEqualStrings(reply ++ "\x07", popProgramStatusTestWrite(&h.termio_mailbox).?);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // Before any report, OSC 9;4 reaches the surface and a prompt has no
     // records to end.
-    stream.nextSlice("\x1b]9;4;1;20\x1b\\");
+    h.stream.nextSlice("\x1b]9;4;1;20\x1b\\");
     {
-        const message = popProgramStatusTestSurfaceMessage(app_queue).?;
+        const message = h.nextSurfaceMessage().?;
         try std.testing.expectEqual(@as(?u8, 20), message.progress_report.progress);
     }
-    stream.nextSlice("\x1b]133;A\x07");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]133;A\x07");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A report reaches the surface with its body. One longer than a small
     // message is allocated and freed with the message.
     const long_msg = "QUFB" ** 80;
-    stream.nextSlice("\x1b]7501;state=working:progress=40:msg=" ++ long_msg ++ "\x1b\\");
+    h.stream.nextSlice("\x1b]7501;state=working:progress=40:msg=" ++ long_msg ++ "\x1b\\");
     {
-        var message = popProgramStatusTestSurfaceMessage(app_queue).?;
+        var message = h.nextSurfaceMessage().?;
         defer message.deinit();
         const report = message.program_status.report;
         try std.testing.expectEqual(.working, report.state);
@@ -2986,74 +2729,38 @@ test "OSC 7501 answers the query once and forwards reports, prompts and resets" 
     }
 
     // A report that breaks the specification never leaves the IO thread.
-    stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
-    stream.nextSlice("\x1b]7501;state=done:msg=YQpi\x1b\\");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
+    h.stream.nextSlice("\x1b]7501;state=done:msg=YQpi\x1b\\");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // From the first report on, OSC 9;4 is no longer mapped.
-    stream.nextSlice("\x1b]9;4;1;50\x1b\\");
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]9;4;1;50\x1b\\");
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A new prompt, OSC 133 A or N, ends the program's records.
-    stream.nextSlice("\x1b]133;A\x07\x1b]133;N\x07");
-    try std.testing.expectEqual(.prompt, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expectEqual(.prompt, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
+    h.stream.nextSlice("\x1b]133;A\x07\x1b]133;N\x07");
+    try std.testing.expectEqual(.prompt, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expectEqual(.prompt, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
 
     // A full reset clears the records before the progress bar, and OSC
     // 9;4 drives the progress bar again.
-    stream.nextSlice("\x1bc");
-    try std.testing.expectEqual(.reset, popProgramStatusTestSurfaceMessage(app_queue).?.program_status);
-    try std.testing.expectEqual(.remove, popProgramStatusTestSurfaceMessage(app_queue).?.progress_report.state);
-    try std.testing.expect(popProgramStatusTestSurfaceMessage(app_queue) == null);
-    stream.nextSlice("\x1b]9;4;1;60\x1b\\");
-    try std.testing.expectEqual(@as(?u8, 60), popProgramStatusTestSurfaceMessage(app_queue).?.progress_report.progress);
+    h.stream.nextSlice("\x1bc");
+    try std.testing.expectEqual(.reset, h.nextSurfaceMessage().?.program_status);
+    try std.testing.expectEqual(.remove, h.nextSurfaceMessage().?.progress_report.state);
+    try std.testing.expect(h.nextSurfaceMessage() == null);
+    h.stream.nextSlice("\x1b]9;4;1;60\x1b\\");
+    try std.testing.expectEqual(@as(?u8, 60), h.nextSurfaceMessage().?.progress_report.progress);
 
     // Nothing a program reported was written back to it.
-    try std.testing.expect(popProgramStatusTestWrite(&termio_mailbox) == null);
+    try std.testing.expect(popProgramStatusTestWrite(&h.termio_mailbox) == null);
 }
 
 test "OSC 22 with an empty shape gives the pointer back" {
     const alloc = std.testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
-    defer term.deinit(alloc);
-
-    var termio_mailbox = try termio.Mailbox.initSPSC(alloc);
-    defer termio_mailbox.deinit(alloc);
-    var renderer_mutex: std.Thread.Mutex = .{};
-    var renderer_state: renderer.State = undefined;
-    renderer_state.mutex = &renderer_mutex;
-    renderer_state.terminal = &term;
-    var rt_app: apprt.App = undefined;
-    rt_app.windows = .empty;
-    rt_app.ui_thread_id = 0;
-    const AppMailbox = @TypeOf(@as(apprt.surface.Mailbox, undefined).app);
-    const app_queue = try AppMailbox.Queue.create(alloc);
-    defer app_queue.destroy(alloc);
-    const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
-        .app = .{
-            .rt_app = &rt_app,
-            .mailbox = app_queue,
-        },
-    };
-
-    var stream = StreamHandler.Stream.initAlloc(alloc, .{
-        .alloc = alloc,
-        .size = undefined,
-        .terminal = &term,
-        .termio_mailbox = &termio_mailbox,
-        .surface_mailbox = surface_mailbox,
-        .renderer_state = &renderer_state,
-        .renderer_mailbox = undefined,
-        .renderer_wakeup = undefined,
-        .default_cursor_style = .block,
-        .default_cursor_blink = true,
-        .enquiry_response = "",
-        .osc_color_report_format = .none,
-        .clipboard_write = .allow,
-    });
-    defer stream.deinit();
+    var h: TestStream = undefined;
+    try h.init(alloc, .{ .seen_title = false });
+    defer h.deinit(alloc);
 
     const S = struct {
         fn nextShape(queue: anytype) ?terminal.MouseShape {
@@ -3066,18 +2773,136 @@ test "OSC 22 with an empty shape gives the pointer back" {
     };
 
     // Without mouse tracking the pointer goes back to the text shape.
-    stream.nextSlice("\x1b]22;crosshair\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .text), S.nextShape(app_queue));
+    h.stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .text), S.nextShape(h.app_queue));
 
     // While a program tracks the mouse it goes back to the shape that
     // turning tracking on set.
-    stream.nextSlice("\x1b[?1000h");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;crosshair\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(app_queue));
-    stream.nextSlice("\x1b]22;\x1b\\");
-    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(app_queue));
-    try std.testing.expect(S.nextShape(app_queue) == null);
+    h.stream.nextSlice("\x1b[?1000h");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;crosshair\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .crosshair), S.nextShape(h.app_queue));
+    h.stream.nextSlice("\x1b]22;\x1b\\");
+    try std.testing.expectEqual(@as(?terminal.MouseShape, .default), S.nextShape(h.app_queue));
+    try std.testing.expect(S.nextShape(h.app_queue) == null);
+}
+
+test "DECRQM answers a mode past 15 bits as not recognized" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    // Cut to 15 bits, these would read wraparound (7) and insert (4).
+    h.stream.nextSlice("\x1b[?32775$p");
+    try expectIssue149Write(&h.termio_mailbox, "\x1b[?32775;0$y");
+    h.stream.nextSlice("\x1b[4h\x1b[32772$p");
+    try expectIssue149Write(&h.termio_mailbox, "\x1b[32772;0$y");
+    h.stream.nextSlice("\x1b[4$p");
+    try expectIssue149Write(&h.termio_mailbox, "\x1b[4;1$y");
+}
+
+test "DECXCPR reports the cursor position with page 1" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("\x1b[5;3H\x1b[?6n");
+    try expectIssue149Write(&h.termio_mailbox, "\x1b[?5;3;1R");
+
+    // In origin mode the position is relative to the scrolling region.
+    h.stream.nextSlice("\x1b[5;20r\x1b[?6h\x1b[3;5H\x1b[?6n");
+    try expectIssue149Write(&h.termio_mailbox, "\x1b[?3;5;1R");
+}
+
+test "DECRQSS SGR reports the underline style and overline" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("\x1b[4:3;53m\x1bP$qm\x1b\\");
+    try expectIssue149Write(&h.termio_mailbox, "\x1bP1$r0;4:3;53m\x1b\\");
+
+    // Every attribute and two direct colors still fit the reply buffer.
+    h.stream.nextSlice("\x1b[0;1;2;3;4:5;53;5;7;8;9;38:2::255:255:255;48:2::255:255:255m\x1bP$qm\x1b\\");
+    try expectIssue149Write(&h.termio_mailbox, "\x1bP1$r0;1;2;3;4:5;53;5;7;8;9;38:2::255:255:255;48:2::255:255:255m\x1b\\");
+}
+
+test "DECSTR restores the configured cursor style and keeps the screen" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("hello\x1b[4h\x1b[?6h\x1b[6 q\x1b[3;4H\x1b[!p");
+    try std.testing.expect(!h.term.modes.get(.insert));
+    try std.testing.expect(!h.term.modes.get(.origin));
+    try std.testing.expectEqual(terminal.CursorStyle.block, h.term.screens.active.cursor.cursor_style);
+    try std.testing.expect(h.term.modes.get(.cursor_blinking));
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), h.term.screens.active.cursor.x);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 2), h.term.screens.active.cursor.y);
+
+    const str = try h.term.plainString(alloc);
+    defer alloc.free(str);
+    try std.testing.expectEqualStrings("hello", str);
+}
+
+test "CHA, VPA, HPR and VPR stay relative to the margins in origin mode" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    // Margins rows 3-8 and columns 4-9, origin mode, cursor at 2;2 in
+    // the region (absolute row 3, column 4, both 0-based).
+    h.stream.nextSlice("\x1b[?69h\x1b[3;8r\x1b[4;9s\x1b[?6h\x1b[2;2H");
+    const cursor = &h.term.screens.active.cursor;
+
+    h.stream.nextSlice("\x1b[1G");
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), cursor.x);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), cursor.y);
+
+    h.stream.nextSlice("\x1b[1d");
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), cursor.x);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 2), cursor.y);
+
+    h.stream.nextSlice("\x1b[2a\x1b[2e");
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 5), cursor.x);
+    try std.testing.expectEqual(@as(terminal.size.CellCountInt, 4), cursor.y);
+}
+
+test "CSI 19 t asks for the size in characters" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+
+    h.stream.nextSlice("\x1b[19t");
+    const message = switch (h.termio_mailbox) {
+        .spsc => |*value| value.queue.pop() orelse return error.NoTermioMessage,
+    };
+    try std.testing.expectEqual(termio.Message.SizeReport.csi_19_t, message.size_report);
+}
+
+test "a cancelled or aborted Kitty graphics APC runs nothing" {
+    const alloc = std.testing.allocator;
+    var h: TestStream = undefined;
+    try h.init(alloc, .{});
+    defer h.deinit(alloc);
+    const storage = &h.term.screens.active.kitty_images;
+
+    // CAN and SUB cancel the APC, and CSI (0x9B) aborts it.
+    for ([_][]const u8{ "\x18", "\x1a", "\x9b" }) |ending| {
+        h.stream.nextSlice("\x1b_Ga=t,f=24,s=1,v=1,i=7,q=2;AAAA");
+        h.stream.nextSlice(ending);
+        try std.testing.expect(storage.imageById(7) == null);
+    }
+
+    // The same command ended by ST stores the image.
+    h.stream.nextSlice("\x1b_Ga=t,f=24,s=1,v=1,i=7,q=2;AAAA\x1b\\");
+    try std.testing.expect(storage.imageById(7) != null);
 }

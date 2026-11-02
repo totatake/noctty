@@ -347,6 +347,29 @@ pub const Action = union(enum) {
     reset,
 
     /// Copy the selected text to the clipboard.
+    ///
+    /// Valid values:
+    ///
+    ///   - `plain`
+    ///
+    ///     Copy the selection as plain text only.
+    ///
+    ///   - `vt`
+    ///
+    ///     Copy the selection as plain text, preserving terminal escape
+    ///     sequences (such as colors and styles).
+    ///
+    ///   - `html`
+    ///
+    ///     Copy the selection as HTML, preserving colors and styles as
+    ///     HTML markup.
+    ///
+    ///   - `mixed` (default)
+    ///
+    ///     Place multiple representations on the clipboard at once
+    ///     (e.g. plain text and HTML), each tagged with its content type
+    ///     so the receiving OS or application can pick the most appropriate
+    ///     representation when pasting.
     copy_to_clipboard: CopyToClipboard,
 
     /// Copy the output of the most recent command completed by shell
@@ -363,6 +386,18 @@ pub const Action = union(enum) {
     insert_last_command,
 
     /// Paste the contents of the default clipboard.
+    ///
+    /// On Windows, files copied in Explorer paste as their paths, quoted and
+    /// space-separated, after the same paste protection as a drop.
+    ///
+    /// When the clipboard holds no text and no files (an image, say) and the
+    /// program has turned bracketed paste on (mode 2004) in a writable
+    /// (not read-only) pane, this sends an empty bracketed paste,
+    /// `ESC[200~ESC[201~`, as Windows Terminal does, and counts as performed,
+    /// so a `performable:` binding does not also reach the program as a key.
+    /// The program can read the clipboard itself; no image data is
+    /// transferred. Without bracketed paste, or in a read-only pane, nothing
+    /// is sent and the action is not performed.
     paste_from_clipboard,
 
     /// Paste the contents of the selection clipboard.
@@ -411,6 +446,8 @@ pub const Action = union(enum) {
 
     /// Navigate the search results. If there is no active search, this
     /// is not performed.
+    ///
+    /// Valid values: `previous`, `next`.
     navigate_search: NavigateSearch,
 
     /// Start a search if it isn't started already. This doesn't set any
@@ -726,10 +763,21 @@ pub const Action = union(enum) {
     /// of the `confirm-close-surface` configuration setting.
     close_surface,
 
-    /// Close the current tab and all splits therein, close all other tabs, or
-    /// close every tab to the right of the current one depending on the mode.
+    /// Close the specified tabs and all splits therein.
     ///
-    /// If the mode is not specified, defaults to closing the current tab.
+    /// Valid values:
+    ///
+    ///   - `this` (default)
+    ///
+    ///     Close the current tab and all splits within it.
+    ///
+    ///   - `other`
+    ///
+    ///     Close every tab in the current window except the current tab.
+    ///
+    ///   - `right`
+    ///
+    ///     Close every tab to the right of the current tab.
     ///
     /// This might trigger a close confirmation popup, depending on the value
     /// of the `confirm-close-surface` configuration setting.
@@ -1555,7 +1603,7 @@ pub const Action = union(enum) {
         const value_info = @typeInfo(Value);
         switch (Value) {
             void => {},
-            []const u8 => try std.zig.stringEscape(value, writer),
+            []const u8 => try writer.print("{s}", .{value}),
             else => switch (value_info) {
                 .@"enum" => try writer.print("{t}", .{value}),
                 .float => try writer.print("{d}", .{value}),
@@ -4843,12 +4891,14 @@ test "action: format" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const a: Action = .{ .text = "👻" };
+    const a: Action = .{ .text = "👻Ghostty'\"" };
 
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
     try a.format(&buf.writer);
-    try testing.expectEqualStrings("text:\\xf0\\x9f\\x91\\xbb", buf.written());
+
+    const b = try Binding.Action.parse(buf.written());
+    try testing.expect(a.equal(b));
 }
 
 test "action: format set title" {

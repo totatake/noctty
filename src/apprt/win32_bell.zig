@@ -161,13 +161,11 @@ const alias = "noctty_bell";
 /// WAV, MP3, WMA and more) takes `setaudio ... volume`: the `waveaudio` device
 /// MCI picks for a .wav answers it with "driver cannot recognize the command".
 fn openCommand(alloc: Allocator, path: []const u8, with_volume: bool) ![:0]u16 {
-    const utf8 = try std.fmt.allocPrint(
+    return command(
         alloc,
         "open \"{s}\"{s} alias " ++ alias,
         .{ path, if (with_volume) " type mpegvideo" else "" },
     );
-    defer alloc.free(utf8);
-    return std.unicode.utf8ToUtf16LeAllocZ(alloc, utf8);
 }
 
 fn command(alloc: Allocator, comptime fmt: []const u8, args: anytype) ![:0]u16 {
@@ -219,21 +217,9 @@ const MciApi = struct {
 // their writes to the next one. No DLL is loaded for a default, silent bell.
 var mci_api: ?MciApi = null;
 
-fn mciSendStringW(
-    lpstrCommand: [*:0]const u16,
-    lpstrReturnString: ?[*]u16,
-    uReturnLength: u32,
-    hwndCallback: ?windows.HWND,
-) u32 {
-    return mci_api.?.send(lpstrCommand, lpstrReturnString, uReturnLength, hwndCallback);
-}
-
-fn mciGetErrorStringW(
-    fdwError: u32,
-    pszText: [*]u16,
-    cchText: u32,
-) windows.BOOL {
-    return mci_api.?.error_string(fdwError, pszText, cchText);
+/// `mciSendStringW` with no return string and no callback window.
+fn mciSend(cmd: [:0]const u16) u32 {
+    return mci_api.?.send(cmd.ptr, null, 0, null);
 }
 
 /// Flash `hwnd`'s taskbar button until the window comes to the front. The
@@ -283,22 +269,20 @@ pub fn playFile(path: []const u8, volume: f64) void {
         return;
     }
     if (busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+    startPlayThread(path, volume) catch busy.store(false, .release);
+}
+
+/// Hand a copy of `path` to a new `playThread`, which frees it and clears
+/// `busy`. On an error nothing is left to free and `busy` is still set.
+fn startPlayThread(path: []const u8, volume: f64) !void {
     const alloc = std.heap.page_allocator;
-    const job = alloc.create(Job) catch {
-        busy.store(false, .release);
-        return;
-    };
-    job.* = .{ .path = alloc.dupe(u8, path) catch {
-        alloc.destroy(job);
-        busy.store(false, .release);
-        return;
-    }, .volume = mciVolume(volume) };
+    const job = try alloc.create(Job);
+    errdefer alloc.destroy(job);
+    job.* = .{ .path = try alloc.dupe(u8, path), .volume = mciVolume(volume) };
+    errdefer alloc.free(job.path);
     const thread = std.Thread.spawn(.{}, playThread, .{job}) catch |err| {
         log.warn("bell: sound thread failed to start err={}", .{err});
-        alloc.free(job.path);
-        alloc.destroy(job);
-        busy.store(false, .release);
-        return;
+        return err;
     };
     thread.detach();
 }
@@ -325,31 +309,31 @@ fn playBlocking(alloc: Allocator, path: []const u8, volume: u32) !void {
     // device MCI picks for it, at the system volume.
     const typed = try openCommand(alloc, path, true);
     defer alloc.free(typed);
-    const with_volume = mciSendStringW(typed.ptr, null, 0, null) == 0;
+    const with_volume = mciSend(typed) == 0;
     if (!with_volume) {
         const untyped = try openCommand(alloc, path, false);
         defer alloc.free(untyped);
-        try check(mciSendStringW(untyped.ptr, null, 0, null));
+        try check(mciSend(untyped));
     }
     defer send(alloc, "close " ++ alias, .{});
 
     if (with_volume) send(alloc, "setaudio " ++ alias ++ " volume to {d}", .{volume});
     const play = try command(alloc, "play " ++ alias ++ " wait", .{});
     defer alloc.free(play);
-    try check(mciSendStringW(play.ptr, null, 0, null));
+    try check(mciSend(play));
 }
 
 fn send(alloc: Allocator, comptime fmt: []const u8, args: anytype) void {
     const cmd = command(alloc, fmt, args) catch return;
     defer alloc.free(cmd);
-    const code = mciSendStringW(cmd.ptr, null, 0, null);
+    const code = mciSend(cmd);
     if (code != 0) log.debug("bell: mci command failed code={d}", .{code});
 }
 
 fn check(code: u32) !void {
     if (code == 0) return;
     var text: [128]u16 = undefined;
-    if (mciGetErrorStringW(code, &text, text.len) != 0) {
+    if (mci_api.?.error_string(code, &text, text.len) != 0) {
         const len = std.mem.indexOfScalar(u16, &text, 0) orelse text.len;
         log.debug("bell: mci error {d}: {f}", .{ code, std.unicode.fmtUtf16Le(text[0..len]) });
     }

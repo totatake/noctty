@@ -3,10 +3,14 @@
 Portable, hidden-desktop integration regression for the docked search bar
 (PKG-41): which match the first Enter selects and how Enter, F3 and the arrow
 keys walk the matches, the "Invalid pattern" label for a regex that does not
-compile, and the narrow-pane collapse that drops the toggles and then
-previous/next instead of overlapping them. Run with -Bin <source bin
-directory> -Run <new evidence directory>. The run directory must not already
-exist.
+compile, that Escape closes the bar without turning its chip to "Searching"
+and start_search reopens it on the same query, that Escape at the focused
+terminal (the end_search binding) does not turn the chip to "Searching"
+either, that Escape on a focused
+search button closes the bar of that button's pane, and the narrow-pane
+collapse that drops the toggles and then previous/next instead of
+overlapping them. Run with -Bin <source bin directory> -Run <new evidence
+directory>. The run directory must not already exist.
 
 Never switches desktops, injects real input or touches the clipboard: every
 action is a posted window message. The search copies nothing, and the
@@ -31,6 +35,7 @@ param(
     [string] $ExpectedStartupModified
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hidden-win11-local-lib.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -41,17 +46,9 @@ public static class Ds {
     [StructLayout(LayoutKind.Sequential)] public struct GuiThreadInfo {
         public int cbSize, flags; public IntPtr active, focus, capture, menuOwner, moveSize, caret; public Rect caretRect;
     }
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct Startup {
-        public int cb; public string reserved,desktop,title;
-        public int x,y,cx,cy,charsX,charsY,fill,flags; public short show,reservedBytes;
-        public IntPtr reservedPointer,input,output,error;
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct ProcessInfo { public IntPtr process,thread; public int pid,tid; }
     public delegate bool EnumWindow(IntPtr h, IntPtr p);
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumWindow cb, IntPtr p);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out Rect r);
@@ -67,75 +64,19 @@ public static class Ds {
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(int thread,ref GuiThreadInfo info);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(int from,int to,bool attach);
     [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("kernel32.dll")] static extern int GetCurrentThreadId();
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr dev,IntPtr mode,int flags,uint access,IntPtr sa);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out ProcessInfo pi);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h,uint ms);
-    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h,out uint code);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr a,string name);
-    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
-    [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
-    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] public static extern bool TerminateProcess(IntPtr process,uint code);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job,uint code);
-    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job,int type,out JobAccounting accounting,uint size,IntPtr returned);
-    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
-        public long userTime,kernelTime,periodUserTime,periodKernelTime;
-        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long processTime,jobTime; public uint flags;
-        public UIntPtr minWorking,maxWorking; public uint activeProcesses;
-        public UIntPtr affinity; public uint priority,scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes; }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public IoCounters io;
-        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
-    }
-    public static IntPtr CreateOwnedJob() {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job==IntPtr.Zero) throw new Exception("CreateJobObject failed");
-        var limits=new JobLimits(); limits.basic.flags=0x2000; // KILL_ON_JOB_CLOSE
-        if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf<JobLimits>())) {
-            CloseHandle(job); throw new Exception("SetInformationJobObject failed");
-        }
-        return job;
-    }
-    public static uint StopOwnedJob(IntPtr job) {
-        try {
-            if(!TerminateJobObject(job,1)) throw new Exception("Terminate owned job failed");
-            var deadline=DateTime.UtcNow.AddSeconds(5);
-            do {
-                JobAccounting accounting;
-                if(!QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf<JobAccounting>(),IntPtr.Zero))
-                    throw new Exception("Query owned job failed");
-                if(accounting.activeProcesses==0) return accounting.totalProcesses;
-                System.Threading.Thread.Sleep(10);
-            } while(DateTime.UtcNow<deadline);
-            throw new Exception("Owned job cleanup exceeded five seconds");
-        } finally { CloseHandle(job); }
-    }
-    static string Class(IntPtr h) { var s=new StringBuilder(128); GetClassNameW(h,s,128); return s.ToString(); }
-    public static IntPtr[] Hosts(int pid) {
-        var list=new List<IntPtr>(); EnumWindows((h,p)=> { int id; GetWindowThreadProcessId(h,out id);
-            if(id==pid && Class(h)=="noctty.win32.host") list.Add(h); return true;
-        },IntPtr.Zero); return list.ToArray();
-    }
-    public static IntPtr[] Surfaces(IntPtr host) {
-        var list=new List<IntPtr>();
-        EnumChildWindows(host,(c,p)=> { if(Class(c)=="noctty.win32") list.Add(c); return true; },IntPtr.Zero);
-        return list.ToArray();
-    }
     // The first child of `host` with the control ID, in the order Windows
     // enumerates them, or zero.
     public static IntPtr Child(IntPtr host,int id) {
         IntPtr found=IntPtr.Zero;
         EnumChildWindows(host,(c,p)=> { if(GetDlgCtrlID(c)==id) { found=c; return false; } return true; },IntPtr.Zero);
         return found;
+    }
+    // Every child of `host` with the control ID.
+    public static IntPtr[] Children(IntPtr host,int id) {
+        var list=new List<IntPtr>();
+        EnumChildWindows(host,(c,p)=> { if(GetDlgCtrlID(c)==id) list.Add(c); return true; },IntPtr.Zero);
+        return list.ToArray();
     }
     public static bool Alive(IntPtr h) { return IsWindow(h); }
     public static bool Visible(IntPtr h) { return IsWindowVisible(h); }
@@ -185,83 +126,12 @@ public static class Ds {
         if(!AttachThreadInput(me,tid,true)) throw new Exception("AttachThreadInput failed");
         try { SetFocus(h); } finally { AttachThreadInput(me,tid,false); }
     }
-    // Starts a process on the named desktop, with no console window.
-    public static ProcessInfo Spawn(string app,string command,string cwd,string desktop) {
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
-        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000000,IntPtr.Zero,cwd,ref si,out pi))
-            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
-        return pi;
-    }
-    public static ProcessInfo Launch(string app,string command,string cwd,string desktop,IntPtr job) {
-        var si=new Startup { cb=Marshal.SizeOf<Startup>(),desktop=desktop,flags=1,show=0 }; ProcessInfo pi;
-        // Assign the suspended driver before it can spawn children. The job
-        // owns only this launch and its descendants, including terminal shells.
-        if(!CreateProcessW(app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08004004,IntPtr.Zero,cwd,ref si,out pi))
-            throw new Exception("CreateProcess failed: "+Marshal.GetLastWin32Error());
-        if(!AssignProcessToJobObject(job,pi.process)||ResumeThread(pi.thread)==0xFFFFFFFF) {
-            TerminateProcess(pi.process,1); CloseHandle(pi.thread); CloseHandle(pi.process);
-            throw new Exception("Assign/resume owned driver failed");
-        }
-        return pi;
-    }
 }
 '@
-function Startup-Fingerprint {
-    $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if (-not (Test-Path -LiteralPath $path)) { return @{ Exists=$false } }
-    return @{ Exists=$true; Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(); Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o') }
-}
-function Copy-Portable([string] $Source, [string] $Destination) {
-    [void](New-Item -ItemType Directory -Path $Destination)
-    Get-ChildItem -LiteralPath $Source -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Destination }
-    $share = Join-Path (Split-Path -Parent $Source) 'share'
-    if (Test-Path -LiteralPath $share) { Copy-Item -LiteralPath $share -Destination (Join-Path (Split-Path -Parent $Destination) 'share') -Recurse }
-    Set-Content -LiteralPath (Join-Path $Destination 'noctty.portable') -Value '' -NoNewline
-}
 if (-not $Driver) {
-    $Bin = (Resolve-Path -LiteralPath $Bin).Path
-    $Run = [IO.Path]::GetFullPath($Run)
-    if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
-    if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Source Bin must contain noctty.exe.' }
-    $before = Startup-Fingerprint
-    $clipBefore = [Ds]::GetClipboardSequenceNumber()
-    if (($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)) { throw 'Real startup state differs from supplied baseline; no launches performed.' }
-    [void](New-Item -ItemType Directory -Path $Run)
-    Copy-Portable $Bin (Join-Path $Run 'source\bin')
-    foreach ($name in @('localappdata','appdata')) { [void](New-Item -ItemType Directory -Path (Join-Path $Run $name)) }
-    $desktopName = 'noctty-search-' + [guid]::NewGuid().ToString('N')
-    $desktop = [Ds]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
-    if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktop failed.' }
-    $oldLocal=$env:LOCALAPPDATA; $oldRoaming=$env:APPDATA
-    $pi=$null; $job=[IntPtr]::Zero
-    try {
-        $job=[Ds]::CreateOwnedJob()
-        $env:LOCALAPPDATA=Join-Path $Run 'localappdata'; $env:APPDATA=Join-Path $Run 'appdata'
-        $pwsh=(Get-Command pwsh.exe).Source
-        $line='"{0}" -NoProfile -NonInteractive -File "{1}" -Bin "{2}" -Run "{3}" -DesktopName "{4}" -Driver' -f $pwsh,$PSCommandPath,(Join-Path $Run 'source\bin'),$Run,$desktopName
-        $pi=[Ds]::Launch($pwsh,$line,$Run,"WinSta0\$desktopName",$job)
-        Write-Host "Hidden driver PID=$($pi.pid); evidence=$Run"
-        $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
-        while ([Ds]::WaitForSingleObject($pi.process,1000) -eq 258) {
-            if([datetime]::UtcNow -ge $deadline) { throw "Hidden driver exceeded $DriverTimeoutSeconds seconds; owned process job will be closed." }
-        }
-        [uint32]$code=0; [void][Ds]::GetExitCodeProcess($pi.process,[ref]$code)
-    } finally {
-        $env:LOCALAPPDATA=$oldLocal; $env:APPDATA=$oldRoaming
-        $cleanupError=$null; $ownedProcessCount=0
-        if($job -ne [IntPtr]::Zero) { try { $ownedProcessCount=[Ds]::StopOwnedJob($job) } catch { $cleanupError=$_ } }
-        if($pi) { [void][Ds]::CloseHandle($pi.thread); [void][Ds]::CloseHandle($pi.process) }
-        [void][Ds]::CloseDesktop($desktop)
-        $after=Startup-Fingerprint
-        $clipAfter=[Ds]::GetClipboardSequenceNumber()
-        $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{ Before=$before; After=$after; Unchanged=$unchanged; ClipboardSequenceBefore=$clipBefore; ClipboardSequenceAfter=$clipAfter; ClipboardUnchanged=($clipBefore -eq $clipAfter); OwnedJobCleanedUp=($null -eq $cleanupError); OwnedProcessCount=$ownedProcessCount } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
-        if (-not $unchanged) { throw 'Real startup state changed; stop launches.' }
-        if ($clipBefore -ne $clipAfter) { throw "Clipboard sequence number moved ($clipBefore -> $clipAfter); stop launches and report it." }
-        if($cleanupError) { throw $cleanupError }
-    }
-    if($code -ne 0) { throw "Hidden driver failed with exit $code; inspect sanitized results in $Run." }
-    Write-Host 'Hidden docked search: PASS'
+    Invoke-LocalHiddenDriver -Script $PSCommandPath -Bin $Bin -Run $Run -TimeoutSeconds $DriverTimeoutSeconds `
+        -ExpectedStartupHash $ExpectedStartupHash -ExpectedStartupModified $ExpectedStartupModified `
+        -DesktopPrefix 'noctty-search-' -Label 'Hidden docked search' -PassDesktopName -GuardClipboard
     exit
 }
 
@@ -271,18 +141,10 @@ $script:checks=[Collections.Generic.List[object]]::new()
 $script:samples=[Collections.Generic.List[object]]::new()
 $script:processes=[Collections.Generic.List[object]]::new()
 $desktopPath="WinSta0\$DesktopName"
-function Check([string]$Name,[bool]$Passed,$Expected,$Actual) {
-    $script:checks.Add(@{ Name=$Name; Passed=$Passed; Expected=$Expected; Actual=$Actual })
-}
-function Wait-Until([scriptblock]$Predicate,[int]$Seconds=10) {
-    $deadline=[datetime]::UtcNow.AddSeconds($Seconds)
-    do { if(& $Predicate) { return $true }; Start-Sleep -Milliseconds 50 } while([datetime]::UtcNow -lt $deadline)
-    return [bool](& $Predicate)
-}
 # ID of each docked search control (src/apprt/win32/consts.zig).
 $Id=@{ Bg=2100; Edit=2101; Prev=2102; Next=2103; Regex=2104; Case=2105; Word=2106; Results=2107; Close=2108 }
 function Pane($h) {
-    $all=@([Ds]::Surfaces($h)); $shown=@($all|Where-Object {[Ds]::Visible($_)})
+    $all=@([HiddenLocal]::Surfaces($h)); $shown=@($all|Where-Object {[Ds]::Visible($_)})
     if($shown.Count) { return $shown[0] }
     if($all.Count) { return $all[0] }
     throw 'Host has no pane.'
@@ -299,6 +161,12 @@ function Wait-Label($h,[scriptblock]$Is,[int]$Seconds=6) {
     return (Label $h)
 }
 function Press-Edit($h,[int]$Key) { [Ds]::Key([Ds]::Child($h,$Id.Edit),$Key) }
+# The search control `$id` of the pane `$pane`: the bar spans its pane's width.
+function Pane-Child($h,$pane,[int]$id) {
+    $p=[Ds]::RectOf($pane)
+    foreach($c in [Ds]::Children($h,$id)) { $r=[Ds]::RectOf($c); if($r.Left -ge $p.Left -and $r.Right -le $p.Right) { return $c } }
+    return [IntPtr]::Zero
+}
 function Set-Query($h,[string]$Text) {
     # An edit of the query as a user's typing makes: the text changes and
     # EN_CHANGE reaches the search bar.
@@ -313,13 +181,13 @@ function Launch-Case([string]$Name) {
     # may hold spaces without any quoting for cmd.exe.
     @("working-directory = $dir",'command = cmd.exe /d /c fill.cmd','shell-integration = none','single-instance = false','window-save-state = never','confirm-close-surface = false',
       'copy-on-select = false','clipboard-read = deny','clipboard-write = deny',
-      'keybind = f4=start_search') | Set-Content -LiteralPath $config
+      'keybind = f4=start_search','keybind = f5=new_split:right') | Set-Content -LiteralPath $config
     $exe=Join-Path $dir 'noctty.exe'
-    $pi=[Ds]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$config),$dir,$desktopPath)
+    $pi=[HiddenLocal]::Spawn($exe,('"{0}" --config-file="{1}"' -f $exe,$config),$dir,$desktopPath)
     $script:processes.Add(@{Case=$Name;Pid=$pi.pid})
     $deadline=[datetime]::UtcNow.AddSeconds(20)
     do {
-        $hosts=@([Ds]::Hosts($pi.pid))
+        $hosts=@([HiddenLocal]::Hosts($pi.pid))
         $ready=$false
         $ledger=Join-Path $dir 'startup-attempts.json'
         if(Test-Path -LiteralPath $ledger) {
@@ -328,7 +196,7 @@ function Launch-Case([string]$Name) {
                 $ready=$attempts.Count -gt 0 -and $attempts[-1].phase -eq 'ready' -and $null -ne $attempts[-1].ready_at_unix_ms
             } catch { } # A concurrent ledger write may be incomplete; retry within the deadline.
         }
-        if($ready -and $hosts.Count -and @([Ds]::Surfaces($hosts[0])).Count -gt 0) {
+        if($ready -and $hosts.Count -and @([HiddenLocal]::Surfaces($hosts[0])).Count -gt 0) {
             [void][Ds]::ShowWindow($hosts[0],4)
             Start-Sleep -Milliseconds 400
             return @{Pi=$pi; Pid=$pi.pid; Host=$hosts[0]}
@@ -339,13 +207,13 @@ function Launch-Case([string]$Name) {
     throw "Window startup failed for case $Name."
 }
 function Close-Case($case) {
-    foreach($h in [Ds]::Hosts($case.Pid)) { [void][Ds]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
-    if([Ds]::WaitForSingleObject($case.Pi.process,5000) -eq 258) {
+    foreach($h in [HiddenLocal]::Hosts($case.Pid)) { [void][Ds]::PostMessageW($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero) }
+    if([HiddenLocal]::WaitForSingleObject($case.Pi.process,5000) -eq 258) {
         # The handle is this launch's own process: no name or pattern match.
-        [void][Ds]::TerminateProcess($case.Pi.process,1)
-        [void][Ds]::WaitForSingleObject($case.Pi.process,5000)
+        [void][HiddenLocal]::TerminateProcess($case.Pi.process,1)
+        [void][HiddenLocal]::WaitForSingleObject($case.Pi.process,5000)
     }
-    [void][Ds]::CloseHandle($case.Pi.thread); [void][Ds]::CloseHandle($case.Pi.process)
+    [void][HiddenLocal]::CloseHandle($case.Pi.thread); [void][HiddenLocal]::CloseHandle($case.Pi.process)
 }
 function Open-Search($h) {
     [Ds]::Key((Pane $h),0x73)            # F4: start_search
@@ -396,6 +264,100 @@ try {
         $literal=Wait-Label $h { param($t) $t -ne 'Invalid pattern' }
         Check 'a toggle clears the mark: the literal text is searched' ($literal -eq 'No matches') 'No matches' $literal
         $script:samples.Add(@{Name='invalid pattern labels'; Labels=@($invalid,$valid,$none,$again,$literal)})
+    } finally { Close-Case $case }
+
+    # Escape closes the bar; start_search opens it again on the same query
+    # and searches it again.
+    $case=Launch-Case 'reopen'
+    try {
+        $h=$case.Host
+        Start-Sleep -Milliseconds 4000
+        Open-Search $h
+        [Ds]::Chars([Ds]::Child($h,$Id.Edit),'needlex')
+        # The full total: a count taken while fill.cmd still prints is partial.
+        $typed=Wait-Label $h { param($t) $t -eq '60' } 15
+        Press-Edit $h 0x1B
+        [void](Wait-Until { -not [Ds]::Visible([Ds]::Child($h,$Id.Edit)) } 4)
+        $closed=-not [Ds]::Visible([Ds]::Child($h,$Id.Edit))
+        Check 'Escape closes the bar' $closed $true $closed
+        # WM_GETTEXT reads the hidden chip: the close leaves its count there
+        # rather than writing (and announcing) "Searching" as the bar hides.
+        $hiddenChip=Label $h
+        Check 'Escape leaves the hidden chip on its count' ($hiddenChip -eq $typed) $typed $hiddenChip
+        Open-Search $h
+        $edit=[Ds]::Child($h,$Id.Edit); $results=[Ds]::Child($h,$Id.Results)
+        # WM_GETTEXT reads the chip hidden or not, so its visibility is asked.
+        [void](Wait-Until { [Ds]::Visible($results) -and (Label $h) -match '^\d+$' } 6)
+        $reopened=@{ Edit=[Ds]::Visible($edit); Query=[Ds]::Text($edit); Chip=[Ds]::Visible($results); Label=(Label $h) }
+        Check 'reopening shows the same query and searches it again' ($reopened.Edit -and $reopened.Query -eq 'needlex' -and $reopened.Chip -and $reopened.Label -eq '60') @{Edit=$true;Query='needlex';Chip=$true;Label='60'} $reopened
+        $script:samples.Add(@{Name='reopen'; Labels=@($typed,$reopened.Label)})
+    } finally { Close-Case $case }
+
+    # Escape at the terminal ends the search through the default end_search
+    # binding (Surface.endSearch), not through the bar's own controls: the
+    # bar hides before the core's clears reach it, so its hidden chip keeps
+    # the count rather than turning to (and announcing) "Searching".
+    $case=Launch-Case 'terminal-escape'
+    try {
+        $h=$case.Host
+        Start-Sleep -Milliseconds 4000
+        Open-Search $h
+        [Ds]::Chars([Ds]::Child($h,$Id.Edit),'needlex')
+        $typed=Wait-Label $h { param($t) $t -eq '60' } 15
+        $pane=Pane $h
+        [Ds]::FocusOn($pane); Start-Sleep -Milliseconds 200
+        $focused=([Ds]::FocusOf($h) -eq $pane)
+        [Ds]::Key($pane,0x1B)
+        [void](Wait-Until { -not [Ds]::Visible([Ds]::Child($h,$Id.Edit)) } 4)
+        $closed=-not [Ds]::Visible([Ds]::Child($h,$Id.Edit))
+        Check 'Escape at the focused terminal closes the bar' ($focused -and $closed) @{TerminalFocused=$true;Closed=$true} @{TerminalFocused=$focused;Closed=$closed}
+        $hiddenChip=Label $h
+        Check 'Escape at the terminal leaves the hidden chip on its count' ($closed -and $hiddenChip -eq $typed) $typed $hiddenChip
+        $script:samples.Add(@{Name='terminal escape'; Labels=@($typed,$hiddenChip)})
+    } finally { Close-Case $case }
+
+    # Escape on a focused search button closes the bar of the button's pane.
+    # Two panes search; the left one is made active, then the right one's
+    # close button takes the focus and gets the Escape. The mirror, from the
+    # left pane's button, is the control that the check tells panes apart.
+    $case=Launch-Case 'button-escape'
+    try {
+        $h=$case.Host
+        Start-Sleep -Milliseconds 4000
+        Open-Search $h
+        [Ds]::Chars([Ds]::Child($h,$Id.Edit),'needlex')
+        [void](Wait-Label $h { param($t) $t -eq '60' } 15)
+        [Ds]::Key((Pane $h),0x74)            # F5: new_split:right
+        [void](Wait-Until { @([HiddenLocal]::Surfaces($h)).Count -eq 2 } 8)
+        Start-Sleep -Milliseconds 4000       # the new pane prints its 60 lines
+        $panes=@([HiddenLocal]::Surfaces($h) | Sort-Object { [Ds]::RectOf($_).Left })
+        $left=$panes[0]; $right=$panes[1]
+        [Ds]::Key($right,0x73)               # F4 in the right pane
+        [void](Wait-Until { $e=Pane-Child $h $right $Id.Edit; $e -ne [IntPtr]::Zero -and [Ds]::Visible($e) } 8)
+        [Ds]::Chars((Pane-Child $h $right $Id.Edit),'needlex')
+        Start-Sleep -Milliseconds 800
+        $leftEdit=Pane-Child $h $left $Id.Edit; $rightEdit=Pane-Child $h $right $Id.Edit
+        $open=@{ Left=[Ds]::Visible($leftEdit); Right=[Ds]::Visible($rightEdit) }
+        Check 'both panes search' ($open.Left -and $open.Right -and $leftEdit -ne $rightEdit) @{Left=$true;Right=$true} $open
+        # The left pane becomes active through its edit, then the right
+        # pane's close button takes the focus.
+        [Ds]::FocusOn($leftEdit); Start-Sleep -Milliseconds 200
+        $rightClose=Pane-Child $h $right $Id.Close
+        [Ds]::FocusOn($rightClose); Start-Sleep -Milliseconds 200
+        $focused=([Ds]::FocusOf($h) -eq $rightClose)
+        [Ds]::Key($rightClose,0x1B)
+        [void](Wait-Until { -not [Ds]::Visible($rightEdit) } 4)
+        $after=@{ ButtonFocused=$focused; RightOpen=[Ds]::Visible($rightEdit); LeftOpen=[Ds]::Visible($leftEdit); FocusOnRightPane=([Ds]::FocusOf($h) -eq $right) }
+        Check 'Escape on a focused button closes its own pane''s bar and focuses that pane' ($after.ButtonFocused -and -not $after.RightOpen -and $after.LeftOpen -and $after.FocusOnRightPane) @{ButtonFocused=$true;RightOpen=$false;LeftOpen=$true;FocusOnRightPane=$true} $after
+        # The mirror: the right pane is active, the left pane's button closes the left bar.
+        [Ds]::FocusOn($right); Start-Sleep -Milliseconds 200
+        $leftClose=Pane-Child $h $left $Id.Close
+        [Ds]::FocusOn($leftClose); Start-Sleep -Milliseconds 200
+        [Ds]::Key($leftClose,0x1B)
+        [void](Wait-Until { -not [Ds]::Visible($leftEdit) } 4)
+        $mirror=@{ LeftOpen=[Ds]::Visible($leftEdit); FocusOnLeftPane=([Ds]::FocusOf($h) -eq $left) }
+        Check 'the left pane''s button closes the left bar the same way' (-not $mirror.LeftOpen -and $mirror.FocusOnLeftPane) @{LeftOpen=$false;FocusOnLeftPane=$true} $mirror
+        $script:samples.Add(@{Name='button escape'; After=$after; Mirror=$mirror})
     } finally { Close-Case $case }
 
     # F079: the controls of the bar as the pane narrows.

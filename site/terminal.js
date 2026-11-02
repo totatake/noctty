@@ -1,6 +1,12 @@
-// Terminal demo: a scripted typewriter that stays polite — it pauses
-// off-screen and in hidden tabs, sits still under reduced motion, and
-// hands control to the Play/Pause button.
+// Hero demo: a scripted noctty window, drawn from captures of the app, that
+// plays three steps (the palette, a split, a close and reopen). It pauses
+// off-screen and in hidden tabs, sits on a still frame under reduced motion,
+// and the step buttons always switch steps. The palette rows, their order
+// and the status line are what the app showed for "split" in the captures;
+// tests pin each row's title, description and action, the shortcut on the
+// rows that show one, and the status format to src/input/command.zig, the
+// Windows default keybindings and src/apprt/win32/labels.zig. The order and
+// the match count come only from the capture.
 
 export const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 
@@ -18,78 +24,103 @@ export function subscribeToMediaQuery(mediaQuery, onChange) {
 
 export function observeElementVisibility(Observer, element, onChange) {
   if (typeof Observer !== 'function' || !element) return () => {};
+  // A batch can hold several crossings; the last one is the current state.
   const observer = new Observer(
-    ([entry]) => onChange(Boolean(entry?.isIntersecting)),
+    (entries) => onChange(Boolean(entries[entries.length - 1]?.isIntersecting)),
     { threshold: 0.05 },
   );
   observer.observe(element);
   return () => observer.disconnect();
 }
 
-const NC_REPO = 'amanthanvi/noctty';
-const PROMPT = 'PS C:\\Users\\dev>';
+export const PROMPT = 'PS C:\\dev\\aurora> ';
 
-let NC_VERSION = (typeof window !== 'undefined' && window.NC_VERSION) || '1.3.133';
+// Keys the step chips show, with the default action each is bound to.
+// Enter is the palette's own key ("Enter activates" in its status line),
+// not a binding.
+export const DEMO_KEYS = {
+  palette: { keys: 'Ctrl+Shift+P', action: 'toggle_command_palette' },
+  focus: { keys: 'Alt+Left', action: 'goto_split:left' },
+};
+export const PALETTE_KEYS = ['Enter'];
 
-export function buildScenes(v) {
-  return [
-    {
-      title: 'download setup.exe',
-      lines: [
-        { kind: 'cmd', text: "$archEnv = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }" },
-        { kind: 'cmd', text: "$arch = if ($archEnv -eq 'ARM64') { 'arm64' } else { 'x64' }" },
-        { kind: 'cmd', text: `iwr https://github.com/${NC_REPO}/releases/download/v${v}/noctty-${v}-windows-$arch-setup.exe -OutFile noctty-setup.exe` },
-        { kind: 'cmd', text: '.\\noctty-setup.exe' },
-        { kind: 'out', text: '→ installer build: Start menu entry and standard uninstall path' },
-        { kind: 'out', text: '→ x64 and ARM64 installers are Authenticode-signed.' },
-        { kind: 'out', text: '→ SmartScreen may still warn: the certificate is self-signed.' },
-      ],
-    },
-    {
-      title: 'portable (.zip)',
-      lines: [
-        { kind: 'cmd', text: "$archEnv = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }" },
-        { kind: 'cmd', text: "$arch = if ($archEnv -eq 'ARM64') { 'arm64' } else { 'x64' }" },
-        { kind: 'cmd', text: `iwr https://github.com/${NC_REPO}/releases/download/v${v}/noctty-${v}-windows-$arch-portable.zip -OutFile noctty.zip` },
-        { kind: 'cmd', text: 'Expand-Archive noctty.zip -DestinationPath .' },
-        { kind: 'cmd', text: '.\\noctty\\noctty.exe' },
-        { kind: 'out', text: '→ same signed Win32 runtime, no install step required' },
-      ],
-    },
-    {
-      title: 'make it yours',
-      lines: [
-        { kind: 'cmd', text: 'noctty +show-config --default --docs' },
-        { kind: 'out', text: '→ config lives at: %LOCALAPPDATA%\\noctty\\config.ghostty' },
-        { kind: 'out', text: '→ download mode stages a verified signed installer; you choose when to run it' },
-        { kind: 'out', text: '→ profile picker: PowerShell, cmd, Git Bash, and opt-in WSL' },
-      ],
-    },
-  ];
+// The palette for the query "split", as the app lists it: command title,
+// description, and the default shortcut where one exists. "api" is the
+// current tab, which the palette also matches.
+export const PALETTE_QUERY = 'split';
+export const PALETTE_MATCH_COUNT = 48;
+export const PALETTE_RESULTS = [
+  { title: 'Split Up', description: 'Split the terminal up.', keys: '', action: 'new_split:up' },
+  { title: 'Split Down', description: 'Split the terminal down.', keys: 'ctrl+shift+e', action: 'new_split:down' },
+  { title: 'Split Left', description: 'Split the terminal to the left.', keys: '', action: 'new_split:left' },
+  { title: 'Split Right', description: 'Split the terminal to the right.', keys: 'ctrl+shift+backslash', action: 'new_split:right' },
+  { title: 'api', description: 'api', keys: '', tab: true },
+  { title: 'Focus Split: Right', description: 'Focus the split to the right, if it exists.', keys: '', action: 'goto_split:right' },
+  { title: 'Focus Split: Left', description: 'Focus the split to the left, if it exists.', keys: '', action: 'goto_split:left' },
+];
+export const PALETTE_PICK = 'Split Right';
+
+// labels.zig: "{d} matches. Selected: {s} — {s}{s} Up/Down selects; Enter
+// activates.", where the last {s} is sentenceStop: a period unless the
+// description already ends in one.
+export function paletteStatus(count, entry) {
+  const stop = /[.!?]$/.test(entry.description) ? '' : '.';
+  return `${count} matches. Selected: ${entry.title} — ${entry.description}${stop} Up/Down selects; Enter activates.`;
 }
+
+// Lines are lists of [text, kind] runs; kind names a color class, or null.
+const cmd = (...tokens) => [[PROMPT, null], ...tokens];
+export const LEFT_HISTORY = [
+  cmd(['git', 'command'], [' ', null], ['log', 'arg'], [' ', null], ['--oneline -n', 'dim'], [' ', null], ['6', 'num']),
+  [['ad9957b (', 'yellow'], ['HEAD -> ', 'cyan'], ['main', 'green'], [')', 'yellow'], [' add health check endpoint', null]],
+  [['979af40', 'yellow'], [' parse config from env', null]],
+  [['2e2cee1', 'yellow'], [' fix off-by-one in pager', null]],
+  [['5843869', 'yellow'], [' rename session store', null]],
+  [['9f8c4f1', 'yellow'], [' bump deps', null]],
+  [['e75d257', 'yellow'], [' initial commit', null]],
+  cmd(['git', 'command'], [' ', null], ['status', 'arg']),
+  [['On branch main', null]],
+  [['nothing to commit, working tree clean', null]],
+];
+export const RIGHT_COMMAND = [['ls', 'command'], [' ', null], ['-Name', 'dim']];
+export const RIGHT_OUTPUT = ['src', '.gitignore', 'package.json', 'README.md'];
 
 if (typeof document !== 'undefined') {
-  initTerminalDemo(document.querySelector('[data-nc-terminal]'));
+  initDemo(document.querySelector('[data-nc-demo]'));
 }
 
-function initTerminalDemo(root) {
-  if (!root) return;
-  const body = root.querySelector('.nc-terminal__body');
-  const motionButton = root.querySelector('[data-nc-motion]');
-  if (!body || !motionButton) return;
+function initDemo(win) {
+  if (!win) return;
+  const section = win.closest('.nc-demo');
+  const panes = win.querySelector('[data-nc-panes]');
+  const left = win.querySelector('[data-nc-pane="left"]');
+  const right = win.querySelector('[data-nc-pane="right"]');
+  const tabLabel = win.querySelector('[data-nc-tab-label]');
+  const bar = win.querySelector('[data-nc-palette]');
+  const query = win.querySelector('[data-nc-query]');
+  const count = win.querySelector('[data-nc-count]');
+  const status = win.querySelector('[data-nc-status]');
+  const results = win.querySelector('[data-nc-results]');
+  const stepButtons = [...section.querySelectorAll('[data-nc-step]')];
+  const motionButton = section.querySelector('[data-nc-motion]');
+  const keyChips = new Map(
+    [...section.querySelectorAll('[data-nc-key]')].map((chip) => [chip.dataset.ncKey, chip]),
+  );
+  if (!panes || !left || !right || !bar || !results || !motionButton) return;
 
-  let scenes = buildScenes(NC_VERSION);
-  let sceneIdx = 0;
-  let lineIdx = 0;
-  let typed = 0;
-  let timer = null;
-  let liveText = null;
-  // 'auto' follows the reduced-motion preference; 'playing'/'paused' are
-  // explicit user choices made through the button and override it.
+  let step = 0;
+  // 'auto' follows the reduced-motion preference; 'playing' and 'paused'
+  // are explicit choices made with the button and override it.
   let motionMode = 'auto';
   let documentActive = !document.hidden;
   let inViewport = true;
   let reducedMotion = window.matchMedia?.(REDUCED_MOTION_QUERY).matches ?? false;
+  let run = 0;
+  let running = false;
+
+  // A clock that only advances while the demo plays, so pausing holds a
+  // typed line mid-word instead of skipping ahead.
+  let pending = null;
 
   function shouldAnimate() {
     if (!documentActive || !inViewport) return false;
@@ -98,135 +129,330 @@ function initTerminalDemo(root) {
     return !reducedMotion;
   }
 
-  function clearTimer() {
-    if (timer === null) return;
-    window.clearTimeout(timer);
-    timer = null;
-  }
-
-  function schedule(callback, delay) {
-    clearTimer();
-    timer = window.setTimeout(() => {
-      timer = null;
-      callback();
-    }, delay);
-  }
-
-  function makeCaret() {
-    const caret = document.createElement('span');
-    caret.className = 'nc-caret';
-    caret.setAttribute('aria-hidden', 'true');
-    caret.textContent = '▋';
-    return caret;
-  }
-
-  function appendCommandLine(text, withCaret) {
-    const p = document.createElement('p');
-    const prompt = document.createElement('span');
-    prompt.className = 'nc-terminal__prompt';
-    prompt.textContent = PROMPT;
-    const live = document.createElement('span');
-    live.className = 'nc-terminal__live';
-    const textNode = document.createTextNode(text);
-    live.append(textNode);
-    if (withCaret) live.append(makeCaret());
-    p.append(prompt, live);
-    body.append(p);
-    return textNode;
-  }
-
-  function appendOutputLine(text) {
-    const div = document.createElement('div');
-    div.className = 'nc-terminal__line nc-terminal__line--dim';
-    div.textContent = text;
-    body.append(div);
-  }
-
-  function renderCompletedScene() {
-    const scene = scenes[sceneIdx];
-    body.textContent = '';
-    for (const line of scene.lines) {
-      if (line.kind === 'cmd') appendCommandLine(line.text, false);
-      else appendOutputLine(line.text);
-    }
-    appendCommandLine('', true);
-    lineIdx = scene.lines.length;
-    typed = 0;
-    liveText = null;
-    body.scrollTop = 0;
-  }
-
-  function resetScene() {
-    body.textContent = '';
-    lineIdx = 0;
-    typed = 0;
-    liveText = null;
-  }
-
-  function step() {
-    const scene = scenes[sceneIdx];
-    const line = scene.lines[lineIdx];
-
-    if (!line) {
-      if (!body.querySelector('.nc-caret')) appendCommandLine('', true);
-      schedule(() => {
-        sceneIdx = (sceneIdx + 1) % scenes.length;
-        resetScene();
-        step();
-      }, 1800);
-      return;
-    }
-
-    if (line.kind === 'cmd') {
-      if (liveText === null) liveText = appendCommandLine('', true);
-      if (typed < line.text.length) {
-        schedule(() => {
-          typed += 1;
-          liveText.nodeValue = line.text.slice(0, typed);
-          body.scrollTop = body.scrollHeight;
-          step();
-        }, 32 + Math.random() * 48);
-      } else {
-        schedule(() => {
-          liveText.parentNode.querySelector('.nc-caret')?.remove();
-          liveText = null;
-          typed = 0;
-          lineIdx += 1;
-          step();
-        }, 360);
+  function sleep(ms, token) {
+    return new Promise((resolve, reject) => {
+      if (token !== run) {
+        reject(new Error('cancelled'));
+        return;
       }
-      return;
-    }
+      pending = { remaining: ms, resolve, reject, timer: null, started: 0 };
+      if (shouldAnimate()) startPending();
+    });
+  }
 
-    schedule(() => {
-      appendOutputLine(line.text);
-      body.scrollTop = body.scrollHeight;
-      lineIdx += 1;
-      step();
-    }, 220);
+  function startPending() {
+    if (!pending || pending.timer !== null) return;
+    pending.started = performance.now();
+    pending.timer = window.setTimeout(() => {
+      const done = pending;
+      pending = null;
+      done.resolve();
+    }, pending.remaining);
+  }
+
+  function holdPending() {
+    if (!pending || pending.timer === null) return;
+    window.clearTimeout(pending.timer);
+    pending.timer = null;
+    pending.remaining = Math.max(0, pending.remaining - (performance.now() - pending.started));
+  }
+
+  function cancelPending() {
+    if (!pending) return;
+    if (pending.timer !== null) window.clearTimeout(pending.timer);
+    const cancelled = pending;
+    pending = null;
+    cancelled.reject(new Error('cancelled'));
+  }
+
+  // drawing
+
+  function span(text, kind) {
+    if (!kind) return document.createTextNode(text);
+    const el = document.createElement('span');
+    el.className = `nc-term__${kind}`;
+    el.textContent = text;
+    return el;
+  }
+
+  function line(runs) {
+    const div = document.createElement('div');
+    div.className = 'nc-term__line';
+    for (const [text, kind] of runs) div.append(span(text, kind));
+    return div;
+  }
+
+  function cursor() {
+    const el = document.createElement('span');
+    el.className = 'nc-term__cursor';
+    return el;
+  }
+
+  function promptLine(withCursor = true) {
+    const div = line([[PROMPT, null]]);
+    if (withCursor) div.append(cursor());
+    return div;
+  }
+
+  function setSplit(split) {
+    panes.classList.toggle('is-split', split);
+    right.hidden = !split;
+    if (tabLabel) tabLabel.textContent = split ? '* 1: api (2)' : '* 1: api';
+  }
+
+  function setFocus(which) {
+    left.classList.toggle('is-focused', which === 'left');
+    right.classList.toggle('is-focused', which === 'right');
+  }
+
+  function drawLeftHistory() {
+    left.replaceChildren(...LEFT_HISTORY.map(line), promptLine());
+  }
+
+  function drawRightListing() {
+    right.replaceChildren(
+      line(cmdRuns(RIGHT_COMMAND)),
+      ...RIGHT_OUTPUT.map((name) => line([[name, null]])),
+      promptLine(),
+    );
+  }
+
+  function cmdRuns(tokens) {
+    return [[PROMPT, null], ...tokens];
+  }
+
+  function drawResults(selectedTitle) {
+    const selected = PALETTE_RESULTS.find((entry) => entry.title === selectedTitle) ?? PALETTE_RESULTS[0];
+    results.replaceChildren(
+      ...PALETTE_RESULTS.map((entry) => {
+        const li = document.createElement('li');
+        if (entry === selected) li.className = 'is-selected';
+        for (const text of [entry.title, entry.description, entry.keys]) {
+          const cell = document.createElement('span');
+          cell.textContent = text;
+          li.append(cell);
+        }
+        return li;
+      }),
+    );
+    results.hidden = false;
+    status.textContent = paletteStatus(PALETTE_MATCH_COUNT, selected);
+    count.textContent = String(PALETTE_MATCH_COUNT);
+  }
+
+  function openBar(text = '') {
+    bar.hidden = false;
+    query.textContent = text;
+    count.textContent = '';
+    status.textContent = '';
+    results.hidden = true;
+  }
+
+  function closeBar() {
+    bar.hidden = true;
+    results.hidden = true;
+  }
+
+  function pressKey(name, pressed) {
+    keyChips.get(name)?.classList.toggle('is-pressed', pressed);
+  }
+
+  function releaseKeys() {
+    for (const chip of keyChips.values()) chip.classList.remove('is-pressed');
+  }
+
+  // Still frames: where the demo starts, and where each step ends.
+
+  function drawStart() {
+    releaseKeys();
+    win.classList.remove('is-closed');
+    closeBar();
+    setSplit(false);
+    setFocus('left');
+    drawLeftHistory();
+  }
+
+  function drawEnd(index) {
+    releaseKeys();
+    win.classList.remove('is-closed');
+    if (index === 0) {
+      setSplit(false);
+      setFocus('left');
+      drawLeftHistory();
+      openBar(PALETTE_QUERY);
+      drawResults(PALETTE_PICK);
+    } else if (index === 1) {
+      closeBar();
+      setSplit(true);
+      setFocus('left');
+      drawLeftHistory();
+      drawRightListing();
+    } else {
+      closeBar();
+      setSplit(true);
+      setFocus('left');
+      left.replaceChildren(promptLine());
+      right.replaceChildren(promptLine());
+    }
+  }
+
+  // scripts
+
+  async function typeRuns(target, tokens, token) {
+    for (const [text, kind] of tokens) {
+      const node = span('', kind);
+      target.append(node);
+      for (const ch of text) {
+        await sleep(55 + Math.random() * 45, token);
+        node.textContent += ch;
+      }
+    }
+  }
+
+  async function playPalette(token) {
+    drawStart();
+    await sleep(900, token);
+    pressKey('palette', true);
+    await sleep(220, token);
+    openBar();
+    pressKey('palette', false);
+    await sleep(450, token);
+    for (const ch of PALETTE_QUERY) {
+      await sleep(90 + Math.random() * 60, token);
+      query.textContent += ch;
+    }
+    await sleep(160, token);
+    drawResults(PALETTE_RESULTS[0].title);
+    await sleep(1000, token);
+    const pickIndex = PALETTE_RESULTS.findIndex((entry) => entry.title === PALETTE_PICK);
+    for (let i = 1; i <= pickIndex; i += 1) {
+      await sleep(320, token);
+      drawResults(PALETTE_RESULTS[i].title);
+    }
+    await sleep(1500, token);
+  }
+
+  async function playSplit(token) {
+    drawEnd(0);
+    await sleep(500, token);
+    pressKey('enter', true);
+    await sleep(200, token);
+    pressKey('enter', false);
+    closeBar();
+    setSplit(true);
+    setFocus('right');
+    right.replaceChildren(promptLine());
+    await sleep(800, token);
+    right.replaceChildren();
+    const typing = line([[PROMPT, null]]);
+    const caret = cursor();
+    right.append(typing);
+    typing.append(caret);
+    const typed = document.createElement('span');
+    typing.insertBefore(typed, caret);
+    await typeRuns(typed, RIGHT_COMMAND, token);
+    await sleep(300, token);
+    caret.remove();
+    for (const name of RIGHT_OUTPUT) right.append(line([[name, null]]));
+    right.append(promptLine());
+    await sleep(1100, token);
+    pressKey('focus', true);
+    await sleep(200, token);
+    setFocus('left');
+    pressKey('focus', false);
+    await sleep(1600, token);
+  }
+
+  async function playRestore(token) {
+    drawEnd(1);
+    await sleep(900, token);
+    win.classList.add('is-closed');
+    await sleep(1300, token);
+    left.replaceChildren(promptLine());
+    right.replaceChildren(promptLine());
+    setFocus('left');
+    win.classList.remove('is-closed');
+    await sleep(3200, token);
+  }
+
+  const SCRIPTS = [playPalette, playSplit, playRestore];
+  // Each script's length with average typing, used only to pace the step
+  // underline; the underline pauses with the script's clock.
+  const STEP_MS = [5800, 5300, 5400];
+
+  function markStep(index) {
+    step = index;
+    for (const button of stepButtons) button.setAttribute('aria-pressed', 'false');
+    section.style.setProperty('--nc-step-ms', `${STEP_MS[index]}ms`);
+    // Restart the underline even when the same step plays again.
+    void section.offsetWidth;
+    stepButtons[index]?.setAttribute('aria-pressed', 'true');
+  }
+
+  async function playFrom(index) {
+    const token = ++run;
+    running = true;
+    let current = index;
+    try {
+      for (;;) {
+        markStep(current);
+        await SCRIPTS[current](token);
+        if (token !== run) return;
+        current = (current + 1) % SCRIPTS.length;
+      }
+    } catch {
+      // A newer run or a step switch cancelled this one.
+    } finally {
+      if (token === run) running = false;
+    }
+  }
+
+  function stopRun() {
+    run += 1;
+    running = false;
+    cancelPending();
+  }
+
+  function showStill(index) {
+    stopRun();
+    markStep(index);
+    drawEnd(index);
   }
 
   function applyMotionState() {
     const animating = shouldAnimate();
-    root.setAttribute('data-motion', animating ? 'playing' : 'paused');
-    const label = animating ? 'Pause terminal demo' : 'Play terminal demo';
+    // 'paused' holds a step mid-way; 'still' is a finished frame.
+    section.setAttribute('data-motion', animating ? 'playing' : running ? 'paused' : 'still');
+    const label = animating ? 'Pause the demo' : 'Play the demo';
     motionButton.textContent = animating ? 'Pause' : 'Play';
     motionButton.setAttribute('aria-label', label);
     motionButton.setAttribute('title', label);
     if (animating) {
-      if (timer === null) step();
+      if (!running) playFrom(step);
+      else startPending();
     } else {
-      clearTimer();
+      holdPending();
     }
   }
+
+  stepButtons.forEach((button, index) => {
+    button.addEventListener('click', () => {
+      if (shouldAnimate()) {
+        stopRun();
+        playFrom(index);
+        applyMotionState();
+      } else {
+        showStill(index);
+        applyMotionState();
+      }
+    });
+  });
 
   motionButton.addEventListener('click', () => {
     const animating = shouldAnimate();
     motionMode = animating ? 'paused' : 'playing';
-    // A static completed scene has no in-flight line to resume; restart it.
-    if (!animating && liveText === null && lineIdx >= scenes[sceneIdx].lines.length) {
-      resetScene();
-    }
+    // Resuming from a still frame replays the current step from its start.
+    if (!animating && !running) stopRun();
     applyMotionState();
   });
 
@@ -235,7 +461,7 @@ function initTerminalDemo(root) {
     applyMotionState();
   });
 
-  observeElementVisibility(window.IntersectionObserver, root, (visible) => {
+  observeElementVisibility(window.IntersectionObserver, win, (visible) => {
     inViewport = visible;
     applyMotionState();
   });
@@ -243,34 +469,20 @@ function initTerminalDemo(root) {
   if (window.matchMedia) {
     subscribeToMediaQuery(window.matchMedia(REDUCED_MOTION_QUERY), (event) => {
       reducedMotion = event.matches;
+      // Only the automatic mode follows the preference; a visitor's own
+      // pause or play stands.
+      if (motionMode === 'auto' && !shouldAnimate()) showStill(step);
       applyMotionState();
     });
   }
 
-  window.addEventListener('nc-version-updated', (event) => {
-    const next = event?.detail?.version || window.NC_VERSION;
-    if (!next || next === NC_VERSION) return;
-    NC_VERSION = next;
-    window.NC_VERSION = next;
-    scenes = buildScenes(NC_VERSION);
-    if (shouldAnimate()) {
-      resetScene();
-      clearTimer();
-      step();
-    } else {
-      renderCompletedScene();
-    }
-  });
-
-  // The markup ships with scene one pre-rendered for no-JS visitors. With
-  // JS running, a non-animating start re-renders that scene from the current
-  // data: version.js may have published a cached release before this module's
-  // listener existed, and the markup hardcodes the compiled version.
+  // The markup ships the split frame for visitors without JS. With JS, start
+  // on the first step: animated when motion is allowed, else its still frame.
   if (shouldAnimate()) {
-    resetScene();
+    markStep(0);
     applyMotionState();
   } else {
-    renderCompletedScene();
+    showStill(0);
     applyMotionState();
   }
 }

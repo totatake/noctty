@@ -59,6 +59,7 @@ a fork-owned feature. The current high-risk seams are:
 - `src/config/Config.zig`
 - `src/Surface.zig`
 - `src/renderer/Thread.zig`
+- `src/renderer/Pacer.zig` and its test adapter `src/renderer/pacer_sim.zig`
 - `src/renderer/generic.zig`
 - `src/termio/Termio.zig`
 - `src/termio/Exec.zig`
@@ -75,6 +76,38 @@ Upstream wins on VT and protocol correctness and on memory-safety fixes, but
 those changes must be adapted around fork-owned Windows behavior rather than
 overwriting it. If neither rule resolves a conflict cleanly, add the change to
 the window's deferred list with a written reason; do not force it through.
+
+`PageList.Node` reaches its page through upstream's accessors (`page()`,
+`rows()`, `cols()` and `capacity()`), so a ported hunk that uses them
+applies as written and is not an adaptation to record. Upstream's other
+node names come with page compression, which the fork does not have. A hunk
+that uses one is an adaptation, and this is what each becomes:
+
+- `pageAssumeResident()` and `metadata()`: `page()` where the node is
+  mutable; otherwise add the accessor with upstream's resident arm alone
+  (`&self.data.resident`) in the first port that needs it.
+- `pageIfResident()`: `page()`; drop the null arm.
+- `pagePreservingState(alloc)`: `page()`; drop the `try` and the `deinit`.
+- `isCompressed()`: `false`; drop the branch it guards.
+- `storage()` and `Storage`: drop the `.compressed` arm.
+- `switch (node.data)`: the hunk depends on compression; adapt it.
+- `.owned = .pool` or `.heap`: drop it. `destroyNodeExt` infers the owner
+  from the page's size, which holds only while no port heap-allocates a page
+  at or below `std_size` (upstream's `compact` does; the fork's leaves such
+  a page alone and takes a smaller result from the pool).
+
+Each window diffs upstream's Node accessor block against the fork's and
+records a changed name, receiver or return type in its drift report. It
+also checks that `git grep -F '.data.resident' -- src` finds only Node's
+accessor bodies: the seal stops the old spellings, but a direct
+`node.data.resident` still compiles anywhere.
+
+Renderer scheduling is split in the fork: `Pacer.turn` decides when a frame
+updates, presents or waits and when the timers run, and `Thread.Frame` holds
+the mechanics (the mailbox drain, `updateFrame` and the present, the libxev
+timers). Adapt an upstream hunk that changes the render pass, its timers or
+the drain's timer arms in `src/renderer/Thread.zig` into one of those two;
+Thread's timer and wakeup callbacks stay one `turn` call each.
 
 The merge scope above decides which paths a window merges from upstream. It is
 not a reason to defer an upstream memory-safety fix (a use-after-free, double

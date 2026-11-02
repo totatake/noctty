@@ -124,8 +124,9 @@ Win32-validated VT protocol coverage is tracked in
   drag, the double-click maximize and the right-click menu were checked with
   real mouse input on Windows 11 build 26300 (a right-click on an active
   window opened no menu until that check found why); Snap was not measured.
-- The tab strip follows the Windows accent colour by default
-  (`accent-follow-system`); the rest of the chrome keeps its fixed palette.
+- The active tab takes its terminal's background and joins the terminal
+  below it, as in Windows Terminal; the tab strip uses no accent colour.
+  `accent-follow-system` still parses but has no effect.
 - High-contrast mode detection and palette switching.
 - IME for CJK and other composed input.
 - A local sensitive-input indicator for no-echo input. `toggle_secure_input`
@@ -159,9 +160,14 @@ Win32-validated VT protocol coverage is tracked in
   input, and `quick-terminal-space-behavior` has no Windows effect.
 - WinRT Action Center notifications with an in-app banner/log fallback,
   gated by `desktop-notifications`. Command-finish toasts also need
-  `notify-on-command-finish` and a `notify` action. Command-finish and
-  program status ([OSC 7501](windows.md#program-status-osc-7501)) toasts focus
-  the originating pane when clicked; OSC 9 / OSC 777 toasts are display-only.
+  `notify-on-command-finish` and a `notify` action. Every toast from a
+  terminal pane (OSC 9, OSC 777, command finished, program status
+  ([OSC 7501](windows.md#program-status-osc-7501)) and the "Copied ... to
+  clipboard" notices) names its tab and focuses its pane when its popup is
+  clicked, and in an installed copy when its Action Center entry is
+  clicked (COM toast activator; not yet exercised on a real desktop).
+  A pane keeps one toast in Action Center, removed when its tab is seen,
+  when the pane or tab closes, and at exit.
   Command-finish toasts depend on OSC 133 command marks, which plain
   `cmd.exe` does not supply (Clink with the shipped script does).
 - Taskbar progress for the active pane in each host window, driven by
@@ -173,7 +179,11 @@ Win32-validated VT protocol coverage is tracked in
 - Session restore via `window-save-state`: windows, tabs, splits, profiles,
   working directories, and explicit titles come back; child processes do
   not. The opt-in `window-save-state-scrollback` line count also restores
-  bounded, clearly marked plain-text pane snapshots. Only one noctty process
+  bounded, clearly marked plain-text pane snapshots. The next launch restores
+  what was open when the session ended: what the last window held when it
+  went, however it went (its close, its last tab or pane, its last shell
+  exiting), or every window a quit closed. Undo history is not saved. Only
+  one noctty process
   owns `session-state.json`; a second instance, a forwarded launch, `-e` and
   `--working-directory` launches neither restore nor save it.
 - Named layouts (C17): save the focused window's tabs, splits, profiles,
@@ -265,13 +275,19 @@ Win32-validated VT protocol coverage is tracked in
 ### Windows package managers
 
 - WinGet package id: `AmanThanvi.noctty` (published; `winget install --id AmanThanvi.noctty -e`).
-- Chocolatey package id: `noctty` (the release workflow builds it and its
-  last step runs after WinGet, but the publish script skips the push while no
-  `CHOCO_API_KEY` secret is configured, as in 1.3.132; community.chocolatey.org
-  had no `noctty` package on 2026-10-16). The first submission then waits in
-  moderation for weeks, and later pushes get `403` until a version is
-  approved; see [chocolatey-publishing.md](chocolatey-publishing.md). A
-  released version is pushed with the manual Chocolatey Publish workflow.
+- Chocolatey package id: `noctty` (published; `choco install noctty`).
+  community.chocolatey.org approved 1.3.134 on 2026-10-23. The release
+  workflow builds the package and its last step, after WinGet, pushes it; the
+  repository variable `CHOCOLATEY_PUBLISH` was deleted on 2026-10-23, so the
+  step runs on every release. Chocolatey reviews each version before listing
+  it, so a release can reach it after the other channels. The community
+  maintainer `virtualex`, who submitted `noctty` 1.3.131 on 2026-10-16, added
+  `amanthanvi` as a maintainer on 2026-10-20 and stays on as a co-maintainer.
+  The install script asks the CPU which installer to use, because Chocolatey
+  runs as an emulated x64 process on ARM64 Windows; that ships with the first
+  release built after 1.3.134, whose package installs the x64 build there. See
+  [chocolatey-publishing.md](chocolatey-publishing.md). A released version is
+  pushed with the manual Chocolatey Publish workflow.
 - Scoop bucket: `https://github.com/amanthanvi/scoop-noctty`.
 
 ### Crash reports
@@ -287,7 +303,10 @@ Win32-validated VT protocol coverage is tracked in
   startup failures fall back to safe mode (a launch that ends only because
   OpenGL cannot start is not counted). A saved session that keeps ending
   the process during restore is renamed to `session-state.json.restore-failed`
-  instead of being restored again. Details in
+  instead of being restored again. A restored session whose programs all
+  ended by themselves before anyone used it is renamed to
+  `session-state.json.restore-ended` instead of being saved back.
+  Details in
   [windows.md](windows.md#session-restore-and-recovery).
 - `+diagnostic-bundle` exports are explicit and redact terminal content,
   environment, and config values by default.
@@ -329,7 +348,15 @@ the interactive UI Automation harness nor the screen-reader matrix exercises
 them.
 
 Not yet covered: the profile picker and tab-overview overlay rows, context
-menus, toasts, the tab drag preview, and quick-terminal chrome. `Ctrl+F6` and
+menus, toasts, the tab drag preview, quick-terminal chrome, and the
+in-progress IME composition. noctty draws the composition itself and exposes
+none of it through UI Automation, as Windows Terminal does. NVDA reads IMM32
+and TSF compositions through its own IME support (from its source, not
+measured in noctty). Microsoft's IME requirements require an IME's own
+candidate window to expose itself to Narrator, and how Narrator reads the
+composition string is not documented; neither is measured here. A
+hands-on check with real IMEs and screen readers is still owed (see
+[accessibility-matrix.md](accessibility-matrix.md)). `Ctrl+F6` and
 `Ctrl+Shift+F6` (`cycle_focus_region`; a bare `F6` goes to the application)
 move focus between the terminal, the tab strip, the docked search query and
 the host banner, and `Escape` returns to the terminal. The cycle does not
@@ -360,9 +387,14 @@ transient status instead.
 
 ### Win32 runtime extraction
 
-The Win32 runtime is still centered on one large file
-(`src/apprt/win32.zig`). Extraction into focused modules is in progress and
-lands incrementally.
+The Win32 runtime's `App`, `Host` and `Surface` types live in
+`src/apprt/win32/app.zig`, `host.zig` and `terminal_window.zig`, beside
+focused modules for session restore, the quick terminal host, window state,
+surface presentation, the docked search controls, overlay and palette
+orchestration and the chrome scene. `src/apprt/win32.zig` still holds the
+forwarding aliases, the native window procedures, shared helpers and the tests
+that combine owners. Extraction into smaller modules is in progress and lands
+incrementally.
 
 ## Known caveats
 
@@ -435,15 +467,55 @@ lands incrementally.
   desktop with a 60 ms delay injected after the font change, standing in for
   a slow font build in another pane: one resize per pane at its final grid,
   single pane and split, where the hold alone pushed lines on 29 of 30 moves.
-  The two have not been measured together with real input. A tab hidden
-  during the move takes the font and the size as separate resizes when it is
-  shown, so a slow font build there can still wrap long lines into scrollback.
-  A pane whose new font cannot be built gets the new size in the old font at
-  once, which on a move to a lower DPI can do the same, and the font is
-  retried on a later layout (both inferred, not measured).
+  The two together were then measured with real input on 2026-10-17 (a build
+  of main with #426, the D3D11 renderer, a machine with a 144 DPI primary and
+  two 96 DPI monitors, no injected delay). Over 30 drags of a single pane, no
+  text shifted and no size mismatched. A build that logs what termio applied,
+  over 30 more, sent no old-font size to the core, made no intermediate grid
+  and pushed no rows into scrollback. In a split window, 10 drags on a rebuilt
+  logging build brought one termio resize per pane, in the final font, with
+  every pane's scrollback unchanged (the panes' PTY sizes were not captured).
+  The first split run, on the earlier build of the logging executable (which
+  the 30 logged single-pane drags used too; their logs are complete), logged
+  one pane's resize on 7 of 10 drags. The screenshot check flagged 5 of 10
+  drags in both split runs. The agent log (test-harnesses.md, 2026-10-19)
+  reads the first as overwritten bytes in the logger (shown for 4 of the 7,
+  consistent with the other 3) and the second as a split pane compared with an
+  unsplit reference. A hidden-desktop check (20 crossings per orientation
+  between 144 and 96 DPI, on a one-tab window and on two-pane splits) matched
+  all 80 of its observations (client pixels, core, IO and terminal grids, and
+  the PTY size read back through `AttachConsole`), so neither shows a product
+  miss; it did not cover an unspecified initial size, transient sizes,
+  composed output or the message order of a real drag. A tab hidden during the
+  move now takes its new size and font as one resize too when it is shown, by
+  a click on its tab or by switching tabs from the keyboard. Measured on a
+  hidden desktop with a 60 ms delay injected at the start of each DPI font
+  change, showing the tab through the tab strip's command (a harness hook into
+  the same path as a click): main applied a 66x18 grid before the pane's 93x29
+  on 20 of 20 shows, and on the first show at 96 DPI 9 rows went into its
+  scrollback and stayed there; with the batch, 0 of 20. Without the injected
+  delay main gave 0 of 20 too, because the new font is cached and both resizes
+  arrive within termio's 25 ms. A split tab shown from the keyboard
+  (`goto_tab`) got a wrong grid on main on 10 of 10 shows with the delay
+  (32x18 before 49x28 at 144 DPI, and 12 rows into scrollback on the first);
+  its batch was not measured. A window that is hidden or minimized while its
+  DPI changes (a quick terminal shown on another monitor, say) can still take
+  its new size before its new font, and a pane whose new font cannot be built
+  gets the new size in the old font at once, which on a move to a lower DPI
+  can do the same; the font is retried on a later layout (both inferred, not
+  measured).
 - Alt+Space still sends ESC SPACE to the program as well as opening the
   window menu (#381). Once conhost has seen a Win32 input record it holds a
   lone ESC back until more input arrives, as under Windows Terminal (#335).
+- Since 1.3.132 (#335) noctty sends keys to ConPTY as Win32 input records
+  (unless the program asked for the Kitty keyboard protocol). A record's text
+  is Windows' translation of the key against the keyboard state at key-down,
+  not a `WM_CHAR` that follows it. So a tool that types into noctty by sending
+  `WM_KEYDOWN` and then `WM_CHAR` to its window (`SendMessage`) without setting
+  that keyboard state (for example with `AttachThreadInput` and
+  `SetKeyboardState`) gets a Shift chord's unshifted character: Shift+.
+  arrives as `.`, and the tool's `WM_CHAR` is dropped. Real keys, `SendInput`
+  and IME commits are unaffected.
 - A Japanese IME commit of 【】 freezes input in a `wslc exec -it` session
   (#395); reading wslc's source points at `wslc.exe` itself, not noctty (not
   reproduced with a real IME or container).
@@ -471,7 +543,7 @@ No formal roadmap. Likely next areas:
   already recorded there, and UI Automation for overlay rows and menus.
 - Keyboard reach for the chrome the focus-region cycle still skips (the
   search buttons, overlay rows and menus).
-- Continuing the `src/apprt/win32.zig` extraction.
+- Continuing the Win32 runtime extraction under `src/apprt/win32/`.
 - Broader local crash metadata and report packaging.
 - ARB-context OpenGL migration paired with atlas rebuild.
 

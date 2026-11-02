@@ -1,6 +1,7 @@
 //! https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
 const std = @import("std");
 
+const lib = @import("../../lib.zig");
 const string_encoding = @import("../../../os/string_encoding.zig");
 
 const log = std.log.scoped(.osc_semantic_prompt);
@@ -58,6 +59,16 @@ pub const Command = struct {
     }
 };
 
+// ClickEvents can either be a click_events=1 or click_events=2.
+// The click_events=1 sends a click event with the absolute coordinates
+// of the click.
+// The click_events=2 sends a click event with the coordinates of the click
+// relative to the prompt area.
+// See https://github.com/ghostty-org/ghostty/issues/10865 and
+// https://github.com/kovidgoyal/kitty/issues/9500
+// for further details.
+pub const ClickEvents = enum { absolute, relative };
+
 pub const Option = enum {
     aid,
     cl,
@@ -100,7 +111,7 @@ pub const Option = enum {
             .err => []const u8,
             .redraw => Redraw,
             .special_key => bool,
-            .click_events => bool,
+            .click_events => ClickEvents,
             .cmdline => []const u8,
             .cmdline_url => []const u8,
             .exit_code => i32,
@@ -152,11 +163,11 @@ pub const Option = enum {
             // If we're looking for exit_code we special case it.
             // as the first value.
             if (comptime self == .exit_code) {
-                return std.fmt.parseInt(i32, full, 10) catch {
+                return lib.parseInt(i32, full, 10) catch {
                     // Windows reports an exit code as a DWORD, so a crash
                     // is often spelled unsigned (`3221225477` for
                     // 0xC0000005). Keep the 32 bits.
-                    const unsigned = std.fmt.parseInt(u32, full, 10) catch return null;
+                    const unsigned = lib.parseInt(u32, full, 10) catch return null;
                     return @bitCast(unsigned);
                 };
             }
@@ -200,7 +211,12 @@ pub const Option = enum {
                     .last
                 else
                     null,
-                .special_key, .click_events => if (value.len == 1) switch (value[0]) {
+                .click_events => if (value.len == 1) switch (value[0]) {
+                    '1' => .absolute,
+                    '2' => .relative,
+                    else => null,
+                } else null,
+                .special_key => if (value.len == 1) switch (value[0]) {
                     '0' => false,
                     '1' => true,
                     else => null,
@@ -1251,9 +1267,10 @@ test "Option.read special_key" {
 
 test "Option.read click_events" {
     const testing = std.testing;
-    try testing.expect(Option.click_events.read("click_events=1").? == true);
-    try testing.expect(Option.click_events.read("click_events=0").? == false);
     try testing.expect(Option.click_events.read("click_events=yes") == null);
+    try testing.expect(Option.click_events.read("click_events=0") == null);
+    try testing.expect(Option.click_events.read("click_events=1").? == .absolute);
+    try testing.expect(Option.click_events.read("click_events=2").? == .relative);
 }
 
 test "Option.read exit_code" {
@@ -1277,4 +1294,14 @@ test "Option.read exit_code accepts the unsigned spelling of a 32-bit code" {
     // Past 32 bits either way is still malformed.
     try testing.expect(Option.exit_code.read("4294967296") == null);
     try testing.expect(Option.exit_code.read("-2147483649") == null);
+}
+
+test "OSC 133: exit codes reject digit separators" {
+    var p = @import("../../osc.zig").Parser.init(null);
+    for ("133;D;-4_2;aid=foo") |ch| p.next(ch);
+    const cmd = p.end(null).?.*;
+    try std.testing.expectEqual(null, cmd.semantic_prompt.readOption(.exit_code));
+
+    // The unsigned spelling of a Windows exit code is checked the same way.
+    try std.testing.expectEqual(null, Option.exit_code.read("4_294967295"));
 }

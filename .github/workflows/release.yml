@@ -405,9 +405,11 @@ jobs:
 
       # Last on purpose: until chocolatey.org approves a first version, every
       # later push is refused with 403 for weeks (docs/chocolatey-publishing.md),
-      # and that must not keep WinGet from getting the release.
+      # and that must not keep WinGet from getting the release. The repository
+      # variable CHOCOLATEY_PUBLISH set to off skips the push while
+      # chocolatey.org cannot accept it; unset, the push runs.
       - name: Publish Chocolatey package
-        if: steps.meta.outputs.prerelease != 'true'
+        if: steps.meta.outputs.prerelease != 'true' && vars.CHOCOLATEY_PUBLISH != 'off'
         shell: pwsh
         env:
           CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}

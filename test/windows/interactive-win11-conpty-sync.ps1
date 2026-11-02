@@ -4,14 +4,26 @@ param(
     [switch] $ListScenarios,
     [switch] $Rebuild,
     [switch] $NoBuild,
+    # A scenario skipped because a program it needs is missing (pwsh.exe, vim)
+    # normally passes; with this switch it fails, so a CI image that loses one
+    # cannot quietly shrink the coverage.
+    [switch] $RequireAll,
     [switch] $ResetState,
     [int] $TimeoutSeconds = 900,
+    # An extracted official portable Clink's clink_x64.exe, for the Clink
+    # scenario (skipped without it). Copied into the sandbox, never installed.
+    [string] $Clink,
     # Internal: the half of the harness that runs on the hidden desktop.
     [switch] $Inner,
     [string] $DesktopName,
     [string] $RunRoot,
     [string] $ResultPath
 )
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-conpty-sync.ps1'
+try {
+
 
 # Differential harness: does noctty's screen agree with ConPTY's?
 #
@@ -162,6 +174,21 @@ public static class NocttyConptySyncNative {
         return list;
     }
 
+    [DllImport("user32.dll")] static extern bool EnumDesktopWindows(IntPtr desktop, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr h);
+
+    // The top-level windows of a desktop, from outside it: class, owner pid,
+    // visibility and whether Windows considers the owner hung. Metadata only.
+    public static List<string> DescribeDesktopWindows(IntPtr desktop) {
+        var list = new List<string>();
+        EnumDesktopWindows(desktop, (h, l) => {
+            int p; GetWindowThreadProcessId(h, out p);
+            list.Add(String.Format("0x{0:X} pid={1} class={2} visible={3} hung={4}", h.ToInt64(), p, ClassOf(h), IsWindowVisible(h), IsHungAppWindow(h)));
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
     public static List<IntPtr> VisibleChildren(IntPtr parent, string cls) {
         var list = new List<IntPtr>();
         EnumChildWindows(parent, (h, l) => { if (IsWindowVisible(h) && ClassOf(h) == cls) list.Add(h); return true; }, IntPtr.Zero);
@@ -276,6 +303,55 @@ $script:SYNC_KEYBINDS = [ordered]@{
 }
 $script:SYNC_KEYBIND_NAMES = @{ 0x7C = 'f13'; 0x7D = 'f14'; 0x7E = 'f15'; 0x7F = 'f16'; 0x80 = 'f17' }
 
+# What a run that did not finish looked like from outside: the inner process
+# and its descendants with their thread wait reasons, and the hidden desktop's
+# windows with a hung flag. Bounded metadata only: no command lines, window
+# titles or environment values. It must never hang or throw itself.
+function Write-ConptySyncTimeoutDiagnostics([IntPtr] $Desktop, [int] $RootPid) {
+    Write-Host "--- timeout diagnostics (inner pid $RootPid) ---"
+    try {
+        # The same walk as Get-SyncDescendants: a child older than its parent is
+        # a stale ParentProcessId (a recycled number), not a child.
+        $started = @{}
+        $byParent = @{}
+        foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate -OperationTimeoutSec 15)) {
+            $started[[int]$p.ProcessId] = $p.CreationDate
+            $parent = [int]$p.ParentProcessId
+            if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = New-Object System.Collections.Generic.List[object] }
+            $byParent[$parent].Add($p)
+        }
+        $queue = New-Object System.Collections.Generic.Queue[int]
+        $queue.Enqueue($RootPid)
+        $seen = @{}
+        while ($queue.Count -gt 0) {
+            $id = $queue.Dequeue()
+            if ($seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            try {
+                $proc = Get-Process -Id $id -ErrorAction Stop
+                $states = @($proc.Threads | Group-Object { '{0}/{1}' -f $_.ThreadState, $(if ($_.ThreadState -eq 'Wait') { $_.WaitReason } else { '-' }) } |
+                    ForEach-Object { '{0}x{1}' -f $_.Count, $_.Name }) -join ' '
+                Write-Host ('process {0} pid={1} cpu={2:N1}s ws={3:N0}MB threads={4} [{5}]' -f $proc.ProcessName, $id, $proc.TotalProcessorTime.TotalSeconds, ($proc.WorkingSet64 / 1MB), $proc.Threads.Count, $states)
+            }
+            catch { Write-Host "process pid=$id not readable: $($_.Exception.Message)" }
+            if ($byParent.ContainsKey($id)) {
+                foreach ($child in $byParent[$id]) {
+                    $childStart = $child.CreationDate
+                    $parentStart = $started[$id]
+                    if ($null -ne $childStart -and $null -ne $parentStart -and $childStart.ToUniversalTime() -lt $parentStart.ToUniversalTime()) { continue }
+                    $queue.Enqueue([int]$child.ProcessId)
+                }
+            }
+        }
+    }
+    catch { Write-Host "process diagnostics failed: $($_.Exception.Message)" }
+    try {
+        foreach ($line in [NocttyConptySyncNative]::DescribeDesktopWindows($Desktop)) { Write-Host "window $line" }
+    }
+    catch { Write-Host "window diagnostics failed: $($_.Exception.Message)" }
+    Write-Host '--- end of timeout diagnostics ---'
+}
+
 function Get-ConptySyncRealStartupAttempts {
     # SHGetKnownFolderPath ignores the sandboxed LOCALAPPDATA variable.
     $real = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -302,9 +378,24 @@ function Get-ConptySyncRealPSReadLineState {
 if ($Inner) {
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     [void][NocttyConptySyncNative]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    # Clink reads its overrides from CLINK_* variables, and several beat
+    # `clink inject -p` or add places to load from: CLINK_PROFILE, CLINK_PATH
+    # (noctty prepends its own folder to it), CLINK_SETTINGS, CLINK_INPUTRC,
+    # CLINK_CUSTOMPROMPT, CLINK_COLORTHEME, CLINK_THEMES_DIR,
+    # CLINK_COMPLETIONS_DIR. Remove every one, so a developer's own Clink
+    # scripts, prompt, settings and history stay out of the Clink scenario.
+    Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'CLINK_*' } |
+        ForEach-Object { Remove-Item -LiteralPath "Env:\$($_.Name)" -ErrorAction Ignore }
+    # Then turn a developer's Clink AutoRun off for every scenario, whatever
+    # they had set: an AutoRun Clink would use its real state folder, which it
+    # finds through SHGetFolderPathW, not LOCALAPPDATA. (The cmd scenarios
+    # also pass /d.) It only stops AutoRun, so the Clink scenario's own
+    # `clink inject` still runs.
+    $env:CLINK_NOAUTORUN = '1'
 
     $script:Exe = Join-Path $RunRoot 'bin\noctty.exe'
     $script:DumpExe = Join-Path $RunRoot 'tools\conpty-sync-dump.exe'
+    $script:ClinkExe = Join-Path $RunRoot 'tools\clink\clink_x64.exe'
     $script:Evidence = Join-Path $RunRoot 'evidence'
     $script:Work = Join-Path $RunRoot 'work'
     $script:LogPath = Join-Path $script:Evidence 'inner.log'
@@ -356,19 +447,44 @@ if ($Inner) {
 
     function Get-SyncSurfaces($Ctx) { @([NocttyConptySyncNative]::VisibleChildren($Ctx.Host, 'noctty.win32')) }
 
+    # ParentProcessId is the number the process was created with, and Windows
+    # reuses numbers (a hosted VM's stay in the hundreds). A process whose parent
+    # exited can therefore point at a newer process that took its number, even
+    # one of its own descendants: the walk found a cycle and spun forever at 100%
+    # CPU with no deadline to stop it (5 of 54 hosted runs of the earlier
+    # harness, each stuck at the shell-pid step of a scenario's start). A real
+    # child cannot be older than its parent, and each process is visited once.
+    # A start time that is missing proves nothing, so that child is kept; times
+    # compare in UTC. The query has its own deadline: Wait-SyncCondition's cannot
+    # interrupt a call that stalls.
     function Get-SyncDescendants([int] $RootPid) {
-        $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CreationDate)
-        $result = @()
-        $queue = New-Object System.Collections.Queue
+        $all = @(Get-CimInstance Win32_Process -OperationTimeoutSec 5 | Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+        $started = @{}
+        $byParent = @{}
+        foreach ($p in $all) {
+            $started[[int]$p.ProcessId] = $p.CreationDate
+            $parent = [int]$p.ParentProcessId
+            if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = New-Object System.Collections.Generic.List[object] }
+            $byParent[$parent].Add($p)
+        }
+        $result = New-Object System.Collections.Generic.List[object]
+        $seen = New-Object System.Collections.Generic.HashSet[int]
+        $queue = New-Object System.Collections.Generic.Queue[int]
+        [void]$seen.Add($RootPid)
         $queue.Enqueue($RootPid)
         while ($queue.Count -gt 0) {
             $parent = $queue.Dequeue()
-            foreach ($child in @($all | Where-Object { $_.ParentProcessId -eq $parent })) {
-                $result += $child
-                $queue.Enqueue($child.ProcessId)
+            if (-not $byParent.ContainsKey($parent)) { continue }
+            foreach ($child in $byParent[$parent]) {
+                $childStart = $child.CreationDate
+                $parentStart = $started[$parent]
+                if ($null -ne $childStart -and $null -ne $parentStart -and $childStart.ToUniversalTime() -lt $parentStart.ToUniversalTime()) { continue }
+                if (-not $seen.Add([int]$child.ProcessId)) { continue }
+                $result.Add($child)
+                $queue.Enqueue([int]$child.ProcessId)
             }
         }
-        return $result
+        return $result.ToArray()
     }
 
     function Get-SyncShellPids($Ctx) {
@@ -390,15 +506,29 @@ if ($Inner) {
     }
 
     function Read-SyncConpty([int] $ShellPid) {
-        $path = Join-Path $script:Work ('dump-{0}.txt' -f [guid]::NewGuid().ToString('N'))
-        $arguments = '{0} "{1}"' -f $ShellPid, $path
-        $proc = [NocttyConptySyncNative]::StartOnDesktop($script:DumpExe, $arguments, $script:Work, $DesktopName)
-        if (-not $proc.WaitForExit(10000)) { $proc.Kill(); throw 'console dump timed out' }
-        $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
-        Remove-Item -LiteralPath $path -Force
-        # A read can fail after the header was written, so the exit code,
-        # not the first line, says whether the rows are real.
-        if ($proc.ExitCode -ne 0) { throw "console dump failed with $($proc.ExitCode): $raw" }
+        # The helper takes one snapshot of the window and then reads its rows
+        # one at a time, so a resize that lands in between fails a row read
+        # (exit 7, ReadConsoleOutputW). That is a failed observation, not a
+        # desync: take it again, and fail only if it keeps failing. Seen on a
+        # hosted runner, 1 run in 9: the dump held the 11 rows of the shrunken
+        # buffer and then failed on a 12th, while shrink-rows-bottom-cmd polled.
+        # Every other exit code means the shell or its console is gone, or a
+        # call that was not seen to race, and fails at once. Each retry is logged
+        # so a regression that makes ConPTY thrash cannot hide in them.
+        for ($attempt = 1; ; $attempt++) {
+            $path = Join-Path $script:Work ('dump-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+            $arguments = '{0} "{1}"' -f $ShellPid, $path
+            $proc = [NocttyConptySyncNative]::StartOnDesktop($script:DumpExe, $arguments, $script:Work, $DesktopName)
+            if (-not $proc.WaitForExit(10000)) { $proc.Kill(); throw 'console dump timed out' }
+            $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            Remove-Item -LiteralPath $path -Force
+            # A read can fail after the header was written, so the exit code,
+            # not the first line, says whether the rows are real.
+            if ($proc.ExitCode -eq 0) { break }
+            if ($proc.ExitCode -ne 7 -or $attempt -ge 4) { throw "console dump failed with $($proc.ExitCode) (attempt $attempt): $raw" }
+            Write-SyncLog ("console dump retried after exit 7 (attempt {0}): {1}" -f $attempt, (($raw -split "`n")[0]))
+            Start-Sleep -Milliseconds 100
+        }
         $lines = @($raw.TrimEnd("`n") -split "`n")
         $header = $lines[0]
         if ($header -notmatch '^BUFFER (\d+)x(\d+) WINDOW (\d+),(\d+) (\d+)x(\d+) CURSOR (-?\d+),(-?\d+)$') { throw "bad dump header: $header" }
@@ -507,18 +637,54 @@ if ($Inner) {
         $historyPath = Join-Path $script:Work "$Name-psreadline-history.txt"
         [IO.File]::WriteAllLines($historyPath, [string[]]@($History), (New-Object System.Text.UTF8Encoding $false))
         $integration = Join-Path $RunRoot 'tools\integration.ps1'
-        return ('{0} -NoLogo -NoProfile -NoExit -Command "Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
+        return ('{0} -NoLogo -NoProfile -NoExit -Command "try {{ Import-Module PSReadLine -ErrorAction Stop; Set-PSReadLineOption -HistorySavePath ''{1}'' -HistorySaveStyle SaveAtExit {2} -ErrorAction Stop; if ((Get-PSReadLineOption).HistorySavePath -cne ''{1}'' -or (Get-PSReadLineOption).HistorySaveStyle -ne ''SaveAtExit'') {{ exit 1 }} }} catch {{ exit 1 }}; & {{ $__ghostty_utf8_console = $false; . ([scriptblock]::Create([IO.File]::ReadAllText(''{3}''))) }}"' -f
             $Exe, $historyPath, $ExtraOptions, $integration)
     }
 
-    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @(), [int] $Cols = 80, [int] $Rows = 22) {
+    # Script folders registered with `clink installscripts` load into every
+    # Clink, and no variable or profile setting turns them off. Read through
+    # the registry API: a property of Get-ItemProperty's null result throws
+    # under Set-StrictMode, and Get-ItemPropertyValue throws for a key that
+    # exists without the value, whatever -ErrorAction says.
+    function Test-SyncClinkInstalledScripts([string] $SubKey = 'Software\Clink', [string] $ValueName = 'InstalledScripts') {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey)
+        if ($null -eq $key) { return $false }
+        try { return -not [string]::IsNullOrWhiteSpace([string]$key.GetValue($ValueName)) }
+        finally { $key.Dispose() }
+    }
+
+    # cmd with Clink injected from the sandbox copy, using a scenario-local
+    # profile (settings, history), as `clink inject` from AutoRun would. The
+    # build's own Lua script reaches Clink through CLINK_PATH as usual.
+    # - Clink loads the first .inputrc it finds, in the profile before
+    #   %USERPROFILE%, %LOCALAPPDATA%, %APPDATA% and %HOME%, so an empty one
+    #   in the profile keeps a developer's own key bindings out.
+    # - `--scripts` names an empty folder: without it Clink takes the script
+    #   folder a Clink started with `--scripts` left in the hidden variable
+    #   `=clink.scripts`, which no CLINK_* scrub reaches, and searches it first.
+    function Get-SyncClinkCommand([string] $Name) {
+        $clinkProfile = Join-Path $script:Work "$Name-clink-profile"
+        $clinkScripts = Join-Path $script:Work "$Name-clink-scripts"
+        New-Item -ItemType Directory -Force -Path $clinkProfile, $clinkScripts | Out-Null
+        # clink.autostart = nul: otherwise Clink runs a clink_start.cmd from
+        # its own folder (copied from -Clink) at the first prompt.
+        [IO.File]::WriteAllLines((Join-Path $clinkProfile 'clink_settings'), [string[]]@('clink.autoupdate = off', 'clink.logo = none', 'clink.autostart = nul'))
+        [IO.File]::WriteAllText((Join-Path $clinkProfile '.inputrc'), '')
+        $launch = Join-Path $script:Work "$Name-clink.cmd"
+        [IO.File]::WriteAllText($launch, "@echo off`r`n`"$script:ClinkExe`" inject -q -p `"$clinkProfile`" --scripts `"$clinkScripts`"`r`n")
+        return "cmd.exe /d /k `"$launch`""
+    }
+
+    function Start-SyncNoctty([string] $Name, [string] $Shell, [string] $PSReadLineOptions = '', [string[]] $History = @()) {
         $shellCommand = switch ($Shell) {
-            'cmd' { 'cmd.exe' }
+            # /d: no AutoRun, so no Clink a developer installed for AutoRun.
+            'cmd' { 'cmd.exe /d' }
+            'clink' { Get-SyncClinkCommand $Name }
             'powershell' { Get-SyncPowerShellCommand 'powershell.exe' $Name $PSReadLineOptions $History }
             'pwsh' { Get-SyncPowerShellCommand 'pwsh.exe' $Name $PSReadLineOptions $History }
             default { throw "unknown shell $Shell" }
         }
-        $shellExe = "$Shell.exe"
+        $shellExe = if ($Shell -eq 'clink') { 'cmd.exe' } else { "$Shell.exe" }
         # A config file rather than flags: the PowerShell command line holds
         # quotes that do not survive another round of argv quoting.
         $config = @(
@@ -527,8 +693,8 @@ if ($Inner) {
             'quit-after-last-window-closed = true'
             'auto-update = off'
             'font-size = 12'
-            "window-width = $Cols"
-            "window-height = $Rows"
+            'window-width = 80'
+            'window-height = 22'
             'working-directory = C:\'
             "command = $shellCommand"
         )
@@ -539,9 +705,11 @@ if ($Inner) {
         [IO.File]::WriteAllLines($configPath, [string[]]$config, (New-Object System.Text.UTF8Encoding $false))
         # The shared composer adds the Job Object containment, a private
         # single-instance class per scenario, and nothing else.
-        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" })) +
+        $arguments = @(Get-InteractiveWin11LaunchArguments -Layout ([ordered]@{ SandboxId = "$DesktopName-$Name" }) -UseConfiguredCommand) +
             @("`"--config-file=$configPath`"")
         $process = [NocttyConptySyncNative]::StartOnDesktop($script:Exe, ($arguments -join ' '), $script:Work, $DesktopName)
+        # One line per step, so a run that stops says which step it stopped in.
+        Write-SyncLog ('{0}: launched noctty pid={1}' -f $Name, $process.Id)
         $ctx = [pscustomobject]@{
             Name = $Name; Shell = $Shell; ShellExe = $shellExe; Process = $process
             Host = [IntPtr]::Zero; Surface = [IntPtr]::Zero; ShellPid = 0
@@ -561,16 +729,19 @@ if ($Inner) {
             $ctx.Surface = $surfaces[0]
             return $true
         }
+        Write-SyncLog ('{0}: host window 0x{1:X}' -f $Name, $ctx.Host.ToInt64())
         Wait-SyncCondition -Description "$shellExe under noctty" -Condition {
             $pids = @(Get-SyncShellPids $ctx)
             if ($pids.Count -eq 0) { return $false }
             $ctx.ShellPid = $pids[0]
             return $true
         }
+        Write-SyncLog ('{0}: {1} pid={2}' -f $Name, $shellExe, $ctx.ShellPid)
         Wait-SyncCondition -Description 'first prompt' -Condition {
             ((Read-SyncNoctty $ctx.Surface) -join "`n").Contains('>')
         }
-        if ($Shell -ne 'cmd') {
+        Write-SyncLog ('{0}: first prompt' -f $Name)
+        if ($Shell -in @('powershell', 'pwsh')) {
             # The scenarios mean nothing without the integration's prompt
             # marks (redraw=0), so prove it loaded.
             Send-SyncText $ctx.Surface ("if ((Get-Command __ghostty_write_osc -ErrorAction Ignore) -and (Get-PSReadLineOption).HistorySavePath.StartsWith('$($script:Work)')) { 'integration=' + 'on' } else { 'integration=' + 'off' }`r")
@@ -636,10 +807,7 @@ if ($Inner) {
     # -- shell setups ---------------------------------------------------------
 
     function Invoke-SyncFill($Ctx, [int] $Count = 40) {
-        $command = switch ($Ctx.Shell) {
-            'cmd' { "for /L %i in (1,1,$Count) do @echo L%i" }
-            default { "1..$Count | % { 'L' + `$_ }" }
-        }
+        $command = if ($Ctx.Shell -in @('cmd', 'clink')) { "for /L %i in (1,1,$Count) do @echo L%i" } else { "1..$Count | % { 'L' + `$_ }" }
         Send-SyncText $Ctx.Surface ($command + "`r")
         Wait-SyncText $Ctx ("L$Count")
     }
@@ -665,6 +833,21 @@ if ($Inner) {
         Start-Sleep -Milliseconds 500
         Send-SyncKey $Ctx.Surface 0x51 ([int][char]'q')
         Wait-SyncCondition -Description 'left the alternate screen' -Condition { -not (((Read-SyncNoctty $Ctx.Surface) -join "`n").Contains('ALT SCREEN')) }
+    }
+
+    # Open a split below the pane, wait for its shell, close it again, and
+    # wait for the grid to give the rows back.
+    function Invoke-SyncSplitAndClose($Ctx) {
+        $before = Read-SyncConpty $Ctx.ShellPid
+        Send-SyncBinding $Ctx 'new_split:down'
+        Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 2 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
+        $other = @(Get-SyncSurfaces $Ctx | Where-Object { $_ -ne $Ctx.Surface })[0]
+        Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $Ctx).Count -eq 2 }
+        Start-Sleep -Milliseconds 500
+        Send-SyncBinding $Ctx 'close_surface' $other
+        Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $Ctx).Count -eq 1 }
+        [void](Wait-SyncGrid $Ctx { param($d) $d.Rows -eq $before.Rows } 'rows back')
     }
 
     function Get-SyncVim {
@@ -765,19 +948,7 @@ if ($Inner) {
             Name = 'split-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
             Description = 'open a split below and close it again'
             Setup = { param($c) Invoke-SyncFill $c }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'maximize-cmd'; Shell = 'cmd'; Expect = 'sync'; Finding = 'F015'
@@ -816,19 +987,7 @@ if ($Inner) {
                 Send-SyncText $c.Surface 'Get-Help about_P'
                 Wait-SyncText $c 'about_Providers'
             }
-            Trigger = {
-                param($c)
-                $before = Read-SyncConpty $c.ShellPid
-                Send-SyncBinding $c 'new_split:down'
-                Wait-SyncCondition -Description 'second pane' -Condition { @(Get-SyncSurfaces $c).Count -eq 2 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -lt $before.Rows } 'split takes rows')
-                $other = @(Get-SyncSurfaces $c | Where-Object { $_ -ne $c.Surface })[0]
-                Wait-SyncCondition -Description 'second shell' -Condition { @(Get-SyncShellPids $c).Count -eq 2 }
-                Start-Sleep -Milliseconds 500
-                Send-SyncBinding $c 'close_surface' $other
-                Wait-SyncCondition -Description 'second pane closed' -Condition { @(Get-SyncSurfaces $c).Count -eq 1 }
-                [void](Wait-SyncGrid $c { param($d) $d.Rows -eq $before.Rows } 'rows back')
-            }
+            Trigger = { param($c) Invoke-SyncSplitAndClose $c }
         }
         [pscustomobject]@{
             Name = 'listview-narrow-pwsh'; Shell = 'pwsh'; Expect = 'sync'; Finding = 'control'
@@ -898,6 +1057,52 @@ if ($Inner) {
                 Set-SyncHostSize $c ($rect.Right - $rect.Left) ($rect.Bottom - $rect.Top)
                 [void](Wait-SyncGrid $c { param($d) $d.Cols -eq $before.Cols } 'wide again')
             }
+        }
+        [pscustomobject]@{
+            Name = 'clink-typed-narrow-widen'; Shell = 'clink'; Expect = 'sync'; Finding = 'CLINK-RESIZE-01'
+            Description = 'Clink at the bottom of a full screen with a typed line that wraps when the window narrows, then widens'
+            # Clink leaves blank prompt rows under its line (its input hint
+            # and comment rows). A reflow that kept them scrolled this screen a
+            # row more than ConPTY's when narrowing, and the redraw Clink makes
+            # after the widen then drew the line twice.
+            Requires = {
+                if (-not (Test-Path -LiteralPath $script:ClinkExe -PathType Leaf)) { 'no portable Clink (pass -Clink)' }
+                elseif (Test-SyncClinkInstalledScripts) { 'Clink script folders are registered with clink installscripts (HKCU\Software\Clink InstalledScripts) and would load into the scenario' }
+            }
+            Setup = {
+                param($c)
+                # `clink inject` is quiet: without Clink in cmd this would
+                # only test plain cmd, which never leaves those rows. Any cmd
+                # under noctty: the interactive one may be a child of the one
+                # noctty started.
+                Wait-SyncCondition -Description 'Clink loaded in cmd' -Condition {
+                    @(Get-SyncShellPids $c | Where-Object {
+                            @((Get-Process -Id $_ -ErrorAction Ignore).Modules | Where-Object { $_.ModuleName -ieq 'clink_dll_x64.dll' }).Count -gt 0
+                        }).Count -gt 0
+                }
+                Invoke-SyncFill $c
+                Send-SyncText $c.Surface 'echo some pending input that is long enough to wrap when narrowed'
+                Wait-SyncText $c 'when narrowed'
+            }
+            Trigger = {
+                param($c)
+                $before = Read-SyncConpty $c.ShellPid
+                $rect = Get-SyncHostRect $c
+                Resize-SyncHost $c 0.6 1.0
+                # Narrow until Clink has drawn the line wrapped. The desync
+                # starts here, so compare here too, not only after the widen.
+                [void](Wait-SyncGrid $c {
+                    param($d)
+                    $d.Cols -lt $before.Cols -and @($d.Lines | Where-Object { $_.Contains('narrowed') }).Count -eq 1 -and
+                        @($d.Lines | Where-Object { $_.Contains('echo some') -and $_.Contains('narrowed') }).Count -eq 0
+                } 'the line wrapped')
+                $narrow = Get-SyncComparison $c 'narrow'
+                if ($narrow.Diff -ne 0) { throw "views differ after the narrow ($($narrow.Diff) rows, $($narrow.File))" }
+                Set-SyncHostSize $c ($rect.Right - $rect.Left) ($rect.Bottom - $rect.Top)
+                [void](Wait-SyncGrid $c { param($d) $d.Cols -eq $before.Cols } 'wide again')
+            }
+            # The marker would join the pending line.
+            NoMarker = $true
         }
         [pscustomobject]@{
             Name = 'altscreen-maximize-powershell'; Shell = 'powershell'; Expect = 'sync'; Finding = 'F015'
@@ -1043,7 +1248,9 @@ $forwardedArgs = @('-TimeoutSeconds', $TimeoutSeconds.ToString())
 if ($Scenario.Count -gt 0) { $forwardedArgs += @('-Scenario', ($Scenario -join ',')) }
 if ($Rebuild) { $forwardedArgs += '-Rebuild' }
 if ($NoBuild) { $forwardedArgs += '-NoBuild' }
+if ($RequireAll) { $forwardedArgs += '-RequireAll' }
 if ($ResetState) { $forwardedArgs += '-ResetState' }
+if ($Clink) { $forwardedArgs += @('-Clink', (Resolve-Path -LiteralPath $Clink -ErrorAction Stop).ProviderPath) }
 Invoke-InteractiveWin11HarnessMain `
     -RepoRoot $repoRoot `
     -LauncherPath $launcherPath `
@@ -1098,6 +1305,18 @@ Set-Content -LiteralPath $altApp -Encoding ASCII -Value @(
 )
 $env:NOCTTY_SYNC_ALTAPP = $altApp
 Add-Type -TypeDefinition $script:ConptySyncDumpSource -OutputAssembly (Join-Path $runRoot 'tools\conpty-sync-dump.exe') -OutputType ConsoleApplication
+if ($Clink) {
+    # The whole extracted folder: clink_x64.exe loads its DLL and scripts from
+    # beside itself. Refuse anything that does not look like that folder, so a
+    # stray path never copies some other tree into the sandbox.
+    $clinkExe = (Resolve-Path -LiteralPath $Clink -ErrorAction Stop).ProviderPath
+    $clinkDir = Split-Path -Parent $clinkExe
+    if (-not (Test-Path -LiteralPath $clinkExe -PathType Leaf) -or (Split-Path -Leaf $clinkExe) -ine 'clink_x64.exe' -or
+        -not (Test-Path -LiteralPath (Join-Path $clinkDir 'clink_dll_x64.dll') -PathType Leaf)) {
+        throw "-Clink must be clink_x64.exe in an extracted portable Clink folder: $clinkExe"
+    }
+    Copy-Item -LiteralPath $clinkDir -Destination (Join-Path $runRoot 'tools\clink') -Recurse
+}
 
 $historyBefore = Get-ConptySyncRealPSReadLineState
 $clipboardBefore = [NocttyConptySyncNative]::GetClipboardSequenceNumber()
@@ -1147,6 +1366,7 @@ try {
             [void][NocttyConptySyncNative]::GetExitCodeProcess($pi.hProcess, [ref]$code)
             $innerExit = [int]$code
         }
+        else { Write-ConptySyncTimeoutDiagnostics $desktop $pi.dwProcessId }
     }
     finally {
         [void][NocttyConptySyncNative]::CloseHandle($pi.hThread)
@@ -1195,6 +1415,10 @@ foreach ($r in $results) {
         Write-Host "       $($r.Detail)"
         $bad += $r.Name
     }
+    elseif ($RequireAll -and $r.Status -eq 'SKIP') {
+        Write-Host "       $($r.Name) was skipped and -RequireAll is set: $($r.Detail)"
+        $bad += $r.Name
+    }
 }
 if ($bad.Count -gt 0) {
     throw "interactive-win11 conpty-sync validation failed: $($bad -join ', ') (evidence: $runRoot\evidence)"
@@ -1203,3 +1427,7 @@ $passCount = @($results | Where-Object Status -eq 'PASS').Count
 $xfailCount = @($results | Where-Object Status -eq 'XFAIL').Count
 $skipCount = @($results | Where-Object Status -eq 'SKIP').Count
 Write-Host ("interactive-win11 conpty-sync validation: PASS (scenarios={0}, in-sync={1}, known-desync={2}, skipped={3}, evidence={4})" -f $results.Count, $passCount, $xfailCount, $skipCount, (Join-Path $runRoot 'evidence'))
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

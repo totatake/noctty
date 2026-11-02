@@ -42,6 +42,7 @@ pub const HMODULE = windows.HMODULE;
 pub const HANDLE_FLAG_INHERIT = windows.HANDLE_FLAG_INHERIT;
 pub const INFINITE = windows.INFINITE;
 pub const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
+pub const MAX_PATH = windows.MAX_PATH;
 pub const OPEN_EXISTING = windows.OPEN_EXISTING;
 pub const PIPE_ACCESS_OUTBOUND = windows.PIPE_ACCESS_OUTBOUND;
 pub const PIPE_TYPE_BYTE = windows.PIPE_TYPE_BYTE;
@@ -59,6 +60,9 @@ pub const FOLDERID_LocalAppData = windows.FOLDERID_LocalAppData;
 
 pub extern "kernel32" fn GetACP() callconv(.winapi) windows.UINT;
 pub extern "kernel32" fn GetOEMCP() callconv(.winapi) windows.UINT;
+/// The one declaration: the text editor opener and the Win32 runtime's
+/// link prompt both use it.
+pub extern "shlwapi" fn AssocQueryStringW(flags: u32, str: u32, assoc: [*:0]const u16, extra: ?[*:0]const u16, out: ?[*]u16, len: *u32) callconv(.winapi) windows.HRESULT;
 /// std's `DeviceIoControl` wrapper drops the byte count, which a reader of
 /// variable-length output (reparse data) needs.
 pub extern "kernel32" fn DeviceIoControl(
@@ -75,6 +79,13 @@ pub extern "kernel32" fn DeviceIoControl(
 pub extern "kernel32" fn GetDriveTypeW(
     lpRootPathName: ?windows.LPCWSTR,
 ) callconv(.winapi) windows.UINT;
+
+pub extern "kernel32" fn GetFinalPathNameByHandleW(
+    hFile: windows.HANDLE,
+    lpszFilePath: [*]u16,
+    cchFilePath: windows.DWORD,
+    dwFlags: windows.DWORD,
+) callconv(.winapi) windows.DWORD;
 
 /// `GetDriveTypeW` return values, as documented at
 /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdrivetypew
@@ -127,6 +138,61 @@ pub fn directVolumePath(path: *windows.PathSpace) bool {
     }
     return directVolumePathWithMapping(path, directVolumeDeviceName);
 }
+
+pub const DeleteOpenedFileError = error{ AccessDenied, Unexpected };
+
+/// Delete the file `handle` is open on, whatever its path names now: the
+/// delete goes through a second handle to the same file (`ReOpenFile`), so
+/// no path is resolved again. `handle` must share delete access, as every
+/// `std.fs` open does. Flags as std's `DeleteFile`: POSIX semantics, and the
+/// legacy class where a file system refuses the Ex one (FAT).
+pub fn deleteOpenedFile(handle: windows.HANDLE) DeleteOpenedFileError!void {
+    const delete_handle = exp.kernel32.ReOpenFile(
+        handle,
+        windows.DELETE,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        0,
+    );
+    if (delete_handle == windows.INVALID_HANDLE_VALUE) return switch (windows.GetLastError()) {
+        .ACCESS_DENIED, .SHARING_VIOLATION => error.AccessDenied,
+        else => |err| windows.unexpectedError(err),
+    };
+    defer windows.CloseHandle(delete_handle);
+
+    var io: windows.IO_STATUS_BLOCK = undefined;
+    var info_ex: windows.FILE_DISPOSITION_INFORMATION_EX = .{
+        .Flags = FILE_DISPOSITION_DELETE |
+            FILE_DISPOSITION_POSIX_SEMANTICS |
+            FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+    };
+    var rc = windows.ntdll.NtSetInformationFile(
+        delete_handle,
+        &io,
+        &info_ex,
+        @sizeOf(windows.FILE_DISPOSITION_INFORMATION_EX),
+        .FileDispositionInformationEx,
+    );
+    if (rc == .INVALID_PARAMETER) {
+        var info: windows.FILE_DISPOSITION_INFORMATION = .{ .DeleteFile = windows.TRUE };
+        rc = windows.ntdll.NtSetInformationFile(
+            delete_handle,
+            &io,
+            &info,
+            @sizeOf(windows.FILE_DISPOSITION_INFORMATION),
+            .FileDispositionInformation,
+        );
+    }
+    return switch (rc) {
+        .SUCCESS => {},
+        .ACCESS_DENIED, .CANNOT_DELETE, .MEDIA_WRITE_PROTECTED => error.AccessDenied,
+        else => windows.unexpectedStatus(rc),
+    };
+}
+
+// FILE_DISPOSITION_INFORMATION_EX flags (ntifs.h); std keeps its copies private.
+const FILE_DISPOSITION_DELETE: windows.ULONG = 0x00000001;
+const FILE_DISPOSITION_POSIX_SEMANTICS: windows.ULONG = 0x00000002;
+const FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE: windows.ULONG = 0x00000010;
 
 /// Inject at the OS boundary so tests enter through the real production callers.
 /// The override and its dispatch are absent from non-test builds. Thread-local
@@ -715,6 +781,19 @@ pub const exp = struct {
             lpBuffer: ?windows.LPWSTR,
             nSize: *windows.DWORD,
         ) callconv(.winapi) windows.BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw
+        pub extern "kernel32" fn GetTempPathW(
+            nBufferLength: windows.DWORD,
+            lpBuffer: windows.LPWSTR,
+        ) callconv(.winapi) windows.DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile
+        /// Fails with INVALID_HANDLE_VALUE, not NULL.
+        pub extern "kernel32" fn ReOpenFile(
+            hOriginalFile: windows.HANDLE,
+            dwDesiredAccess: windows.DWORD,
+            dwShareMode: windows.DWORD,
+            dwFlagsAndAttributes: windows.DWORD,
+        ) callconv(.winapi) windows.HANDLE;
     };
 
     /// The `NameType` values of `GetComputerNameExW` that name this machine.

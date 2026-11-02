@@ -31,15 +31,34 @@ $localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $u
 $tempDir = if ($env:TEMP) { $env:TEMP } else { Join-Path $localAppData "Temp" }
 $tmpDir = if ($env:TMP) { $env:TMP } else { $tempDir }
 
-foreach ($candidateRoot in @($programFilesX86, $programFiles)) {
+# vswhere ships with the Visual Studio Installer at this fixed path and knows every instance (2026 is
+# version 18, 2022 is 17), any edition and install directory. It is asked for one with the C++
+# tools for this architecture, a release first and then a preview. If it is missing or finds none,
+# the default install paths are probed, newest first, and a VsDevCmd.bat counts only beside an MSVC
+# toolset with libraries for this architecture (VC\Tools\MSVC\<version>\lib\x64 or lib\arm64): an
+# instance left behind by an uninstall can keep its VsDevCmd.bat without the C++ tools, and one can
+# have another architecture's.
+$vcTools = if ($Architecture -eq "arm64") { "Microsoft.VisualStudio.Component.VC.Tools.ARM64" } else { "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
+$vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path -LiteralPath $vswhere) {
+    foreach ($prerelease in @($false, $true)) {
+        $query = @("-latest", "-products", "*") + @(if ($prerelease) { "-prerelease" }) + @("-requires", $vcTools, "-find", "Common7\Tools\VsDevCmd.bat")
+        # Windows PowerShell turns native stderr into errors that "Stop" makes terminating.
+        $found = & { $ErrorActionPreference = "Continue"; & $vswhere @query 2>$null }
+        $vsDevCmd = @($found | Where-Object { $_ }) | Select-Object -First 1
+        if ($vsDevCmd) { break }
+    }
+}
+foreach ($version in @("18", "2022")) {
     foreach ($edition in @("BuildTools", "Community", "Professional", "Enterprise")) {
-        $candidate = Join-Path $candidateRoot "Microsoft Visual Studio\2022\$edition\Common7\Tools\VsDevCmd.bat"
-        if (Test-Path -LiteralPath $candidate) {
-            $vsDevCmd = $candidate
-            break
+        foreach ($candidateRoot in @($programFiles, $programFilesX86)) {
+            $install = Join-Path $candidateRoot "Microsoft Visual Studio\$version\$edition"
+            $candidate = Join-Path $install "Common7\Tools\VsDevCmd.bat"
+            if ($vsDevCmd -or -not (Test-Path -LiteralPath $candidate)) { continue }
+            $toolsets = @(Get-ChildItem -LiteralPath (Join-Path $install "VC\Tools\MSVC") -Directory -ErrorAction Ignore)
+            if (@($toolsets | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "lib\$Architecture") }).Count -gt 0) { $vsDevCmd = $candidate }
         }
     }
-    if ($vsDevCmd) { break }
 }
 
 if (-not $env:ZIG_HOME) {
@@ -80,8 +99,9 @@ if (-not $env:ZIG_HOME) {
 }
 
 if (-not $vsDevCmd) {
-    throw "Missing VS Dev shell bootstrap. Install Visual Studio 2022 Build Tools with the C++ workload."
+    throw "Missing VS Dev shell bootstrap. Install Visual Studio 2026 or 2022 Build Tools with the C++ workload for $Architecture."
 }
+Write-Host "VS Dev shell: `"$vsDevCmd`""
 if (-not (Test-Path (Join-Path $gitCmd "git.exe"))) {
     throw "Missing Git executable under $gitCmd"
 }
@@ -112,15 +132,14 @@ if ([string]::IsNullOrWhiteSpace($env:ZIG_LOCAL_CACHE_DIR)) {
     $env:ZIG_LOCAL_CACHE_DIR = Join-Path (Get-Location) ".zig-cache"
 }
 
-$bootstrap = @"
-call "$vsDevCmd" -arch=$Architecture || exit /b 1
-set "PATH=$gitCmd;$gitUsrBin;$env:ZIG_HOME;%PATH%"
-set "APPDATA=$env:APPDATA"
-set "LOCALAPPDATA=$env:LOCALAPPDATA"
-set "TEMP=$env:TEMP"
-set "TMP=$env:TMP"
-set "ZIG_GLOBAL_CACHE_DIR=$env:ZIG_GLOBAL_CACHE_DIR"
-set "ZIG_LOCAL_CACHE_DIR=$env:ZIG_LOCAL_CACHE_DIR"
+# A batch file, because `cmd /c` runs only the first line of a multi-line string. It is plain ASCII,
+# whatever the code page: every path reaches it through the environment the child inherits (the
+# variables set above, and the three below).
+$bootstrap = @'
+@echo off
+echo Bootstrap: "%~f0"
+call "%NOCTTY_DEV_VSDEVCMD%" -arch=%NOCTTY_DEV_ARCH% || exit /b 1
+set "PATH=%NOCTTY_DEV_PATH%;%PATH%"
 echo == Versions ==
 where git || exit /b 1
 where cl || exit /b 1
@@ -137,6 +156,36 @@ wsl.exe -l -v || exit /b 1
 ) else (
 echo skipped ^(set DEV_WINDOWS_CHECK_WSL=1 to probe WSL^)
 )
-"@
+'@
 
-cmd.exe /d /c $bootstrap
+$bootstrapPath = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-dev-windows-" + [guid]::NewGuid().ToString("N") + ".cmd")
+$env:NOCTTY_DEV_VSDEVCMD = $vsDevCmd
+$env:NOCTTY_DEV_ARCH = $Architecture
+$env:NOCTTY_DEV_PATH = "$gitCmd;$gitUsrBin;$env:ZIG_HOME"
+try {
+    [System.IO.File]::WriteAllText($bootstrapPath, $bootstrap.Replace("`r`n", "`n").Replace("`n", "`r`n"), [System.Text.Encoding]::ASCII)
+    # Passing the path itself let PowerShell decide its quoting, and a path without
+    # spaces goes unquoted, so an `&` in it (a profile named A&B) started a new command,
+    # which could even exit 0. The path goes through a variable instead: cmd expands it
+    # once and never expands the result again, so a %NAME% in the path stays literal,
+    # and with /s cmd removes only the outer pair of quotes and reads the path inside
+    # its own, where &, ^ and spaces are literal. The argument has no spaces, and Legacy
+    # passing (what PowerShell 7 already uses for cmd.exe, and the only kind in 5.1)
+    # hands it over as written. No `call`: it expands % a second time. Still a native
+    # call, so the output stays in PowerShell's streams for a caller that captures it.
+    # Continue, as for vswhere above: under Stop, Windows PowerShell 5.1 turns a stderr
+    # line that a caller's 2>&1 redirects (VsDevCmd.bat writes some) into a terminating
+    # error; the exit code below still decides.
+    $env:NOCTTY_DEV_BOOTSTRAP = $bootstrapPath
+    & {
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandArgumentPassing = "Legacy"
+        & (Join-Path $env:SystemRoot "System32\cmd.exe") /d /s /c '""%NOCTTY_DEV_BOOTSTRAP%""'
+    }
+    $bootstrapExit = $LASTEXITCODE
+} finally {
+    Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Ignore
+    Remove-Item -LiteralPath Env:NOCTTY_DEV_VSDEVCMD, Env:NOCTTY_DEV_ARCH, Env:NOCTTY_DEV_PATH, Env:NOCTTY_DEV_BOOTSTRAP -ErrorAction Ignore
+}
+# A script run with -File exits 0 when it ends normally, whatever its last native command returned.
+if ($bootstrapExit -ne 0) { throw "The Visual Studio developer shell bootstrap failed with exit code $bootstrapExit." }

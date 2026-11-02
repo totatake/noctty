@@ -56,15 +56,6 @@ pub const ThemeColors = struct {
     accent_hover: u32,
     chrome_accent_idle: u32,
     edit_border_unfocused: u32,
-    /// Accent for the tab strip: the active tab's border and underline and
-    /// the accent strip above a separate tab row. Null means `accent`;
-    /// `accent-follow-system` sets it from the Windows accent color. Read it
-    /// through `tabAccent`.
-    tab_accent: ?u32 = null,
-    /// The Windows accent `tab_accent` was derived from, as read. A surface
-    /// over another background (a custom titlebar band) derives its own
-    /// readable accent from this, not from the already adjusted `tab_accent`.
-    system_accent: ?u32 = null,
 
     // Buttons - idle
     button_bg: u32,
@@ -136,8 +127,99 @@ pub const SettingsColors = struct {
     field_border: u32,
     button_bg: u32,
     button_text: u32,
+    /// Text that acts when clicked, on the pane: the Edit, Copy and Open
+    /// actions of an open All settings or Keybindings row. The accent
+    /// itself is for indicators (3:1); in the light theme it is under the
+    /// 4.5:1 text needs on the pane.
+    action_text: u32,
+    /// A toggle switch that is on: the track's fill and its thumb
+    /// (`win32_settings.paintToggle`). The thumb is cut out in the pane's
+    /// colour, which keeps 3:1 against the accent in both app themes.
+    toggle_on_track: u32,
+    toggle_on_thumb: u32,
+    /// A toggle switch that is off: the track's outline and its thumb.
+    toggle_off: u32,
+    /// The opacity trackbar's channel and thumb (`win32_settings`'s
+    /// `sliderCustomDraw`): the channel in the text fields' resting frame
+    /// colour, the thumb in the accent. High Contrast keeps the stock
+    /// trackbar, in system colours.
+    slider_rail: u32,
+    slider_thumb: u32,
     is_dark: bool,
     high_contrast: bool,
+};
+
+/// Every pair of Settings colours that Settings itself draws one on the
+/// other, or hands Windows for a control through `WM_CTLCOLOR*`, with the
+/// contrast it needs (DESIGN.md): 4.5:1 for text, 3:1 for a control's
+/// boundary, a state cue or a focus indicator. Exempt, and so not listed:
+/// disabled text, and the separators (`rail_separator`, `pane_separator`, a
+/// list row's rule), which are decoration and carry no state. Themed controls (`DarkMode_Explorer`, `DarkMode_CFD`) draw in their own
+/// colours, which these do not cover. Read off every `SetTextColor`, fill
+/// and stroke in `win32_settings.zig`; a new one adds its pair here.
+pub const settings_contrast_pairs = [_]struct {
+    foreground: []const u8,
+    background: []const u8,
+    minimum: f64,
+    /// Whether High Contrast draws the pair too.
+    high_contrast: bool = true,
+}{
+    // Text: labels, statics and the rail on the pane and the rail; the
+    // status line; a selected rail button and an open list row's title;
+    // fields and their lists; buttons; the list rows' actions.
+    .{ .foreground = "text", .background = "window_bg", .minimum = 4.5 },
+    .{ .foreground = "text", .background = "rail_bg", .minimum = 4.5 },
+    .{ .foreground = "secondary_text", .background = "window_bg", .minimum = 4.5 },
+    .{ .foreground = "secondary_text", .background = "rail_bg", .minimum = 4.5 },
+    .{ .foreground = "secondary_text", .background = "edit_bg", .minimum = 4.5 },
+    .{ .foreground = "error_text", .background = "window_bg", .minimum = 4.5 },
+    .{ .foreground = "selection_text", .background = "selection_bg", .minimum = 4.5 },
+    .{ .foreground = "edit_text", .background = "edit_bg", .minimum = 4.5 },
+    // High Contrast's rail labels.
+    .{ .foreground = "edit_text", .background = "rail_bg", .minimum = 4.5 },
+    .{ .foreground = "button_text", .background = "button_bg", .minimum = 4.5 },
+    .{ .foreground = "action_text", .background = "window_bg", .minimum = 4.5 },
+    // A rail button under the pointer; High Contrast does not fill it.
+    .{ .foreground = "text", .background = "button_bg", .minimum = 4.5, .high_contrast = false },
+    .{ .foreground = "secondary_text", .background = "button_bg", .minimum = 4.5, .high_contrast = false },
+    // Focus rings.
+    .{ .foreground = "focus_ring", .background = "window_bg", .minimum = 3.0 },
+    .{ .foreground = "focus_ring", .background = "rail_bg", .minimum = 3.0 },
+    .{ .foreground = "focus_ring", .background = "button_bg", .minimum = 3.0 },
+    // On a selected rail button; High Contrast draws it in the selection's
+    // text colour there.
+    .{ .foreground = "focus_ring", .background = "selection_bg", .minimum = 3.0, .high_contrast = false },
+    // The changed-field marker beside a row.
+    .{ .foreground = "accent", .background = "window_bg", .minimum = 3.0 },
+    // The selected rail button's pill; High Contrast frames the button in
+    // its text colour instead.
+    .{ .foreground = "accent", .background = "selection_bg", .minimum = 3.0, .high_contrast = false },
+    // The rail's unsaved dot and invalid disc (its "!" is the button's own
+    // background on the disc) on each background a rail button has; High
+    // Contrast draws them in the text colours.
+    .{ .foreground = "accent", .background = "rail_bg", .minimum = 3.0, .high_contrast = false },
+    .{ .foreground = "accent", .background = "button_bg", .minimum = 3.0, .high_contrast = false },
+    .{ .foreground = "error_text", .background = "rail_bg", .minimum = 3.0, .high_contrast = false },
+    .{ .foreground = "error_text", .background = "selection_bg", .minimum = 3.0, .high_contrast = false },
+    .{ .foreground = "error_text", .background = "button_bg", .minimum = 3.0, .high_contrast = false },
+    // The invalid disc's "!" is text, in the pane's colour on the disc
+    // (`win32_settings.sectionMarkerGlyph`). High Contrast draws it in the
+    // button's own background, whose pair with the disc's text colour is
+    // the text pair above (text on the rail, or the selection's).
+    .{ .foreground = "window_bg", .background = "error_text", .minimum = 4.5, .high_contrast = false },
+    // A text field's frame: at rest, focused and invalid, on both sides.
+    .{ .foreground = "field_border", .background = "window_bg", .minimum = 3.0 },
+    .{ .foreground = "field_border", .background = "edit_bg", .minimum = 3.0 },
+    .{ .foreground = "accent", .background = "edit_bg", .minimum = 3.0 },
+    .{ .foreground = "error_text", .background = "edit_bg", .minimum = 3.0 },
+    // Toggle switches.
+    .{ .foreground = "toggle_on_track", .background = "window_bg", .minimum = 3.0 },
+    .{ .foreground = "toggle_on_thumb", .background = "toggle_on_track", .minimum = 3.0 },
+    .{ .foreground = "toggle_off", .background = "window_bg", .minimum = 3.0 },
+    // The trackbar's channel shows its range and its thumb the value; High
+    // Contrast draws the stock trackbar.
+    .{ .foreground = "slider_rail", .background = "window_bg", .minimum = 3.0, .high_contrast = false },
+    .{ .foreground = "slider_thumb", .background = "window_bg", .minimum = 3.0, .high_contrast = false },
 };
 
 /// Resolve semantic Settings colors. High Contrast deliberately ignores every
@@ -168,6 +250,14 @@ pub fn settingsColors(
             .field_border = system.window_text,
             .button_bg = system.button_face,
             .button_text = system.button_text,
+            .action_text = system.button_text,
+            // High Contrast draws a plain check box, not a switch; these
+            // keep the system pairs all the same.
+            .toggle_on_track = system.highlight,
+            .toggle_on_thumb = system.highlight_text,
+            .toggle_off = system.button_text,
+            .slider_rail = system.button_text,
+            .slider_thumb = system.highlight,
             .is_dark = false,
             .high_contrast = true,
         };
@@ -190,6 +280,12 @@ pub fn settingsColors(
         .field_border = theme.edit_border_unfocused,
         .button_bg = theme.button_bg,
         .button_text = theme.button_fg,
+        .action_text = theme.info_fg,
+        .toggle_on_track = theme.accent,
+        .toggle_on_thumb = theme.overlay_bg,
+        .toggle_off = theme.text_secondary,
+        .slider_rail = theme.edit_border_unfocused,
+        .slider_thumb = theme.accent,
         .is_dark = theme.is_dark,
         .high_contrast = false,
     };
@@ -648,12 +744,6 @@ pub fn adjustColor(base: u32, dr: i16, dg: i16, db: i16) u32 {
     return rgb(r, g, b);
 }
 
-/// The tab strip's accent: the followed Windows accent when one was
-/// resolved, otherwise the theme's own.
-pub fn tabAccent(theme: *const ThemeColors) u32 {
-    return theme.tab_accent orelse theme.accent;
-}
-
 // ── Button color derivation ─────────────────────────────────────────────
 
 /// Dim inactive top chrome while preserving the system palette in high contrast.
@@ -700,23 +790,24 @@ pub fn buttonColorsFromTheme(
         };
     }
     if (hovered and !pressed and !disabled) {
-        // High Contrast palettes can have a dark background with is_dark=false.
-        // Choose hover direction from the actual button background.
-        const hover_lightens = ((colors.bg & 0xff) * 299 + ((colors.bg >> 8) & 0xff) * 587 + ((colors.bg >> 16) & 0xff) * 114) < 128000;
-        colors.bg = if (accept)
-            adjustColor(theme.button_accept_bg, 14, 16, 22)
-        else if (active)
-            adjustColor(theme.button_active_bg, 16, 18, 22)
-        else if (overlay)
-            if (hover_lightens) adjustColor(theme.button_overlay_bg, 14, 14, 16) else adjustColor(theme.button_overlay_bg, -8, -8, -8)
-        else if (hover_lightens) adjustColor(theme.button_bg, 16, 16, 18) else adjustColor(theme.button_bg, -8, -8, -8);
-        colors.border = if (accept)
-            adjustColor(theme.button_accept_border, 24, 20, 10)
-        else if (active)
-            theme.accent_hover
-        else if (overlay)
-            if (hover_lightens) adjustColor(theme.button_overlay_border, 20, 20, 24) else adjustColor(theme.button_overlay_border, -20, -20, -24)
-        else if (hover_lightens) adjustColor(theme.button_border, 28, 28, 30) else adjustColor(theme.button_border, -28, -28, -30);
+        if (accept) {
+            colors.bg = adjustColor(theme.button_accept_bg, 14, 16, 22);
+            colors.border = adjustColor(theme.button_accept_border, 24, 20, 10);
+        } else if (active) {
+            colors.bg = adjustColor(theme.button_active_bg, 16, 18, 22);
+            colors.border = theme.accent_hover;
+        } else {
+            // High Contrast palettes can have a dark background with is_dark=false.
+            // Choose hover direction from the actual button background.
+            const hover_lightens = ((colors.bg & 0xff) * 299 + ((colors.bg >> 8) & 0xff) * 587 + ((colors.bg >> 16) & 0xff) * 114) < 128000;
+            if (overlay) {
+                colors.bg = if (hover_lightens) adjustColor(theme.button_overlay_bg, 14, 14, 16) else adjustColor(theme.button_overlay_bg, -8, -8, -8);
+                colors.border = if (hover_lightens) adjustColor(theme.button_overlay_border, 20, 20, 24) else adjustColor(theme.button_overlay_border, -20, -20, -24);
+            } else {
+                colors.bg = if (hover_lightens) adjustColor(theme.button_bg, 16, 16, 18) else adjustColor(theme.button_bg, -8, -8, -8);
+                colors.border = if (hover_lightens) adjustColor(theme.button_border, 28, 28, 30) else adjustColor(theme.button_border, -28, -28, -30);
+            }
+        }
     }
     if (pressed) {
         colors.bg = if (overlay) adjustColor(theme.overlay_bg, -4, -4, -4) else adjustColor(theme.chrome_bg, -8, -8, -8);
@@ -772,7 +863,7 @@ test "CHROME57 High Contrast hover uses readable system highlight colours" {
 }
 
 // Legacy buttonColors() and buttonFocusRingColor() removed.
-// Use buttonColorsFromTheme(, false) and ThemeColors focus ring fields instead.
+// Use buttonColorsFromTheme() and ThemeColors focus ring fields instead.
 
 // ── Overlay accent ──────────────────────────────────────────────────────
 
@@ -840,7 +931,7 @@ pub fn profileChromeAccent(kind: ProfileKind, is_dark: bool) ProfileChromeAccent
                 .active_border = rgb(12, 96, 126),
                 .focus = rgb(8, 80, 108),
             },
-            .powershell => .{
+            .powershell, .vs_dev_shell => .{
                 .idle_bg = rgb(228, 232, 248),
                 .idle_border = rgb(48, 68, 156),
                 .hover_bg = rgb(218, 222, 242),
@@ -860,7 +951,9 @@ pub fn profileChromeAccent(kind: ProfileKind, is_dark: bool) ProfileChromeAccent
                 .active_border = rgb(140, 96, 8),
                 .focus = rgb(120, 80, 4),
             },
-            .cmd => .{
+            // A user profile can run anything; it takes the neutral Command
+            // Prompt palette, as the Developer Command Prompt does.
+            .cmd, .user, .vs_dev_cmd => .{
                 .idle_bg = rgb(240, 240, 240),
                 .idle_border = rgb(128, 128, 128),
                 .hover_bg = rgb(232, 232, 232),
@@ -894,7 +987,7 @@ pub fn profileChromeAccent(kind: ProfileKind, is_dark: bool) ProfileChromeAccent
             .active_border = rgb(136, 216, 242),
             .focus = rgb(186, 232, 248),
         },
-        .powershell => .{
+        .powershell, .vs_dev_shell => .{
             .idle_bg = rgb(34, 42, 58),
             .idle_border = rgb(98, 144, 220),
             .hover_bg = rgb(40, 50, 72),
@@ -914,7 +1007,7 @@ pub fn profileChromeAccent(kind: ProfileKind, is_dark: bool) ProfileChromeAccent
             .active_border = rgb(248, 202, 134),
             .focus = rgb(255, 224, 178),
         },
-        .cmd => .{
+        .cmd, .user, .vs_dev_cmd => .{
             .idle_bg = rgb(31, 41, 35),
             .idle_border = rgb(104, 186, 126),
             .hover_bg = rgb(38, 50, 42),
@@ -984,142 +1077,6 @@ pub fn profileKindHintColor(kind: ProfileKind, is_dark: bool) u32 {
     return profileChromeAccent(kind, is_dark).active_border;
 }
 
-// ── Accent-follow helpers ───────────────────────────────────────────────
-// Registry read: win32.zig:resolveSystemAccentColor.
-// Blend: 60% system / 40% semantic, S clamped [0.45, 0.75], V clamped
-// [0.40, 0.90] — keeps the overlay readable against any system accent
-// while preserving the semantic cue.
-
-pub fn semanticOverlayHue(mode: HostOverlayMode) f32 {
-    return switch (mode) {
-        .command_palette => 215.0, // cool blue
-        .profile => 285.0, // violet
-        .search => 150.0, // teal / emerald
-        .surface_title, .tab_title => 40.0, // warm amber
-        .tab_overview => 258.0, // periwinkle
-        .confirm => 0.0, // warning red (destructive)
-        .none => 0.0,
-    };
-}
-
-pub fn blendSemanticAccent(system_rgb: u32, semantic_h_deg: f32) u32 {
-    // Neutral-black accent (e.g. registry empty, or user disabled
-    // accent colour) has no hue to blend — keep the pure semantic hue
-    // at mid saturation / value instead of washing to grey.
-    if (system_rgb == 0) {
-        return hsvToRgb(.{ .h = semantic_h_deg, .s = 0.60, .v = 0.70 });
-    }
-    const sys = rgbToHsv(system_rgb);
-    const blended_h = lerpHue(semantic_h_deg, sys.h, 0.60);
-    const blended_s = std.math.clamp((sys.s * 0.60) + (0.50 * 0.40), 0.45, 0.75);
-    const blended_v = std.math.clamp((sys.v * 0.60) + (0.70 * 0.40), 0.40, 0.90);
-    return hsvToRgb(.{ .h = blended_h, .s = blended_s, .v = blended_v });
-}
-
-const Hsv = struct { h: f32, s: f32, v: f32 };
-
-fn rgbToHsv(colorref: u32) Hsv {
-    const r: f32 = @as(f32, @floatFromInt(colorref & 0xFF)) / 255.0;
-    const g: f32 = @as(f32, @floatFromInt((colorref >> 8) & 0xFF)) / 255.0;
-    const b: f32 = @as(f32, @floatFromInt((colorref >> 16) & 0xFF)) / 255.0;
-    const max = @max(r, @max(g, b));
-    const min = @min(r, @min(g, b));
-    const delta = max - min;
-
-    var h: f32 = 0.0;
-    if (delta > 0.0) {
-        if (max == r) {
-            h = 60.0 * @mod((g - b) / delta, 6.0);
-        } else if (max == g) {
-            h = 60.0 * (((b - r) / delta) + 2.0);
-        } else {
-            h = 60.0 * (((r - g) / delta) + 4.0);
-        }
-        if (h < 0.0) h += 360.0;
-    }
-    const s: f32 = if (max == 0.0) 0.0 else delta / max;
-    return .{ .h = h, .s = s, .v = max };
-}
-
-fn hsvToRgb(hsv: Hsv) u32 {
-    const c = hsv.v * hsv.s;
-    // @mod normalises h = 360 to 0, preventing the hp = 6.0 fall-through
-    // (every `if (hp < N)` branch false → pure black).
-    const hp = @mod(hsv.h, 360.0) / 60.0;
-    const x = c * (1.0 - @abs(@mod(hp, 2.0) - 1.0));
-    var r: f32 = 0;
-    var g: f32 = 0;
-    var b: f32 = 0;
-    if (hp < 1.0) {
-        r = c;
-        g = x;
-    } else if (hp < 2.0) {
-        r = x;
-        g = c;
-    } else if (hp < 3.0) {
-        g = c;
-        b = x;
-    } else if (hp < 4.0) {
-        g = x;
-        b = c;
-    } else if (hp < 5.0) {
-        r = x;
-        b = c;
-    } else {
-        r = c;
-        b = x;
-    }
-    const m = hsv.v - c;
-    const ri: u8 = @intFromFloat(std.math.clamp((r + m) * 255.0, 0.0, 255.0));
-    const gi: u8 = @intFromFloat(std.math.clamp((g + m) * 255.0, 0.0, 255.0));
-    const bi: u8 = @intFromFloat(std.math.clamp((b + m) * 255.0, 0.0, 255.0));
-    return rgb(ri, gi, bi);
-}
-
-fn lerpHue(a: f32, b: f32, t: f32) f32 {
-    var diff = b - a;
-    if (diff > 180.0) diff -= 360.0;
-    if (diff < -180.0) diff += 360.0;
-    const out = a + diff * t;
-    return @mod(out + 360.0, 360.0);
-}
-
-test "rgbToHsv recovers grayscale" {
-    const hsv = rgbToHsv(rgb(128, 128, 128));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), hsv.s, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), hsv.v, 0.01);
-}
-
-test "rgbToHsv primary blue" {
-    const hsv = rgbToHsv(rgb(0, 120, 215)); // Windows default accent-ish
-    try std.testing.expect(hsv.h > 200.0 and hsv.h < 220.0);
-    try std.testing.expect(hsv.s > 0.9);
-}
-
-test "hsvToRgb round-trips primary red" {
-    const c = hsvToRgb(.{ .h = 0.0, .s = 1.0, .v = 1.0 });
-    try std.testing.expectEqual(@as(u32, rgb(255, 0, 0)), c);
-}
-
-test "lerpHue takes shortest arc" {
-    // 350 -> 10 should cross through 0, not go the long way through 180.
-    const mid = lerpHue(350.0, 10.0, 0.5);
-    // Expect midpoint to be near 0 / 360, not ~180.
-    try std.testing.expect(mid < 20.0 or mid > 340.0);
-}
-
-test "blendSemanticAccent stays in sane ranges" {
-    const system = rgb(0, 120, 215); // Windows default-ish
-    for ([_]HostOverlayMode{
-        .command_palette, .profile, .search, .surface_title, .tab_overview,
-    }) |mode| {
-        const blended = blendSemanticAccent(system, semanticOverlayHue(mode));
-        const hsv = rgbToHsv(blended);
-        try std.testing.expect(hsv.s >= 0.45 - 0.01 and hsv.s <= 0.75 + 0.01);
-        try std.testing.expect(hsv.v >= 0.40 - 0.01 and hsv.v <= 0.90 + 0.01);
-    }
-}
-
 test "settings colors follow explicit light and dark app themes" {
     const system = SettingsSystemColors{
         .window = 1,
@@ -1169,6 +1126,40 @@ test "settings field frames keep 3:1 against the pane and the field" {
     }
 }
 
+test "settings colours keep their contrast in light, dark and every shipped High Contrast theme" {
+    const RGB = @import("../terminal/color.zig").RGB;
+    const of = struct {
+        fn rgbOf(color: u32) RGB {
+            return .{ .r = @truncate(color), .g = @truncate(color >> 8), .b = @truncate(color >> 16) };
+        }
+    }.rgbOf;
+    // The contrast themes Windows 11 ships, as their files set them
+    // (`%WINDIR%\Resources\Ease of Access Themes`): hc1 (Dusk), hc2 (Night
+    // sky), hcblack (Aquatic) and hcwhite (Desert).
+    const shipped = [_]SettingsSystemColors{
+        .{ .window = rgb(45, 50, 54), .window_text = rgb(255, 255, 255), .button_face = rgb(45, 50, 54), .button_text = rgb(182, 246, 240), .gray_text = rgb(166, 166, 166), .highlight = rgb(161, 191, 222), .highlight_text = rgb(33, 45, 59) },
+        .{ .window = rgb(0, 0, 0), .window_text = rgb(255, 255, 255), .button_face = rgb(0, 0, 0), .button_text = rgb(255, 238, 50), .gray_text = rgb(166, 166, 166), .highlight = rgb(214, 180, 253), .highlight_text = rgb(43, 43, 43) },
+        .{ .window = rgb(32, 32, 32), .window_text = rgb(255, 255, 255), .button_face = rgb(32, 32, 32), .button_text = rgb(255, 255, 255), .gray_text = rgb(166, 166, 166), .highlight = rgb(142, 227, 240), .highlight_text = rgb(38, 59, 80) },
+        .{ .window = rgb(255, 250, 239), .window_text = rgb(61, 61, 61), .button_face = rgb(255, 250, 239), .button_text = rgb(32, 32, 32), .gray_text = rgb(103, 103, 103), .highlight = rgb(144, 57, 9), .highlight_text = rgb(255, 245, 227) },
+    };
+    var palettes: [2 + shipped.len]SettingsColors = undefined;
+    palettes[0] = settingsColors(lightTheme(), std.mem.zeroes(SettingsSystemColors), false);
+    palettes[1] = settingsColors(darkTheme(), std.mem.zeroes(SettingsSystemColors), false);
+    for (shipped, 2..) |system, index| palettes[index] = settingsColors(lightTheme(), system, true);
+    var failed = false;
+    for (palettes, 0..) |colors, index| inline for (settings_contrast_pairs) |pair| {
+        const ratio = of(@field(colors, pair.foreground)).contrast(of(@field(colors, pair.background)));
+        if (ratio < pair.minimum and (pair.high_contrast or !colors.high_contrast)) {
+            std.debug.print("palette {d}: {s} on {s} is {d:.2}:1, under {d:.1}:1\n", .{ index, pair.foreground, pair.background, ratio, pair.minimum });
+            failed = true;
+        }
+    };
+    try std.testing.expect(!failed);
+    // The toggle's state is not its colour alone: the thumb moves too.
+    // Still, on and off differ by more than the fill.
+    for (palettes[0..2]) |colors| try std.testing.expect(colors.toggle_on_track != colors.toggle_off);
+}
+
 test "settings high contrast uses only exact system color roles" {
     const system = SettingsSystemColors{
         .window = 11,
@@ -1196,6 +1187,10 @@ test "settings high contrast uses only exact system color roles" {
     try std.testing.expectEqual(system.window, colors.edit_bg);
     try std.testing.expectEqual(system.window_text, colors.edit_text);
     try std.testing.expectEqual(system.window_text, colors.field_border);
+    try std.testing.expectEqual(system.highlight, colors.toggle_on_track);
+    try std.testing.expectEqual(system.highlight_text, colors.toggle_on_thumb);
+    try std.testing.expectEqual(system.button_text, colors.toggle_off);
+    try std.testing.expectEqual(system.button_text, colors.action_text);
     try std.testing.expectEqual(@as(u32, 0), settingsDwmDarkModeValue(colors));
     try std.testing.expectEqual(
         @as(u32, 1),

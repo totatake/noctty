@@ -89,10 +89,15 @@ const AllocWindows = struct {
 /// for alignment.
 const grapheme_chunk_len = 4;
 const grapheme_chunk = grapheme_chunk_len * @sizeOf(u21);
+pub const grapheme_max_len = 64;
 const GraphemeAlloc = BitmapAllocator(grapheme_chunk);
 const grapheme_count_default = GraphemeAlloc.bitmap_bit_size;
 pub const grapheme_bytes_default = grapheme_count_default * grapheme_chunk;
-const GraphemeMap = AutoOffsetHashMap(Offset(Cell), Offset(u21).Slice);
+const GraphemeMap = AutoOffsetHashMap(
+    Offset(Cell),
+    Offset(u21).Slice,
+    hash_map.default_max_load_percentage,
+);
 
 /// The allocator used for shared utf8-encoded strings within a page.
 /// Note the chunk size below is the minimum size of a single allocation
@@ -145,6 +150,15 @@ pub const Page = struct {
             @alignOf(Cell),
             StyleSet.base_align.toByteUnits(),
         ) == 0);
+
+        // The PageList memory pool requires that initBuf overwrites at
+        // least the first pointer-size bytes of the backing buffer:
+        // std.heap.MemoryPool stores its free list node there when a
+        // page buffer is returned to it, and pool reuse skips zeroing
+        // in release builds. This holds because the rows array is at
+        // offset 0 (see layout), a page always has at least one row,
+        // and initBuf fully rewrites every row.
+        assert(@sizeOf(Row) >= @sizeOf(usize));
     }
 
     /// The backing memory for the page. A page is always made up of a
@@ -238,6 +252,13 @@ pub const Page = struct {
     /// It is up to the caller to not call deinit on these pages.
     pub inline fn initBuf(buf: OffsetBuf, l: Layout) Page {
         const cap = l.capacity;
+
+        // A page must always have at least one row. Aside from being
+        // useless otherwise, the row initialization below must always
+        // overwrite the start of the buffer for pool reuse. See the
+        // comptime assert at the top of Page.
+        assert(cap.rows > 0);
+
         const rows = buf.member(Row, l.rows_start);
         const cells = buf.member(Cell, l.cells_start);
 
@@ -754,11 +775,11 @@ pub const Page = struct {
             }
         }
 
-        // The hyperlink_map capacity in layout() is computed as:
-        //   hyperlink_count * hyperlink_cell_multiplier (rounded to power of 2)
-        // We need enough hyperlink_bytes so that when layout() computes
-        // the map capacity, it can accommodate all hyperlink cells. This
-        // is unit tested.
+        // layout() requests `hyperlink_count * hyperlink_cell_multiplier`
+        // usable map entries. The map layout adds load-factor headroom and
+        // rounds the raw slot count to a power of two. We need enough
+        // hyperlink_bytes for that requested entry count to accommodate all
+        // hyperlink cells. This is unit tested.
         const hyperlink_cap = cap: {
             const hyperlink_count = id_set.count();
             const hyperlink_set_cap = hyperlink.Set.capacityForCount(hyperlink_count);
@@ -1253,14 +1274,8 @@ pub const Page = struct {
         }
 
         if (comptime build_options.kitty_graphics) {
-            if (row.kitty_virtual_placeholder and
-                cells.len == self.size.cols)
-            {
-                for (cells) |c| {
-                    if (c.codepoint() == kitty.graphics.unicode.placeholder) {
-                        break;
-                    }
-                } else row.kitty_virtual_placeholder = false;
+            if (cells.len == self.size.cols) {
+                row.kitty_virtual_placeholder = false;
             }
         }
 
@@ -1473,7 +1488,7 @@ pub const Page = struct {
         const entry = map.getEntry(src_offset).?;
         const value = entry.value_ptr.*;
         map.removeByPtr(entry.key_ptr);
-        map.putAssumeCapacity(dst_offset, value);
+        map.putAssumeCapacityNoClobber(dst_offset, value);
 
         // NOTE: We must not set src/dst.hyperlink here because this
         // function is used in various cases where we swap cell contents
@@ -1490,11 +1505,12 @@ pub const Page = struct {
     /// Returns the hyperlink capacity for the page. This isn't the byte
     /// size but the number of unique cells that can have hyperlink data.
     pub inline fn hyperlinkCapacity(self: *const Page) usize {
-        return self.hyperlink_map.map(self.memory).capacity();
+        return self.hyperlink_map.map(self.memory).maxLoad();
     }
 
     /// Set the graphemes for the given cell. This asserts that the cell
-    /// has no graphemes set, and only contains a single codepoint.
+    /// has no graphemes set, and only contains a single codepoint. Input
+    /// beyond grapheme_max_len is ignored.
     pub inline fn setGraphemes(
         self: *Page,
         row: *Row,
@@ -1508,14 +1524,15 @@ pub const Page = struct {
 
         const cell_offset = getOffset(Cell, self.memory, cell);
         var map = self.grapheme_map.map(self.memory);
+        const stored_cps = cps[0..@min(cps.len, grapheme_max_len)];
 
-        const slice = self.grapheme_alloc.alloc(u21, self.memory, cps.len) catch |e| {
+        const slice = self.grapheme_alloc.alloc(u21, self.memory, stored_cps.len) catch |e| {
             comptime assert(@TypeOf(e) == error{OutOfMemory});
             // The grapheme alloc capacity needs to be increased.
             return error.GraphemeAllocOutOfMemory;
         };
         errdefer self.grapheme_alloc.free(self.memory, slice);
-        @memcpy(slice, cps);
+        @memcpy(slice, stored_cps);
 
         map.putNoClobber(cell_offset, .{
             .offset = getOffset(u21, self.memory, @ptrCast(slice.ptr)),
@@ -1533,7 +1550,8 @@ pub const Page = struct {
         return;
     }
 
-    /// Append a codepoint to the given cell as a grapheme.
+    /// Append a codepoint to the given cell as a grapheme. Once the cell has
+    /// grapheme_max_len suffix codepoints, additional codepoints are ignored.
     pub fn appendGrapheme(self: *Page, row: *Row, cell: *Cell, cp: u21) Allocator.Error!void {
         defer self.assertIntegrity();
 
@@ -1566,6 +1584,10 @@ pub const Page = struct {
         assert(row.grapheme);
 
         const slice = map.getPtr(cell_offset).?;
+
+        // Terminal input is untrusted. In addition to bounding memory, this
+        // prevents repeated chunk growth and copying from becoming quadratic.
+        if (slice.len >= grapheme_max_len) return;
 
         // If our slice len doesn't divide evenly by the grapheme chunk
         // length then we can utilize the additional chunk space.
@@ -1621,7 +1643,7 @@ pub const Page = struct {
         const entry = map.getEntry(src_offset).?;
         const value = entry.value_ptr.*;
         map.removeByPtr(entry.key_ptr);
-        map.putAssumeCapacity(dst_offset, value);
+        map.putAssumeCapacityNoClobber(dst_offset, value);
     }
 
     /// Clear the graphemes for a given cell.
@@ -1715,6 +1737,11 @@ pub const Page = struct {
     /// and rows size.
     pub inline fn layout(cap: Capacity) Layout {
         const rows_count: usize = @intCast(cap.rows);
+
+        // The rows array must stay at offset 0: the PageList memory
+        // pool relies on initBuf overwriting the first bytes of a
+        // reused page buffer, which hold the pool's free list node.
+        // See the comptime assert at the top of Page.
         const rows_start = 0;
         const rows_end: usize = rows_start + (rows_count * @sizeOf(Row));
 
@@ -1756,7 +1783,7 @@ pub const Page = struct {
                 u32,
                 hyperlink_count * hyperlink_cell_multiplier,
             ) orelse break :count std.math.maxInt(u32);
-            break :count std.math.ceilPowerOfTwoAssert(u32, mult);
+            break :count mult;
         };
         const hyperlink_map_layout = hyperlink.Map.layout(hyperlink_map_count);
         const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align.toByteUnits());
@@ -1834,7 +1861,9 @@ pub const Capacity = struct {
     /// Number of bytes to allocate for strings.
     string_bytes: size.StringBytesInt = string_bytes_default,
 
+    /// The changes to make in `adjust`. Fields left as null are unchanged.
     pub const Adjustment = struct {
+        /// The new number of columns. The number of rows changes to fit.
         cols: ?size.CellCountInt = null,
     };
 
@@ -1860,11 +1889,40 @@ pub const Capacity = struct {
         return @min(std.math.maxInt(size.CellCountInt), max_cols);
     }
 
-    /// Adjust the capacity parameters while retaining the same total size.
+    /// Returns a copy of this capacity with the requested changes applied,
+    /// without making the page use any more memory.
     ///
-    /// Adjustments always happen by limiting the rows in the page. Everything
-    /// else can grow. If it is impossible to achieve the desired adjustment,
-    /// OutOfMemory is returned.
+    /// Changing the number of columns changes how much memory each row
+    /// needs. To stay within the original memory size, `adjust` changes the
+    /// number of rows to match. Wider pages fit fewer rows and narrower pages
+    /// fit more. All other fields, such as `styles`, are left unchanged.
+    ///
+    /// The result never uses more memory than the original, but it can use
+    /// less. This happens for two reasons:
+    ///
+    ///   - Only whole rows are counted. Leftover memory that is too small
+    ///     for one more row goes unused.
+    ///   - The number of rows is capped at `maxInt(size.CellCountInt)`.
+    ///     Narrowing a very wide page can free enough memory for more rows
+    ///     than a page can hold. The extra memory goes unused.
+    ///
+    /// Returns `error.OutOfMemory` if not even one row of the requested
+    /// width fits. Use `maxCols` to find the widest column count that fits.
+    ///
+    /// Example:
+    ///
+    ///     const cap: Capacity = .{ .cols = 80, .rows = 24 };
+    ///
+    ///     // More columns per row means fewer rows fit.
+    ///     const wide = try cap.adjust(.{ .cols = 160 });
+    ///     assert(wide.cols == 160);
+    ///     assert(wide.rows < 24);
+    ///
+    ///     // Too many columns for even one row is an error.
+    ///     const max = cap.maxCols().?;
+    ///     _ = cap.adjust(.{ .cols = max + 1 }) catch |err| {
+    ///         assert(err == error.OutOfMemory);
+    ///     };
     pub fn adjust(self: Capacity, req: Adjustment) Allocator.Error!Capacity {
         var adjusted = self;
         if (req.cols) |cols| {
@@ -1874,7 +1932,14 @@ pub const Capacity = struct {
             //   - The row metadata itself
             //   - The cells per row (n=cols)
             const bits_per_row: usize = @bitSizeOf(Row) + @bitSizeOf(Cell) * @as(usize, @intCast(cols));
-            const new_rows: usize = @divFloor(available_bits, bits_per_row);
+
+            // A page can't hold more than maxInt(CellCountInt) rows, so cap
+            // the count here. Using fewer rows than would fit is always safe
+            // because it only makes the page smaller.
+            const new_rows: usize = @min(
+                @divFloor(available_bits, bits_per_row),
+                std.math.maxInt(size.CellCountInt),
+            );
 
             // If our rows go to zero then we can't fit any row metadata
             // for the desired number of columns.
@@ -2380,6 +2445,23 @@ test "Capacity maxCols with 1 row exactly" {
     try testing.expectEqual(@as(size.CellCountInt, 1), adjusted.rows);
 }
 
+test "Capacity adjust clamps rows to CellCountInt" {
+    // A max-width page narrowed to one column frees enough memory for far
+    // more rows than a page can hold. The row count must be capped, and
+    // the page must still fit in the original memory size.
+    const cap: Capacity = .{
+        .cols = std.math.maxInt(size.CellCountInt),
+        .rows = 4,
+        .styles = 0,
+        .grapheme_bytes = 0,
+        .hyperlink_bytes = 0,
+        .string_bytes = 0,
+    };
+    const adjusted = try cap.adjust(.{ .cols = 1 });
+    try testing.expectEqual(std.math.maxInt(size.CellCountInt), adjusted.rows);
+    try testing.expect(Page.layout(adjusted).total_size <= Page.layout(cap).total_size);
+}
+
 test "Page init" {
     var page = try Page.init(.{
         .cols = 120,
@@ -2465,6 +2547,49 @@ test "Page appendGrapheme larger than chunk" {
     }
 }
 
+test "Page appendGrapheme caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+
+    for (0..grapheme_max_len + 16) |i| {
+        try page.appendGrapheme(rac.row, rac.cell, @intCast(0x0300 + i));
+    }
+
+    const cps = page.lookupGrapheme(rac.cell).?;
+    try testing.expectEqual(@as(usize, grapheme_max_len), cps.len);
+    for (0..grapheme_max_len) |i| {
+        try testing.expectEqual(@as(u21, @intCast(0x0300 + i)), cps[i]);
+    }
+}
+
+test "Page setGraphemes caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    var input: [grapheme_max_len + 16]u21 = undefined;
+    for (&input, 0..) |*cp, i| cp.* = @intCast(0x0300 + i);
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+    try page.setGraphemes(rac.row, rac.cell, &input);
+
+    try testing.expectEqual(
+        @as(usize, grapheme_max_len),
+        page.lookupGrapheme(rac.cell).?.len,
+    );
+}
+
 test "Page clearGrapheme not all cells" {
     var page = try Page.init(.{
         .cols = 10,
@@ -2487,6 +2612,24 @@ test "Page clearGrapheme not all cells" {
     try testing.expect(rac.row.grapheme);
     try testing.expect(!rac.cell.hasGrapheme());
     try testing.expect(rac2.cell.hasGrapheme());
+}
+
+test "Page clearCells full row clears kitty placeholder flag" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init(kitty.graphics.unicode.placeholder);
+    rac.row.kitty_virtual_placeholder = true;
+
+    page.clearCells(rac.row, 0, page.size.cols);
+    try testing.expect(!rac.row.kitty_virtual_placeholder);
 }
 
 test "Page clone" {
@@ -3947,4 +4090,21 @@ test "Page exactRowCapacity hyperlink map capacity for many cells" {
         const cloned_cell = &cloned.rows.ptr(cloned.memory)[0].cells.ptr(cloned.memory)[x];
         try testing.expect(cloned_cell.hyperlink);
     }
+}
+
+test "Page layout avoids double rounding hyperlink map capacity" {
+    const hyperlink_count = 3;
+    const layout = Page.layout(.{
+        .cols = 1,
+        .rows = 1,
+        .hyperlink_bytes = hyperlink_count * @sizeOf(hyperlink.Set.Item),
+    });
+
+    // Three set entries request 48 usable map entries. Scaling that for the
+    // 80% load factor needs 60 raw slots, which rounds once to 64. Rounding
+    // the request before applying the load factor would allocate 128 slots.
+    try std.testing.expectEqual(
+        @as(u32, 64),
+        layout.hyperlink_map_layout.capacity,
+    );
 }

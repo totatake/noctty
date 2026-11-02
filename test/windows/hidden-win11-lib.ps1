@@ -11,13 +11,16 @@
 #     bundled and in-box ConPTY host placement has been observed there.
 #   * Every noctty is a copy with a `noctty.portable` marker, with LOCALAPPDATA
 #     and APPDATA redirected into the run directory.
-#   * The real startup-attempts.json and the real PSReadLine history file are
-#     checked by size, time and hash before and after, never read.
+#   * The real startup-attempts.json is checked by size, time and hash, and both real
+#     PSReadLine history files by size and time only (scripts/windows-harness-history.ps1),
+#     before and after, never read.
 #   * The clipboard sequence number is logged before and after. Nothing here
 #     can copy (no selection, no copy key, no OSC 52 answer).
 #   * A noctty with the product AppUserModelID would replace the real taskbar
 #     jump list, so the binary must carry the measurement AUMID unless
 #     -AllowProductAumid says the machine is an ephemeral runner.
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
 
 if (-not ('HiddenWin' -as [type])) {
 Add-Type @'
@@ -276,6 +279,9 @@ public static class HiddenWin {
     public sealed class DesktopWindowObservation {
         public int ProcessId, ThreadId;
         public bool CompletedAttempt;
+        // Recorded on the private desktop only: the owned window's class and visibility.
+        public string ClassName;
+        public bool Visible;
     }
     // EnumWindows sees the calling thread's desktop. Call only from the outer Default driver.
     // No window titles or unrelated window metadata are retained.
@@ -320,7 +326,7 @@ public static class HiddenWin {
                 bool complete = EnumDesktopWindows(desktop, (h, p) => {
                     int id; int tid = GetWindowThreadProcessId(h, out id);
                     if (tid == 0) { ownerFailed = true; ownerError = Marshal.GetLastWin32Error(); return false; }
-                    if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid });
+                    if (ids.Contains(id)) rows.Add(new DesktopWindowObservation { ProcessId = id, ThreadId = tid, ClassName = Class(h), Visible = IsWindowVisible(h) });
                     return true;
                 }, IntPtr.Zero);
                 int error = ownerFailed ? ownerError : Marshal.GetLastWin32Error();
@@ -405,7 +411,13 @@ function Assert-HiddenDesktop([IntPtr] $Job, [string] $DesktopName, [string] $Re
     if ($RequiredWindowPid -gt 0 -and ($ids -notcontains $RequiredWindowPid -or @($rows | Where-Object { $_.ProcessId -eq $RequiredWindowPid -and $_.CompletedAttempt -eq $true }).Count -eq 0)) {
         throw 'Window startup required process window is absent; further input is blocked.'
     }
-    if ($NoWindows -and $rows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }
+    # noctty's lifecycle window is top-level so that Restart Manager can ask a process with no other
+    # window to close, and it is never shown. Windows gives the thread that owns a top-level window its
+    # default IME windows (class IME, and MSCTFIME UI under Text Services), also hidden; a message-only
+    # window gets none. -NoWindows tolerates exactly those classes, and only while hidden.
+    $toleratedHidden = @('noctty.win32.lifecycle', 'IME', 'MSCTFIME UI')
+    $unexpectedRows = @($rows | Where-Object { -not ($toleratedHidden -ccontains $_.ClassName -and $_.Visible -eq $false) })
+    if ($NoWindows -and $unexpectedRows.Count) { throw 'Hidden desktop unexpected private job window; further launches are blocked.' }
 }
 
 # The child cannot launch noctty until the Default observer validates this receipt.
@@ -493,14 +505,12 @@ function Test-SameFingerprint($A, $B) {
     return $A.Exists -eq $B.Exists -and $A.Hash -eq $B.Hash -and $A.Modified -eq $B.Modified
 }
 
-# The state a run must not touch on the machine it runs on: the real recovery ledger and the
-# real PowerShell history file (a pwsh in a test pane loads PSReadLine). Metadata and a hash
-# only; their contents are never read into the output.
+# The real recovery ledger a run must not touch: its hash and time, never its contents. The real
+# PowerShell history (a pwsh in a test pane loads PSReadLine) is guarded by size and time only,
+# through Start-/Assert-WindowsHarnessHistoryGuard; it is never hashed.
 function Get-RealStateFingerprints {
-    $history = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
     return @{
         Startup = Get-FileFingerprint (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json')
-        History = Get-FileFingerprint $history
     }
 }
 
@@ -514,18 +524,9 @@ function Assert-MeasureAumid([string] $Exe, [switch] $AllowProductAumid) {
     }
 }
 
-# The measurement AUMID does not isolate Server.register's real COM CLSID. An idle server
-# could receive the user's live console handoff while noctty is their delegated terminal.
-# Read only that one selection and fail closed on an unreadable key; there is no bypass.
-function Assert-EmbeddingDelegationSafe {
-    try { $selection = Get-ItemProperty -LiteralPath 'HKCU:\Console\%%Startup' -ErrorAction Stop }
-    catch [Management.Automation.ItemNotFoundException] { return }
-    $terminal = [guid]::Empty
-    if ([guid]::TryParse([string]$selection.DelegationTerminal, [ref]$terminal) -and
-        $terminal -eq [guid]'33368C6F-D328-410C-B225-26DC9F12C728') {
-        throw 'Embedding launch blocked: noctty is the selected delegated terminal. The measurement AUMID does not isolate the real COM handoff CLSID; use a sandbox with independent console delegation.'
-    }
-}
+# Assert-EmbeddingDelegationSafe, the -Embedding delegation guard, has one copy, shared with
+# hidden-win11-local-lib.ps1.
+. (Join-Path $PSScriptRoot 'hidden-win11-embedding-guard.ps1')
 
 function Copy-PortableBin([string] $Source, [string] $Destination) {
     [void](New-Item -ItemType Directory -Path $Destination)
@@ -549,6 +550,7 @@ function Invoke-HiddenDriver {
     if (Test-Path -LiteralPath $Run) { throw 'Run directory must be new.' }
     if (-not (Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))) { throw 'Bin must contain noctty.exe.' }
     $before = Get-RealStateFingerprints
+    $historyGuard = Start-WindowsHarnessHistoryGuard -Harness (Split-Path -Leaf $Script)
     $clipboardBefore = [HiddenWin]::GetClipboardSequenceNumber()
     [void](New-Item -ItemType Directory -Path $Run)
     Copy-PortableBin $Bin (Join-Path $Run 'source\bin')
@@ -599,11 +601,13 @@ function Invoke-HiddenDriver {
         $after = Get-RealStateFingerprints
         $clipboardAfter = [HiddenWin]::GetClipboardSequenceNumber()
         $startupUnchanged = Test-SameFingerprint $before.Startup $after.Startup
-        $historyUnchanged = Test-SameFingerprint $before.History $after.History
+        $historyFailure = $null
+        try { Assert-WindowsHarnessHistoryGuard -Guard $historyGuard } catch { $historyFailure = $_ }
+        $historyUnchanged = $null -eq $historyFailure
         @{ Before = $before; After = $after; StartupUnchanged = $startupUnchanged; HistoryUnchanged = $historyUnchanged; OwnedJobCleanedUp = ($null -eq $cleanupError); OwnedProcessCount = $ownedProcessCount; ClipboardSequenceBefore = $clipboardBefore; ClipboardSequenceAfter = $clipboardAfter } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Run 'real-state.json')
         if (-not $startupUnchanged) { throw 'Real startup-attempts.json changed; stop launches and report it.' }
-        if (-not $historyUnchanged) { throw 'The real PowerShell history file changed; stop launches and report it.' }
+        if (-not $historyUnchanged) { throw ('The real PowerShell history file changed; stop launches and report it. ' + $historyFailure.Exception.Message) }
         if ($clipboardBefore -ne $clipboardAfter) { throw "Clipboard sequence number changed ($clipboardBefore -> $clipboardAfter); stop launches and report it." }
         if ($cleanupError) { throw $cleanupError }
     }
@@ -666,12 +670,35 @@ function Send-Text([IntPtr] $Hwnd, [string] $Text) {
 
 # Every descendant of `RootPid` with its name and command line. Callers reduce the command line to a
 # redacted shape before anything is written down.
+# ParentProcessId is the number a process was created with, and Windows reuses numbers (on hosted
+# VMs they ranged from 620 to 9144). A process whose parent exited can therefore name a newer process
+# that took its number, even one of its own descendants, and a walk that follows the number alone
+# finds a cycle and never returns (interactive-win11-conpty-sync.ps1's copy hung 5 of 54 hosted
+# runs that way). A real child is not older than its parent, and each process is visited once; a
+# start time CIM could not read proves nothing, so that child is kept. The query has a deadline of
+# its own: the callers' polling deadlines cannot interrupt a call that does not return.
 function Get-Descendants([int] $RootPid) {
-    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine)
-    $found = [Collections.Generic.List[object]]::new(); $queue = [Collections.Generic.Queue[int]]::new(); $queue.Enqueue($RootPid)
+    try {
+        $all = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine, CreationDate -OperationTimeoutSec 15 -ErrorAction Stop)
+    } catch { throw "The process table query failed or took longer than 15 s: $($_.Exception.Message)" }
+    $started = @{}; $byParent = @{}
+    foreach ($process in $all) {
+        $started[[int]$process.ProcessId] = $process.CreationDate
+        $parent = [int]$process.ParentProcessId
+        if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = [Collections.Generic.List[object]]::new() }
+        $byParent[$parent].Add($process)
+    }
+    $found = [Collections.Generic.List[object]]::new(); $seen = [Collections.Generic.HashSet[int]]::new(); $queue = [Collections.Generic.Queue[int]]::new()
+    [void]$seen.Add($RootPid); $queue.Enqueue($RootPid)
     while ($queue.Count) {
         $parent = $queue.Dequeue()
-        foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $parent }) { $found.Add($child); $queue.Enqueue([int]$child.ProcessId) }
+        if (-not $byParent.ContainsKey($parent)) { continue }
+        foreach ($child in $byParent[$parent]) {
+            $childStart = $child.CreationDate; $parentStart = $started[$parent]
+            if ($null -ne $childStart -and $null -ne $parentStart -and $childStart.ToUniversalTime() -lt $parentStart.ToUniversalTime()) { continue }
+            if (-not $seen.Add([int]$child.ProcessId)) { continue }
+            $found.Add($child); $queue.Enqueue([int]$child.ProcessId)
+        }
     }
     return $found.ToArray()
 }

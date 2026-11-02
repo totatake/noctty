@@ -7,6 +7,7 @@ const input = @import("../../input.zig");
 
 const sys = @import("sys.zig");
 const c = @import("consts.zig");
+const docked_search = @import("docked_search.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -192,23 +193,30 @@ pub const TypedChars = struct {
 pub fn takeTypedChars(hwnd: sys.HWND) TypedChars {
     var typed: TypedChars = .{};
     var msg: sys.MSG = undefined;
-    while (sys.PeekMessageW(&msg, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) != 0) {
+    while (takeCharMessage(hwnd, &msg)) {
         switch (msg.message) {
             c.WM_CHAR => if (typed.len < typed.units.len) {
                 typed.units[typed.len] = @truncate(msg.wParam);
                 typed.len += 1;
             },
             c.WM_DEADCHAR => typed.dead = true,
-            c.WM_QUIT => {
-                // A filtered PeekMessage still returns WM_QUIT, and removes
-                // it (measured). Put it back for the pump.
-                sys.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
-                break;
-            },
             else => {},
         }
     }
     return typed;
+}
+
+/// Remove the next `WM_CHAR` .. `WM_DEADCHAR` message queued for `hwnd` into
+/// `msg`; false when there is none, or when a quit ends the drain.
+fn takeCharMessage(hwnd: sys.HWND, msg: *sys.MSG) bool {
+    if (sys.PeekMessageW(msg, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) == 0) return false;
+    if (msg.message == c.WM_QUIT) {
+        // A filtered PeekMessage still returns WM_QUIT, and removes
+        // it (measured). Put it back for the pump.
+        sys.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
+        return false;
+    }
+    return true;
 }
 
 const KeyText = struct {
@@ -335,6 +343,18 @@ pub fn highWord(value: usize) u16 {
     return @truncate((value >> 16) & 0xFFFF);
 }
 
+/// The button an X button message's wParam names. Back and forward are
+/// buttons 8 and 9, as X11 numbers them and upstream's GTK and macOS
+/// runtimes report them; 4 and 5 are the vertical wheel, which a program
+/// reading mouse reports would scroll for.
+pub fn xMouseButton(wParam: usize) ?input.MouseButton {
+    return switch (highWord(wParam)) {
+        c.XBUTTON1 => .eight,
+        c.XBUTTON2 => .nine,
+        else => null,
+    };
+}
+
 fn scanCodeFromLParam(lParam: LPARAM) u32 {
     return @as(u32, highWord(lParamBits(lParam))) & 0xFF;
 }
@@ -441,6 +461,17 @@ fn pinnedKeyboardState() ?*const [256]u8 {
 fn pinnedKey(vk: i32) ?u8 {
     const state = pinnedKeyboardState() orelse return null;
     return state[std.math.cast(u8, vk) orelse return 0];
+}
+
+/// The modifiers held for the key message being handled, as the chrome's
+/// key rules and the docked search take them. A test pins them with
+/// `TestingKeyboard`; AltGr reads as Ctrl plus Alt.
+pub fn chromeKeyMods() docked_search.Mods {
+    return .{
+        .shift = keyPressed(c.VK_SHIFT),
+        .ctrl = keyPressed(c.VK_CONTROL),
+        .alt = keyPressed(c.VK_MENU),
+    };
 }
 
 pub fn keyPressed(vk: i32) bool {
@@ -1303,22 +1334,10 @@ const FAKE_KEYSTROKE: usize = 0x02000000;
 /// exactly that pair.
 fn controlKeyStateFromState(state: *const [256]u8, lParam: LPARAM) u16 {
     var cs: u16 = 0;
-    const pressed = [_]struct { vk: usize, bit: u16 }{
-        .{ .vk = c.VK_LMENU, .bit = ControlKeyState.left_alt },
-        .{ .vk = c.VK_RMENU, .bit = ControlKeyState.right_alt },
-        .{ .vk = c.VK_LCONTROL, .bit = ControlKeyState.left_ctrl },
-        .{ .vk = c.VK_RCONTROL, .bit = ControlKeyState.right_ctrl },
-        .{ .vk = c.VK_SHIFT, .bit = ControlKeyState.shift },
-    };
-    for (pressed) |key| {
+    for (control_keys_pressed) |key| {
         if ((state[key.vk] & 0x80) != 0) cs |= key.bit;
     }
-    const toggled = [_]struct { vk: usize, bit: u16 }{
-        .{ .vk = c.VK_NUMLOCK, .bit = ControlKeyState.numlock_on },
-        .{ .vk = c.VK_SCROLL, .bit = ControlKeyState.scrolllock_on },
-        .{ .vk = c.VK_CAPITAL, .bit = ControlKeyState.capslock_on },
-    };
-    for (toggled) |key| {
+    for (control_keys_toggled) |key| {
         if ((state[key.vk] & 1) != 0) cs |= key.bit;
     }
     if (isExtendedKey(lParam)) cs |= ControlKeyState.enhanced_key;
@@ -1330,14 +1349,32 @@ fn controlKeyStateFromState(state: *const [256]u8, lParam: LPARAM) u16 {
 fn controlKeyState(keyboard_state: ?*const [256]u8, lParam: LPARAM) u16 {
     if (keyboard_state) |state| return controlKeyStateFromState(state, lParam);
     var state: [256]u8 = [_]u8{0} ** 256;
-    for ([_]i32{ c.VK_LMENU, c.VK_RMENU, c.VK_LCONTROL, c.VK_RCONTROL, c.VK_SHIFT }) |vk| {
-        if (keyPressed(vk)) state[@intCast(vk)] = 0x80;
+    for (control_keys_pressed) |key| {
+        if (keyPressed(key.vk)) state[key.vk] = 0x80;
     }
-    for ([_]i32{ c.VK_NUMLOCK, c.VK_SCROLL, c.VK_CAPITAL }) |vk| {
-        if (keyToggled(vk)) state[@intCast(vk)] = 1;
+    for (control_keys_toggled) |key| {
+        if (keyToggled(key.vk)) state[key.vk] = 1;
     }
     return controlKeyStateFromState(&state, lParam);
 }
+
+const ControlKey = struct { vk: u8, bit: u16 };
+
+/// The keys `controlKeyStateFromState` reads as held.
+const control_keys_pressed = [_]ControlKey{
+    .{ .vk = c.VK_LMENU, .bit = ControlKeyState.left_alt },
+    .{ .vk = c.VK_RMENU, .bit = ControlKeyState.right_alt },
+    .{ .vk = c.VK_LCONTROL, .bit = ControlKeyState.left_ctrl },
+    .{ .vk = c.VK_RCONTROL, .bit = ControlKeyState.right_ctrl },
+    .{ .vk = c.VK_SHIFT, .bit = ControlKeyState.shift },
+};
+
+/// The locks `controlKeyStateFromState` reads as toggled on.
+const control_keys_toggled = [_]ControlKey{
+    .{ .vk = c.VK_NUMLOCK, .bit = ControlKeyState.numlock_on },
+    .{ .vk = c.VK_SCROLL, .bit = ControlKeyState.scrolllock_on },
+    .{ .vk = c.VK_CAPITAL, .bit = ControlKeyState.capslock_on },
+};
 
 /// How a key release is translated for its record, following what the
 /// console host's `TranslateMessageEx(TM_POSTCHARBREAKS)` produces: a
@@ -1447,10 +1484,14 @@ fn keyMessage(
             .win32 = if (win32_records and
                 (lParamBits(lParam) & FAKE_KEYSTROKE) == 0 and
                 vk != c.VK_PROCESSKEY)
-                win32KeyRecord(vk, lParam, action, keyboard_state, typed, release: {
-                    if (latched_dead_key) break :release .first_unit;
-                    break :release if (msg == c.WM_SYSKEYUP) .none else .full;
-                })
+                win32KeyRecord(
+                    vk,
+                    lParam,
+                    action,
+                    keyboard_state,
+                    typed,
+                    if (latched_dead_key) .first_unit else if (msg == c.WM_SYSKEYUP) .none else .full,
+                )
             else
                 null,
         },
@@ -1662,6 +1703,91 @@ pub fn commitImeText(target: anytype, utf8: []const u8) CoreSurface.InputEffect 
     };
     if (effect != .closed) target.noteInput(utf8);
     return effect;
+}
+
+/// What a `WM_IME_COMPOSITION` asks for once its result string, if any, is
+/// committed. Its lParam names the parts that changed.
+pub const ImeCompositionAction = enum { none, refresh, cancel };
+
+pub fn imeCompositionAction(parts: u32) ImeCompositionAction {
+    // No parts at all: the composition was cancelled, and Microsoft says the
+    // application should erase what it shows of it.
+    if (parts == 0) return .cancel;
+    // An IME can move the caret, or change the clause attributes, without
+    // changing the string.
+    if ((parts & (c.GCS_COMPSTR | c.GCS_CURSORPOS | c.GCS_COMPATTR)) != 0) return .refresh;
+    return .none;
+}
+
+/// The composition caret as a codepoint index into `units`, from the
+/// `GCS_CURSORPOS` value: a count of UTF-16 units before the caret, or a
+/// negative error (`IMM_ERROR_NODATA`, `IMM_ERROR_GENERAL`) when there is
+/// none. A position inside a surrogate pair counts the pair as after the
+/// caret; one past the end is the end.
+pub fn imeCaretCodepointIndex(units: []const u16, cursor: i32) ?usize {
+    if (cursor < 0) return null;
+    const end = @min(@as(usize, @intCast(cursor)), units.len);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < end) : (count += 1) {
+        const pair = std.unicode.utf16IsHighSurrogate(units[i]) and
+            i + 1 < units.len and std.unicode.utf16IsLowSurrogate(units[i + 1]);
+        const step: usize = if (pair) 2 else 1;
+        if (i + step > end) break;
+        i += step;
+    }
+    return count;
+}
+
+/// The clause the IME is converting, as a codepoint range of `units`, from
+/// the `GCS_COMPATTR` attributes read with them: one byte per UTF-16 unit.
+/// It is the first run of units marked `ATTR_TARGET_CONVERTED` or
+/// `ATTR_TARGET_NOTCONVERTED`; a surrogate pair takes its first unit's
+/// attribute. No attributes, a count that is not one per unit, or no target
+/// unit gives none.
+pub fn imeTargetCodepointRange(units: []const u16, attrs: ?[]const u8) ?CoreSurface.PreeditTarget {
+    const bytes = attrs orelse return null;
+    if (bytes.len != units.len) return null;
+    var start: ?usize = null;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < units.len) : (count += 1) {
+        const pair = std.unicode.utf16IsHighSurrogate(units[i]) and
+            i + 1 < units.len and std.unicode.utf16IsLowSurrogate(units[i + 1]);
+        const targeted = bytes[i] == c.ATTR_TARGET_CONVERTED or
+            bytes[i] == c.ATTR_TARGET_NOTCONVERTED;
+        if (targeted) {
+            if (start == null) start = count;
+        } else if (start) |s| {
+            return .{ .start = s, .end = count };
+        }
+        i += if (pair) 2 else 1;
+    }
+    return .{ .start = start orelse return null, .end = count };
+}
+
+/// Show a composition string with its caret and target clause: `cursor` is
+/// the `GCS_CURSORPOS` value and `attrs` the `GCS_COMPATTR` bytes read with
+/// `units`, or null when there are none. An empty string, or one that is
+/// not valid UTF-16, clears the preedit; a negative `cursor` shows the text
+/// without a caret. `target` supplies
+/// `preeditCaretCallback(?[]const u8, ?usize, ?CoreSurface.PreeditTarget)`.
+pub fn applyImeComposition(
+    target: anytype,
+    alloc: std.mem.Allocator,
+    units: []const u16,
+    cursor: i32,
+    attrs: ?[]const u8,
+    stack: []u8,
+) void {
+    if (units.len == 0) return target.preeditCaretCallback(null, null, null);
+    const text = imeTextUtf8(alloc, units, stack) catch return target.preeditCaretCallback(null, null, null);
+    defer text.deinit(alloc);
+    target.preeditCaretCallback(
+        text.bytes,
+        imeCaretCodepointIndex(units, cursor),
+        imeTargetCodepointRange(units, attrs),
+    );
 }
 
 /// Commit one typed character as a key event with no physical key.
@@ -2527,6 +2653,146 @@ test "win32 IME text of any length converts to UTF-8" {
     );
 }
 
+test "win32 IME composition messages refresh on any part that moves the caret" {
+    const testing = std.testing;
+    // No parts at all: Microsoft documents a cancelled composition.
+    try testing.expectEqual(ImeCompositionAction.cancel, imeCompositionAction(0));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPSTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_CURSORPOS));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPATTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_COMPSTR | c.GCS_CURSORPOS | c.GCS_COMPATTR));
+    // A commit alone is handled before this and leaves the preedit to
+    // WM_IME_ENDCOMPOSITION, as before.
+    try testing.expectEqual(ImeCompositionAction.none, imeCompositionAction(c.GCS_RESULTSTR));
+    try testing.expectEqual(ImeCompositionAction.refresh, imeCompositionAction(c.GCS_RESULTSTR | c.GCS_CURSORPOS));
+}
+
+test "win32 IME caret position counts codepoints, not UTF-16 units" {
+    const testing = std.testing;
+    const ascii = [_]u16{ 'z', 'h', 'o', 'n', 'g' };
+    for (0..ascii.len + 1) |i| {
+        try testing.expectEqual(@as(?usize, i), imeCaretCodepointIndex(&ascii, @intCast(i)));
+    }
+    // Past the end clamps to the end.
+    try testing.expectEqual(@as(?usize, 5), imeCaretCodepointIndex(&ascii, 6));
+    try testing.expectEqual(@as(?usize, 5), imeCaretCodepointIndex(&ascii, std.math.maxInt(i32)));
+    // Negative is IMM_ERROR_NODATA or IMM_ERROR_GENERAL: no caret.
+    try testing.expectEqual(@as(?usize, null), imeCaretCodepointIndex(&ascii, -1));
+    try testing.expectEqual(@as(?usize, null), imeCaretCodepointIndex(&ascii, -2));
+
+    const cjk = [_]u16{ 0x4E2D, 0x56FD };
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&cjk, 1));
+    try testing.expectEqual(@as(?usize, 2), imeCaretCodepointIndex(&cjk, 2));
+
+    // U+1F642 is two units. A position between them clamps down to the
+    // start of the pair.
+    const pair = [_]u16{ 'a', 0xD83D, 0xDE42, 'b' };
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&pair, 1));
+    try testing.expectEqual(@as(?usize, 1), imeCaretCodepointIndex(&pair, 2));
+    try testing.expectEqual(@as(?usize, 2), imeCaretCodepointIndex(&pair, 3));
+    try testing.expectEqual(@as(?usize, 3), imeCaretCodepointIndex(&pair, 4));
+    try testing.expectEqual(@as(?usize, 0), imeCaretCodepointIndex(&.{}, 0));
+}
+
+test "win32 IME composition reaches the surface with its caret" {
+    const testing = std.testing;
+    const Target = struct {
+        calls: usize = 0,
+        text: ?[]const u8 = null,
+        caret: ?usize = null,
+        target: ?CoreSurface.PreeditTarget = null,
+        buf: [64]u8 = undefined,
+
+        fn preeditCaretCallback(self: *@This(), text: ?[]const u8, caret: ?usize, target: ?CoreSurface.PreeditTarget) void {
+            self.calls += 1;
+            self.caret = caret;
+            self.target = target;
+            self.text = if (text) |t| blk: {
+                @memcpy(self.buf[0..t.len], t);
+                break :blk self.buf[0..t.len];
+            } else null;
+        }
+    };
+    var stack: [32]u8 = undefined;
+
+    var target: Target = .{};
+    const zhongguo = [_]u16{ 'z', 'h', 'o', 'n', 'g', 'g', 'u', 'o' };
+    applyImeComposition(&target, testing.allocator, &zhongguo, 5, null, &stack);
+    try testing.expectEqualStrings("zhongguo", target.text.?);
+    try testing.expectEqual(@as(?usize, 5), target.caret);
+
+    // A caret after a surrogate pair is an index into the UTF-8 text's
+    // codepoints.
+    const pair = [_]u16{ 0x4E2D, 0xD83D, 0xDE42, 'x' };
+    applyImeComposition(&target, testing.allocator, &pair, 3, null, &stack);
+    try testing.expectEqualStrings("\u{4E2D}\u{1F642}x", target.text.?);
+    try testing.expectEqual(@as(?usize, 2), target.caret);
+
+    // No caret keeps the text.
+    applyImeComposition(&target, testing.allocator, &zhongguo, -1, null, &stack);
+    try testing.expectEqualStrings("zhongguo", target.text.?);
+    try testing.expectEqual(@as(?usize, null), target.caret);
+
+    // An empty composition clears, and so does one that cannot convert.
+    applyImeComposition(&target, testing.allocator, &.{}, 0, null, &stack);
+    try testing.expectEqual(@as(?[]const u8, null), target.text);
+    applyImeComposition(&target, testing.allocator, &zhongguo, 2, null, &stack);
+    applyImeComposition(&target, testing.allocator, &.{0xD83D}, 1, null, &stack);
+    try testing.expectEqual(@as(?[]const u8, null), target.text);
+    try testing.expectEqual(@as(?usize, null), target.caret);
+    try testing.expectEqual(@as(usize, 6), target.calls);
+
+    // The target clause comes with them, and a clear drops it.
+    const kana = [_]u16{ 0x304B, 0x306A, 0x6F22, 0x5B57, 0x5909, 0x63DB };
+    const attrs = [_]u8{ c.ATTR_INPUT, c.ATTR_INPUT, c.ATTR_TARGET_CONVERTED, c.ATTR_TARGET_CONVERTED, c.ATTR_CONVERTED, c.ATTR_CONVERTED };
+    applyImeComposition(&target, testing.allocator, &kana, 2, &attrs, &stack);
+    try testing.expectEqual(@as(?usize, 2), target.caret);
+    try testing.expectEqual(@as(?CoreSurface.PreeditTarget, .{ .start = 2, .end = 4 }), target.target);
+    applyImeComposition(&target, testing.allocator, &kana, 2, null, &stack);
+    try testing.expectEqual(@as(?CoreSurface.PreeditTarget, null), target.target);
+    applyImeComposition(&target, testing.allocator, &kana, 2, &attrs, &stack);
+    applyImeComposition(&target, testing.allocator, &.{}, 0, &.{}, &stack);
+    try testing.expectEqual(@as(?CoreSurface.PreeditTarget, null), target.target);
+}
+
+test "win32 IME target clause is the first run the IME is converting" {
+    const testing = std.testing;
+    const T = CoreSurface.PreeditTarget;
+    const I = c.ATTR_INPUT;
+    const TC = c.ATTR_TARGET_CONVERTED;
+    const CV = c.ATTR_CONVERTED;
+    const TN = c.ATTR_TARGET_NOTCONVERTED;
+    const units = [_]u16{ 'a', 'b', 'c', 'd', 'e', 'f' };
+
+    // Japanese-shaped clauses: input, the target, converted.
+    try testing.expectEqual(@as(?T, .{ .start = 2, .end = 4 }), imeTargetCodepointRange(&units, &.{ I, I, TC, TC, CV, CV }));
+    // The target moved to the next clause.
+    try testing.expectEqual(@as(?T, .{ .start = 4, .end = 6 }), imeTargetCodepointRange(&units, &.{ I, I, CV, CV, TC, TC }));
+    // A target not yet converted counts too.
+    try testing.expectEqual(@as(?T, .{ .start = 0, .end = 3 }), imeTargetCodepointRange(&units, &.{ TN, TN, TN, I, I, I }));
+    // Two target runs: the first wins.
+    try testing.expectEqual(@as(?T, .{ .start = 1, .end = 2 }), imeTargetCodepointRange(&units, &.{ I, TC, CV, TN, TN, I }));
+    // No target: all input, or the other attributes.
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&units, &.{ I, I, I, I, I, I }));
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&units, &.{ CV, c.ATTR_INPUT_ERROR, c.ATTR_FIXEDCONVERTED, 9, 0xff, I }));
+    // No attributes, or not one per unit: never read past either.
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&units, null));
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&units, &.{ I, I, TC, TC, CV }));
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&units, &.{ TC, TC, TC, TC, TC, TC, TC }));
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(&.{}, &.{}));
+    try testing.expectEqual(@as(?T, null), imeTargetCodepointRange(units[0..1], &.{}));
+
+    // U+1F642 is two units and one codepoint, with its first unit's
+    // attribute.
+    const pair = [_]u16{ 'a', 0xD83D, 0xDE42, 'b', 'c' };
+    try testing.expectEqual(@as(?T, .{ .start = 1, .end = 2 }), imeTargetCodepointRange(&pair, &.{ I, TC, I, CV, CV }));
+    try testing.expectEqual(@as(?T, .{ .start = 1, .end = 3 }), imeTargetCodepointRange(&pair, &.{ I, TC, TC, TC, CV }));
+    try testing.expectEqual(@as(?T, .{ .start = 2, .end = 4 }), imeTargetCodepointRange(&pair, &.{ I, I, TC, TC, TC }));
+    // A lone surrogate is a codepoint of its own, as the caret counts it.
+    const lone = [_]u16{ 0xD83D, 'x' };
+    try testing.expectEqual(@as(?T, .{ .start = 1, .end = 2 }), imeTargetCodepointRange(&lone, &.{ I, TC }));
+}
+
 test "win32 IME commit reports the effect that closed the surface" {
     const Target = struct {
         effect: CoreSurface.InputEffect,
@@ -2702,24 +2968,27 @@ fn testingDeliverKeyMessage(
     // The thread's live state moves once the key is translated, as drift in
     // the live keyboard would (a held Ctrl, NumLock on): the dispatch has to
     // report the state the test pinned.
-    var resynced: [256]u8 = [_]u8{0} ** 256;
-    resynced[c.VK_CONTROL] = 0x80;
-    resynced[c.VK_LCONTROL] = 0x80;
-    resynced[c.VK_NUMLOCK] = 1;
-    resynced[c.VK_CAPITAL] = 1;
-    resynced[c.VK_SCROLL] = 1;
+    const resynced = testingDriftedKeyboardState();
     _ = sys.SetKeyboardState(&resynced);
     const typed: TypedChars = if (msg == c.WM_KEYDOWN) takeTypedChars(hwnd) else .{};
     dispatchKeyMessage(terminal, chars, msg, vk, lParam, defer_plain_text, false, terminal.opts.win32InputRecords(), &typed);
 
     var queued: sys.MSG = undefined;
-    while (sys.PeekMessageW(&queued, hwnd, c.WM_CHAR, c.WM_DEADCHAR, c.PM_REMOVE) != 0) {
-        if (queued.message == c.WM_QUIT) {
-            sys.PostQuitMessage(@bitCast(@as(u32, @truncate(queued.wParam))));
-            break;
-        }
+    while (takeCharMessage(hwnd, &queued)) {
         dispatchCharMessage(terminal, chars, queued.message, queued.wParam, queued.lParam, false);
     }
+}
+
+/// A live keyboard that drifted from what a test pinned: Ctrl held and every
+/// lock on.
+fn testingDriftedKeyboardState() [256]u8 {
+    var state: [256]u8 = [_]u8{0} ** 256;
+    state[c.VK_CONTROL] = 0x80;
+    state[c.VK_LCONTROL] = 0x80;
+    state[c.VK_NUMLOCK] = 1;
+    state[c.VK_CAPITAL] = 1;
+    state[c.VK_SCROLL] = 1;
+    return state;
 }
 
 const TestingKey = struct {
@@ -2881,12 +3150,7 @@ test "win32 key messages report the keyboard state a test pinned, not the live k
     defer keyboard.release();
 
     // The thread's own state now says Ctrl is down and every toggle is on.
-    var live: [256]u8 = [_]u8{0} ** 256;
-    live[c.VK_CONTROL] = 0x80;
-    live[c.VK_LCONTROL] = 0x80;
-    live[c.VK_NUMLOCK] = 1;
-    live[c.VK_CAPITAL] = 1;
-    live[c.VK_SCROLL] = 1;
+    const live = testingDriftedKeyboardState();
     _ = sys.SetKeyboardState(&live);
 
     const lParam: LPARAM = @bitCast(@as(usize, 1 | (30 << 16)));
@@ -3198,6 +3462,11 @@ test "win32 XButton wParam decoding maps forward and back buttons" {
     // XBUTTON2 in HIWORD of wParam
     const wp2 = (@as(usize, c.XBUTTON2) << 16) | @as(usize, c.MK_XBUTTON2);
     try std.testing.expectEqual(c.XBUTTON2, highWord(wp2));
+
+    // Back and forward are buttons 8 and 9, never the wheel's 4 and 5.
+    try std.testing.expectEqual(input.MouseButton.eight, xMouseButton(wp1).?);
+    try std.testing.expectEqual(input.MouseButton.nine, xMouseButton(wp2).?);
+    try std.testing.expectEqual(@as(?input.MouseButton, null), xMouseButton(c.MK_XBUTTON1));
 }
 
 test "win32 quick select treats synthetic AltGr as label text instead of an action" {

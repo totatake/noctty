@@ -3,12 +3,23 @@ param(
     [string] $ExePath,
     [string] $RunRoot,
     [ValidateNotNullOrEmpty()] [ValidateSet('cmd', 'pwsh')] [string[]] $Shells = @('cmd', 'pwsh'),
-    [ValidateSet('All', 'Modes', 'Paste')] [string] $Scenario = 'Modes',
+    [ValidateSet('All', 'Modes', 'Paste', 'CtrlC')] [string] $Scenario = 'Modes',
+    [ValidateSet('Enabled', 'Ignoring', 'Both')] [string] $ParentCtrlC = 'Both',
+    [ValidateSet('Default', 'Bundled', 'Inbox', 'Both')] [string] $ConPty = 'Default',
     [int] $TimeoutSeconds = 30,
-    [switch] $RequireAdoptedStartupBaseline,
+    [switch] $RequireMeasurementAumid,
+    [string] $ExpectedStartupFingerprint,
+    [string] $RuntimeReservationOwnerPath,
+    [ValidatePattern('^[A-Za-z0-9_.-]+$')] [string] $BlockedRuntimeOwner,
     [switch] $ExerciseParentTimeout,
+    [switch] $ExerciseInheritedCtrlCIgnore,
     [switch] $Worker
 )
+
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-stale-modes.ps1'
+try {
+
 
 # PKG-16 runtime checks. Never launches the supplied executable in place.
 # Each case owns a portable copy, redirected AppData, and a hidden desktop.
@@ -18,6 +29,22 @@ param(
 # PowerShell loads the copied integration manually so history is redirected
 # before the first interactive prompt. This does not test auto-injection.
 # Marker files prove commands ran; input echo alone is not an oracle.
+# CtrlC is opt-in and independent of the stale-mode/paste checks. Its default
+# matrix is cmd/pwsh x enabled/ignoring driver with bundled ConPTY;
+# -ConPty Both adds the inbox backend. All eight results survive ordinary
+# regression failures; a profile/clipboard guard failure stops the matrix.
+# Supply optional campaign guard parameters when running on a shared machine.
+# ExpectedStartupFingerprint is 'absent' or UTC mtime ticks:length:uppercase SHA256.
+# RuntimeReservationOwnerPath must be absolute so parent and worker check the same file.
+# An absent reservation directory means released; an existing one needs a nonempty owner.
+# Example (with an isolated measurement build):
+# .\test\windows\interactive-win11-stale-modes.ps1 -ExePath <measure-build> `
+#     -RunRoot <fresh-directory> -Scenario CtrlC -ConPty Both -RequireMeasurementAumid
+# The fixture never calls SetConsoleCtrlHandler: its interrupt must come from
+# the shell's inherited state. CtrlC cases clear copy bindings before Ctrl+C.
+# Modes/All normalize their controller with NULL,FALSE as in #477;
+# -ExerciseInheritedCtrlCIgnore seeds that controller via a new process group.
+# CtrlC instead applies its selected Enabled/Ignoring state, without normalization.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -27,11 +54,46 @@ if ($TimeoutSeconds -lt 1) { throw 'TimeoutSeconds must be positive.' }
 if ($Scenario -eq 'Paste' -and $Shells -contains 'pwsh') { throw 'Paste supports cmd only; use -Shells cmd.' }
 if (-not $Worker -and $Scenario -eq 'All' -and $Shells -notcontains 'cmd') { throw 'All requires cmd for its paste check; use -Shells cmd,pwsh.' }
 if ($ExerciseParentTimeout -and $Scenario -ne 'Modes') { throw 'Timeout exercise requires -Scenario Modes.' }
+if ($ExerciseInheritedCtrlCIgnore -and $Scenario -notin @('Modes', 'All')) { throw 'Inherited Ctrl+C exercise requires -Scenario Modes or All; use ParentCtrlC for Scenario CtrlC.' }
+if ($Scenario -ne 'CtrlC' -and ($ConPty -ne 'Default' -or $ParentCtrlC -ne 'Both')) { throw 'ParentCtrlC and ConPty controls require -Scenario CtrlC.' }
+if ($Worker -and $Scenario -eq 'CtrlC' -and ($ParentCtrlC -eq 'Both' -or $ConPty -notin @('Bundled', 'Inbox'))) { throw 'Worker requires one explicit parent/backend control.' }
+if ([bool]$RuntimeReservationOwnerPath -ne [bool]$BlockedRuntimeOwner) { throw 'RuntimeReservationOwnerPath and BlockedRuntimeOwner must be supplied together.' }
+if ($RuntimeReservationOwnerPath -and $RuntimeReservationOwnerPath -notmatch '^(?:[A-Za-z]:[\\/]|[\\/]{2})') { throw 'RuntimeReservationOwnerPath must be fully qualified.' }
 
-function Get-Fingerprint([string] $Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
-    $item = Get-Item -LiteralPath $Path
-    return "$($item.LastWriteTimeUtc.Ticks):$($item.Length):$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash)"
+. (Join-Path $PSScriptRoot 'interactive-win11-hidden-desktop-lib.ps1')
+
+function Assert-RuntimeAllowed {
+    # Optional shared-machine reservation. Recheck in the worker before input
+    # as well as in the parent, since an owner can change between cases.
+    if (-not $RuntimeReservationOwnerPath) { return }
+    # Removing the reservation directory releases it. While it exists,
+    # an absent or empty owner is an acquisition in progress: fail closed.
+    if (Test-Path -LiteralPath (Split-Path -Parent $RuntimeReservationOwnerPath)) {
+        $ownerText = if (Test-Path -LiteralPath $RuntimeReservationOwnerPath -PathType Leaf) {
+            [IO.File]::ReadAllText($RuntimeReservationOwnerPath).Trim()
+        } else { '' }
+        if (-not $ownerText -or ($ownerText -split '\s+')[0] -eq $BlockedRuntimeOwner) {
+            throw 'Runtime deferred while the supplied desktop reservation is active or has no owner.'
+        }
+    }
+}
+
+function Get-AumidRegistrationFingerprint([string] $Id) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\AppUserModelId\' + $Id)
+    if (-not $key) { return 'absent' }
+    try {
+        # Only hashes leave this function; values are never emitted as diagnostics.
+        $values = @(foreach ($name in ($key.GetValueNames() | Sort-Object)) {
+            $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            [ordered]@{ name = $name; kind = $key.GetValueKind($name).ToString(); value = $value }
+        })
+        $record = [ordered]@{ values = $values; subkeys = @($key.GetSubKeyNames() | Sort-Object) }
+        $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $record -Depth 8 -Compress))
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
+        finally { $sha.Dispose() }
+    }
+    finally { $key.Dispose() }
 }
 
 if (-not ('StaleModesNative' -as [type])) {
@@ -41,73 +103,45 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class StaleModesNative {
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct SI {
-        public int cb; public string reserved, desktop, title;
-        public int x,y,xsize,ysize,xchars,ychars,fill,flags;
-        public short show, cbReserved; public IntPtr reserved2, stdin, stdout, stderr;
+    [DllImport("ntdll.dll")] static extern IntPtr RtlGetCurrentPeb();
+    public static uint IgnoreFlag() {
+        // Read-only test oracle: the same PEB/process-parameter prefix used
+        // by Zig 0.15.2 on x64/ARM64 (and the natural 32-bit pointer layout).
+        IntPtr parameters=Marshal.ReadIntPtr(RtlGetCurrentPeb(),4*IntPtr.Size);
+        return unchecked((uint)Marshal.ReadInt32(parameters,16+IntPtr.Size))&1;
     }
-    [StructLayout(LayoutKind.Sequential)] public struct PI { public IntPtr process, thread; public int pid, tid; }
-    public delegate bool EnumProc(IntPtr hwnd, IntPtr arg);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr mode, int flags, uint access, IntPtr security);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr obj, int index, StringBuilder text, int bytes, out int needed);
+    static string ObjectName(IntPtr obj) {
+        var name=new StringBuilder(256); int needed;
+        if(obj==IntPtr.Zero || !GetUserObjectInformationW(obj,2,name,512,out needed)) throw new Exception("Desktop/station identity unavailable");
+        return name.ToString();
+    }
+    public static void VerifyDesktop(string expected, IntPtr window) {
+        int pid; uint thread=window==IntPtr.Zero ? GetCurrentThreadId() : GetWindowThreadProcessId(window,out pid);
+        VerifyThreadDesktop(expected,thread);
+    }
+    public static void VerifyThreadDesktop(string expected, uint thread) {
+        string actual=ObjectName(GetProcessWindowStation())+"\\"+ObjectName(GetThreadDesktop(thread));
+        if(!String.Equals(actual,expected,StringComparison.OrdinalIgnoreCase)) throw new Exception("Unexpected desktop: "+actual);
+    }
+    public static bool VerifyShellThreadDesktop(string expected, uint thread) {
+        // A console-only thread may have no win32k desktop yet. A non-NULL
+        // desktop must match; the fixture also records its context in-process.
+        IntPtr desktop=GetThreadDesktop(thread);
+        if(desktop==IntPtr.Zero) return false;
+        string leaf=expected.Substring(expected.IndexOf('\\')+1);
+        if(!String.Equals(ObjectName(desktop),leaf,StringComparison.OrdinalIgnoreCase)) throw new Exception("Shell thread left the hidden desktop");
+        return true;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateWindowStationW(string name, uint flags, uint access, IntPtr security);
     [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessWindowStation(IntPtr station);
     [DllImport("user32.dll")] public static extern bool CloseWindowStation(IntPtr station);
-    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcessW(string application, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr environment, string cwd, ref SI startup, out PI info);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr security, string name);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-    [DllImport("kernel32.dll")] public static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr process, uint code);
-    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    public static int[] JobPids(IntPtr job) {
-        // This harness has few children. MORE_DATA fails closed rather than
-        // truncating an unexpectedly large process list.
-        int size=8+IntPtr.Size*256; IntPtr buffer=Marshal.AllocHGlobal(size);
-        try {
-            uint returned;
-            if(!QueryInformationJobObject(job,3,buffer,(uint)size,out returned)) throw new Exception("Query owned job failed: "+Marshal.GetLastWin32Error());
-            int count=Marshal.ReadInt32(buffer,4); var ids=new int[count];
-            for(int i=0;i<count;i++) ids[i]=(int)Marshal.ReadIntPtr(buffer,8+i*IntPtr.Size);
-            return ids;
-        } finally { Marshal.FreeHGlobal(buffer); }
-    }
-    public static int[] ReapOwnedJob(IntPtr job) {
-        var stopped=new List<int>();
-        for(int round=0;round<8;round++) {
-            int[] ids=JobPids(job); if(ids.Length==0) return stopped.ToArray();
-            foreach(int id in ids) {
-                // Hold the exact process handle and freshly verify membership
-                // before terminating. A reused PID outside our job is skipped.
-                IntPtr handle=OpenProcess(0x00101001,false,id);
-                if(handle==IntPtr.Zero) continue;
-                try {
-                    bool member;
-                    if(!IsProcessInJob(handle,job,out member)) throw new Exception("Owned job membership query failed");
-                    if(!member) continue;
-                    uint code;
-                    if(!GetExitCodeProcess(handle,out code)) throw new Exception("Owned process query failed");
-                    if(code!=259) continue;
-                    if(!TerminateProcess(handle,1)) {
-                        if(!GetExitCodeProcess(handle,out code) || code==259) throw new Exception("Owned process termination failed");
-                    } else stopped.Add(id);
-                    if(WaitForSingleObject(handle,10000)!=0) throw new Exception("Owned process did not exit");
-                } finally { CloseHandle(handle); }
-            }
-        }
-        if(JobPids(job).Length!=0) throw new Exception("Owned job still has processes after cleanup");
-        return stopped.ToArray();
-    }
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
-    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr arg);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr arg);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int capacity);
-    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint type);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern short VkKeyScanW(char ch);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
@@ -122,18 +156,8 @@ public static class StaleModesNative {
     [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr memory);
     [DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr memory);
     [DllImport("kernel32.dll")] public static extern IntPtr GlobalFree(IntPtr memory);
-    public static string ClassOf(IntPtr hwnd) { var s=new StringBuilder(256); GetClassNameW(hwnd,s,256); return s.ToString(); }
-    public static IntPtr Host(int pid) {
-        IntPtr found=IntPtr.Zero;
-        EnumWindows((h,a)=> { int p; GetWindowThreadProcessId(h,out p); if(p==pid && ClassOf(h)=="noctty.win32.host") found=h; return true; },IntPtr.Zero);
-        return found;
-    }
-    public static IntPtr Surface(IntPtr host) {
-        IntPtr found=IntPtr.Zero;
-        EnumChildWindows(host,(h,a)=> { if(ClassOf(h)=="noctty.win32") found=h; return true; },IntPtr.Zero);
-        return found;
-    }
-    public static void Send(IntPtr hwnd,uint msg,int value,long bits) {
+    // HiddenDesktopNative.Send, for KeyInternal (a separately compiled class cannot call it).
+    static void Send(IntPtr hwnd,uint msg,int value,long bits) {
         UIntPtr result;
         if(SendMessageTimeoutW(hwnd,msg,(UIntPtr)(uint)value,(IntPtr)bits,2,5000,out result)==IntPtr.Zero)
             throw new Exception("SendMessageTimeout failed: "+Marshal.GetLastWin32Error());
@@ -183,70 +207,54 @@ public static class StaleModesNative {
 '@
 }
 
-function Start-Hidden([string] $Application, [string] $Command, [string] $Directory, [string] $Desktop, [IntPtr] $OwnerJob = [IntPtr]::Zero) {
-    $si = [StaleModesNative+SI]::new()
-    $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][StaleModesNative+SI])
-    $si.desktop = $Desktop
-    $pi = [StaleModesNative+PI]::new()
-    $flags = if ($OwnerJob -ne [IntPtr]::Zero) { 0x08004004 } else { 0x08004000 }
-    if (-not [StaleModesNative]::CreateProcessW($Application, [Text.StringBuilder]::new($Command),
-            [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, [IntPtr]::Zero, $Directory, [ref]$si, [ref]$pi)) {
-        throw "CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-    }
-    try {
-        # Assign the suspended driver before its first instruction: every
-        # descendant inherits containment even if the worker cannot finalize.
-        if ($OwnerJob -ne [IntPtr]::Zero) {
-            if (-not [StaleModesNative]::AssignProcessToJobObject($OwnerJob, $pi.process)) {
-                [void][StaleModesNative]::TerminateProcess($pi.process, 1)
-                throw 'Assigning suspended driver to owned job failed.'
-            }
-            if ([StaleModesNative]::ResumeThread($pi.thread) -eq [uint32]::MaxValue) {
-                [void][StaleModesNative]::TerminateProcess($pi.process, 1)
-                throw 'Resuming contained driver failed.'
-            }
-        }
-    }
-    finally {
-        [void][StaleModesNative]::CloseHandle($pi.thread)
-        [void][StaleModesNative]::CloseHandle($pi.process)
-    }
-    return [Diagnostics.Process]::GetProcessById($pi.pid)
-}
-
-function Stop-Owned([Diagnostics.Process] $Process, [string] $ExpectedPath, [datetime] $StartTime) {
-    # Re-read the exact PID immediately before termination; reject PID reuse
-    # and executable changes. No name/pattern or system-wide tree kill.
-    $fresh = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
-    if (-not $fresh) { return }
-    if ($fresh.StartTime -ne $StartTime -or $fresh.Path -ne $ExpectedPath) { throw "PID identity changed: $($Process.Id)" }
-    $fresh.Kill()
-    if (-not $fresh.WaitForExit(10000)) { throw "Owned process $($fresh.Id) did not exit." }
-}
-
 if (-not $Worker) {
     $ExePath = (Resolve-Path -LiteralPath $ExePath).Path
     $sourceEvidence = [ordered]@{ path = $ExePath; sha256 = (Get-FileHash -LiteralPath $ExePath).Hash;
         mtimeUtc = (Get-Item -LiteralPath $ExePath).LastWriteTimeUtc.ToString('o') }
-    if (Test-Path -LiteralPath $RunRoot) { throw 'RunRoot must be a fresh directory.' }
-    $realStartup = Join-Path $env:LOCALAPPDATA 'noctty\startup-attempts.json'
-    $startupBefore = Get-Fingerprint $realStartup
-    $expectedHash = '7B4F9AA31731DF822E3EC13F8381E76DC759455ABBF8BB458F74E10BF5E2BB9C'
-    # The campaign opts into its adopted incident baseline. Other profiles,
-    # including an absent startup ledger, use the captured preservation check.
-    if ($RequireAdoptedStartupBaseline -and
-        ($startupBefore -eq 'absent' -or
-        (Get-FileHash -LiteralPath $realStartup).Hash -ne $expectedHash -or
-        (Get-Item -LiteralPath $realStartup).LastWriteTimeUtc.ToString('yyyy-MM-ddTHH:mm:ss') -ne '2026-10-10T18:18:34')) {
-        throw 'Real startup-attempts.json differs from the adopted incident baseline; no launch performed.'
+    # Identity check only; registration suppression is checked by the
+    # before/after AUMID registration guard below.
+    if ($RequireMeasurementAumid) {
+        # Check both byte alignments: PE data need not align wide literals
+        # relative to the beginning of the file. UTF-8 product namespace
+        # strings also identify the default class, so they are not an AUMID oracle.
+        $binaryBytes = [IO.File]::ReadAllBytes($ExePath)
+        $binary = [Text.Encoding]::Unicode.GetString($binaryBytes)
+        $oddBinary = if ($binaryBytes.Length -gt 1) { [Text.Encoding]::Unicode.GetString($binaryBytes, 1, $binaryBytes.Length - 1) } else { '' }
+        if ((-not $binary.Contains("io.github.amanthanvi.noctty.measure`0") -and -not $oddBinary.Contains("io.github.amanthanvi.noctty.measure`0")) -or
+            $binary.Contains("io.github.amanthanvi.noctty`0") -or $oddBinary.Contains("io.github.amanthanvi.noctty`0")) {
+            throw 'Measurement AUMID required, with no product AUMID literal; no launch performed.'
+        }
+        $binary = $null; $oddBinary = $null; $binaryBytes = $null
     }
+    if (Test-Path -LiteralPath $RunRoot) { throw 'RunRoot must be a fresh directory.' }
+    $realStartup = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
+    $startupBefore = Get-Fingerprint $realStartup
+    if ($ExpectedStartupFingerprint -and $startupBefore -ne $ExpectedStartupFingerprint) {
+        throw 'Real startup-attempts.json differs from the supplied fingerprint; no launch performed.'
+    }
+    # Measurement builds promise to suppress registration; ordinary product
+    # builds can legitimately create their display-name registration.
+    $registrationIds = if ($RequireMeasurementAumid) { @('io.github.amanthanvi.noctty', 'io.github.amanthanvi.noctty.measure') } else { @() }
+    $registrationsBefore = @{}; foreach ($id in $registrationIds) { $registrationsBefore[$id] = Get-AumidRegistrationFingerprint $id }
     # GetFolderPath deliberately ignores redirected APPDATA, as PSReadLine does.
     $historyRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
     $realHistories = @('Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt',
         'Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt') | ForEach-Object { Join-Path $historyRoot $_ }
-    $historyBefore = @{}; foreach ($path in $realHistories) { $historyBefore[$path] = Get-Fingerprint $path }
+    $realHistories += Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\PSReadLine\ConsoleHost_history.txt'
+    $realHistories += Join-Path ([Environment]::GetFolderPath('UserProfile')) '.bash_history'
+    $historyBefore = @{}; foreach ($path in $realHistories) { $historyBefore[$path] = Get-HistoryMetadata $path }
+    $realDestinations = Join-Path $historyRoot 'Microsoft\Windows\Recent\CustomDestinations\c2214d6ebc43ff3f.customDestinations-ms'
+    $destinationsBefore = Get-Fingerprint $realDestinations
+    $clipboardBefore = [StaleModesNative]::GetClipboardSequenceNumber()
+    $batchStartedUtc = [DateTime]::UtcNow.ToString('o')
     [void](New-Item -ItemType Directory -Path $RunRoot)
     $RunRoot = (Resolve-Path -LiteralPath $RunRoot).Path
+    $guardOptions = [ordered]@{ requireMeasurementAumid = [bool]$RequireMeasurementAumid;
+        expectedStartupFingerprint = $ExpectedStartupFingerprint;
+        runtimeReservationOwnerPath = $RuntimeReservationOwnerPath; blockedRuntimeOwner = $BlockedRuntimeOwner }
+    [ordered]@{ startedUtc = $batchStartedUtc; startup = $startupBefore; histories = $historyBefore;
+        productCustomDestinations = $destinationsBefore; aumidRegistrations = $registrationsBefore; clipboard = $clipboardBefore; guardOptions = $guardOptions } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $RunRoot 'guard-before.json')
     $fixtureSource = @'
 using System;
 using System.Diagnostics;
@@ -258,13 +266,60 @@ class Fixture {
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
     [DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr handle,uint mode);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process,int info,out UIntPtr value,uint size,out uint returned);
+    [DllImport("ntdll.dll")] static extern IntPtr RtlGetCurrentPeb();
+    // Test-only read oracles. Natural pointer alignment matches x64/ARM64
+    // PEB/RTL_USER_PROCESS_PARAMETERS; production never reads or mutates them.
+    [StructLayout(LayoutKind.Sequential)] struct PebHeader {
+        public byte inherited,options,debugged,bits;
+        public IntPtr mutant,image,loader,parameters;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ParametersHeader {
+        public uint allocation,size,flags,debug;
+        public IntPtr console;
+        public uint consoleFlags;
+    }
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll")] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformationW(IntPtr obj,int index,StringBuilder text,int bytes,out int needed);
+    static string ObjectName(IntPtr obj) {
+        var text=new StringBuilder(256); int needed;
+        if(!GetUserObjectInformationW(obj,2,text,512,out needed)) throw new Exception("Fixture desktop query failed");
+        return text.ToString();
+    }
     static void Emit(string text) { byte[] b=Encoding.ASCII.GetBytes(text); var s=Console.OpenStandardOutput(); s.Write(b,0,b.Length); s.Flush(); }
+    static int Fail(string marker,int code) {
+        File.WriteAllText(marker+".error.tmp",code.ToString());
+        File.Move(marker+".error.tmp",marker+".error"); return code;
+    }
     static int Main(string[] a) {
         string action=a[0], marker=a[1]; uint output;
         if(GetConsoleMode(GetStdHandle(-11),out output)) SetConsoleMode(GetStdHandle(-11),output|4);
         if(action=="interrupt") {
-            Console.CancelKeyPress+=(s,e)=> { File.WriteAllText(marker+".interrupted","yes"); Environment.Exit(0); };
-            File.WriteAllText(marker+".ready",Process.GetCurrentProcess().Id.ToString());
+            try {
+                // Registering a handler does NOT reset the inherited ignore bit.
+                // Never call SetConsoleCtrlHandler(NULL,FALSE) in this fixture.
+                Console.CancelKeyPress+=(s,e)=> { File.WriteAllText(marker+".interrupted","yes"); Environment.Exit(0); };
+                uint input;
+                if(!GetConsoleMode(GetStdHandle(-10),out input)) return Fail(marker,14);
+                File.WriteAllText(marker+".input-mode",input.ToString());
+                File.WriteAllText(marker+".desktop",ObjectName(GetProcessWindowStation())+"\\"+ObjectName(GetThreadDesktop(GetCurrentThreadId())));
+                // ProcessConsoleHostProcess (49) returns the actual console server,
+                // with low flag bits. GetConsoleWindow's owner can masquerade as
+                // the root client and DLL presence does not rule out fallback.
+                UIntPtr server; uint returned;
+                if(NtQueryInformationProcess(new IntPtr(-1),49,out server,(uint)UIntPtr.Size,out returned)<0 || returned!=(uint)UIntPtr.Size) return Fail(marker,15);
+                int hostPid=checked((int)(server.ToUInt64()&~3UL));
+                if(hostPid==0) return Fail(marker,16);
+                File.WriteAllText(marker+".host-pid",hostPid.ToString());
+                using(var host=Process.GetProcessById(hostPid)) File.WriteAllText(marker+".host-image",host.MainModule.FileName);
+                var peb=(PebHeader)Marshal.PtrToStructure(RtlGetCurrentPeb(),typeof(PebHeader));
+                var parameters=(ParametersHeader)Marshal.PtrToStructure(peb.parameters,typeof(ParametersHeader));
+                File.WriteAllText(marker+".ignore",(parameters.consoleFlags&1).ToString());
+                File.WriteAllText(marker+".ready.tmp",Process.GetCurrentProcess().Id.ToString());
+                File.Move(marker+".ready.tmp",marker+".ready");
+            } catch(Exception) { return Fail(marker,17); }
             Thread.Sleep(Timeout.Infinite); return 0;
         }
         if(action=="paste") {
@@ -289,20 +344,31 @@ class Fixture {
     }
 }
 '@
-    $fixturePath = Join-Path $RunRoot 'mode-fixture.exe'
     $sourcePath = Join-Path $RunRoot 'mode-fixture.cs'
     [IO.File]::WriteAllText($sourcePath, $fixtureSource)
-    $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    & $compiler /nologo /target:exe "/out:$fixturePath" $sourcePath
-    if ($LASTEXITCODE -ne 0) { throw 'Console fixture compilation failed.' }
+    $cases = @()
+    foreach ($shell in $Shells) {
+        if ($Scenario -eq 'CtrlC') {
+            $parents = if ($ParentCtrlC -eq 'Both') { @('Enabled', 'Ignoring') } else { @($ParentCtrlC) }
+            $backends = if ($ConPty -eq 'Both') { @('Bundled', 'Inbox') } elseif ($ConPty -eq 'Default') { @('Bundled') } else { @($ConPty) }
+            foreach ($backend in $backends) {
+                foreach ($control in $parents) { $cases += [pscustomobject]@{ shell = $shell; parent = $control; backend = $backend; name = "$shell-$backend-$control" } }
+            }
+        }
+        else { $cases += [pscustomobject]@{ shell = $shell; parent = 'Both'; backend = 'Default'; name = $shell } }
+    }
     $allResults = @()
     try {
-        foreach ($shell in $Shells) {
-            $caseRoot = Join-Path $RunRoot $shell
+        foreach ($case in $cases) {
+            Assert-RuntimeAllowed
+            $shell = $case.shell
+            $caseRoot = Join-Path $RunRoot $case.name
             [void](New-Item -ItemType Directory -Path $caseRoot)
             Copy-Item -LiteralPath $ExePath -Destination (Join-Path $caseRoot 'noctty.exe')
+            if ((Get-FileHash -LiteralPath (Join-Path $caseRoot 'noctty.exe')).Hash -ne $sourceEvidence.sha256) { throw 'Supplied executable changed while staging the matrix.' }
             foreach ($name in @('conpty.dll', 'OpenConsole.exe')) {
                 $path = Join-Path (Split-Path -Parent $ExePath) $name
+                if ($case.backend -eq 'Bundled' -and -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Bundled control requires $name beside the supplied build." }
                 if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $caseRoot }
             }
             # Keep built resources/fonts and integration matched to this executable.
@@ -310,13 +376,14 @@ class Fixture {
             if (-not (Test-Path -LiteralPath $share)) { throw "Build share directory absent: $share" }
             Copy-Item -LiteralPath $share -Destination (Join-Path $caseRoot 'share') -Recurse
             [IO.File]::WriteAllText((Join-Path $caseRoot 'noctty.portable'), '')
-            Copy-Item -LiteralPath $fixturePath -Destination (Join-Path $caseRoot 'mode-fixture.exe')
+            Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $caseRoot 'mode-fixture.cs')
             [void](New-Item -ItemType Directory -Path (Join-Path $caseRoot 'local'), (Join-Path $caseRoot 'roaming'))
             $uniqueName = 'noctty-stale-' + [guid]::NewGuid().ToString('N')
-            $stationName = if ($Scenario -eq 'Modes') { 'WinSta0' } else { $uniqueName }
-            $desktopLeaf = if ($Scenario -eq 'Modes') { $uniqueName } else { 'hidden' }
+            $needsClipboard = $Scenario -in @('All', 'Paste')
+            $stationName = if ($needsClipboard) { $uniqueName } else { 'WinSta0' }
+            $desktopLeaf = if ($needsClipboard) { 'hidden' } else { $uniqueName }
             $station = [IntPtr]::Zero
-            if ($Scenario -ne 'Modes') {
+            if ($needsClipboard) {
                 $station = [StaleModesNative]::CreateWindowStationW($stationName, 0, 0x10000000, [IntPtr]::Zero)
                 if ($station -eq [IntPtr]::Zero) { throw "Private paste windowstation unavailable (Win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error())); run -Scenario Modes for checks without clipboard access." }
             }
@@ -324,7 +391,7 @@ class Fixture {
             $desktop = [IntPtr]::Zero
             try {
                 if ($station -ne [IntPtr]::Zero -and -not [StaleModesNative]::SetProcessWindowStation($station)) { throw 'SetProcessWindowStation failed.' }
-                $desktop = [StaleModesNative]::CreateDesktopW($desktopLeaf, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
+                $desktop = [HiddenDesktopNative]::CreateDesktopW($desktopLeaf, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
                 if ($desktop -eq [IntPtr]::Zero) { throw 'CreateDesktopW failed.' }
             }
             finally {
@@ -335,16 +402,21 @@ class Fixture {
             [IO.File]::WriteAllText((Join-Path $caseRoot 'desktop.txt'), $deskName)
             $driver = $null
             $driverHandle = [IntPtr]::Zero
-            $ownerJob = [StaleModesNative]::CreateJobObjectW([IntPtr]::Zero, [NullString]::Value)
+            $ownerJob = [HiddenDesktopNative]::CreateJobObjectW([IntPtr]::Zero, [NullString]::Value)
             if ($ownerJob -eq [IntPtr]::Zero) { throw 'Creating owned driver job failed.' }
             $timedOut = $false
             try {
                 $pwsh = (Get-Command pwsh.exe).Source
                 $command = '"{0}" -NoProfile -NonInteractive -File "{1}" -Worker -RunRoot "{2}" -Shells {3} -TimeoutSeconds {4} -Scenario {5}' -f $pwsh, $PSCommandPath, $caseRoot, $shell, $TimeoutSeconds, $Scenario
+                $command += ' -ParentCtrlC {0} -ConPty {1}' -f $case.parent, $case.backend
+                if ($RuntimeReservationOwnerPath) { $command += ' -RuntimeReservationOwnerPath "{0}" -BlockedRuntimeOwner {1}' -f $RuntimeReservationOwnerPath, $BlockedRuntimeOwner }
                 if ($ExerciseParentTimeout) { $command += ' -ExerciseParentTimeout' }
-                $driver = Start-Hidden $pwsh $command $caseRoot $deskName $ownerJob
+                if ($ExerciseInheritedCtrlCIgnore) { $command += ' -ExerciseInheritedCtrlCIgnore' }
+                $driverEnvironment = @{ LOCALAPPDATA = Join-Path $caseRoot 'local'; APPDATA = Join-Path $caseRoot 'roaming';
+                    GHOSTTY_RESOURCES_DIR = Join-Path $caseRoot 'share\ghostty' }
+                $driver = Start-Hidden $pwsh $command $caseRoot $deskName $ownerJob -EnvironmentOverrides $driverEnvironment -NewProcessGroup:$ExerciseInheritedCtrlCIgnore
                 $started = $driver.StartTime
-                $driverHandle = [StaleModesNative]::OpenProcess(0x00101000, $false, $driver.Id)
+                $driverHandle = [HiddenDesktopNative]::OpenProcess(0x00101000, $false, $driver.Id)
                 if ($driverHandle -eq [IntPtr]::Zero) { throw 'Opening driver wait/query handle failed.' }
                 $driverWaitMilliseconds = ($TimeoutSeconds * 20 + 60) * 1000
                 if ($ExerciseParentTimeout) {
@@ -366,30 +438,65 @@ class Fixture {
                 # Process.ExitCode can remain null after WaitForExit in the
                 # managed desktop harness. Read the native code as well.
                 $driverExit = [uint32]259
-                if (-not [StaleModesNative]::GetExitCodeProcess($driverHandle, [ref]$driverExit)) { throw 'GetExitCodeProcess failed.' }
-                if ($driverExit -ne 0 -or $result.status -ne 'PASS') { throw "Hidden $shell checks failed (exit $driverExit): $($result.error)" }
+                if (-not [HiddenDesktopNative]::GetExitCodeProcess($driverHandle, [ref]$driverExit)) { throw 'GetExitCodeProcess failed.' }
+                if ($driverExit -ne 0 -or $result.status -ne 'PASS') {
+                    if ($Scenario -ne 'CtrlC') { throw "Hidden $shell checks failed (exit $driverExit): $($result.error)" }
+                    # Keep the whole focused matrix, including the expected
+                    # failing ignoring-parent cases on main, for the lead's A/B.
+                    $result.status = 'FAIL'
+                }
             }
             finally {
                 try {
-                    $stopped = @([StaleModesNative]::ReapOwnedJob($ownerJob))
-                    [pscustomobject]@{ timedOut = $timedOut; terminatedPids = $stopped; remainingPids = @([StaleModesNative]::JobPids($ownerJob)) } |
+                    $stopped = $null; $remainingPids = $null
+                    $reapFailure = $null; $queryFailure = $null
+                    try { $stopped = @([HiddenDesktopNative]::ReapOwnedJob($ownerJob)) }
+                    catch { $reapFailure = $_ }
+                    try { $remainingPids = @([HiddenDesktopNative]::JobPids($ownerJob)) }
+                    catch { $queryFailure = $_ }
+                    [pscustomobject]@{ timedOut = $timedOut; terminatedPids = $stopped; remainingPids = $remainingPids;
+                        reapError = $(if ($reapFailure) { $reapFailure.Exception.Message } else { $null });
+                        queryError = $(if ($queryFailure) { $queryFailure.Exception.Message } else { $null }) } |
                         ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $caseRoot 'cleanup.json')
+                    if ($queryFailure) { throw $queryFailure }
+                    if ($remainingPids.Count -ne 0) { throw 'Owned job is not empty after cleanup.' }
+                    if ($reapFailure) { throw $reapFailure }
                 }
                 finally {
-                    [void][StaleModesNative]::CloseHandle($ownerJob)
-                    if ($driverHandle -ne [IntPtr]::Zero) { [void][StaleModesNative]::CloseHandle($driverHandle) }
-                    [void][StaleModesNative]::CloseDesktop($desktop)
+                    [void][HiddenDesktopNative]::CloseHandle($ownerJob)
+                    if ($driverHandle -ne [IntPtr]::Zero) { [void][HiddenDesktopNative]::CloseHandle($driverHandle) }
+                    [void][HiddenDesktopNative]::CloseDesktop($desktop)
                     if ($station -ne [IntPtr]::Zero) { [void][StaleModesNative]::CloseWindowStation($station) }
                     if ((Get-Fingerprint $realStartup) -ne $startupBefore) { throw 'Real startup-attempts.json changed.' }
-                    foreach ($path in $realHistories) { if ((Get-Fingerprint $path) -ne $historyBefore[$path]) { throw 'Real PSReadLine history changed.' } }
+                    foreach ($path in $realHistories) { if ((Get-HistoryMetadata $path) -ne $historyBefore[$path]) { throw 'Real PSReadLine history changed.' } }
+                    if ((Get-Fingerprint $realDestinations) -ne $destinationsBefore) { throw 'Real product CustomDestinations changed.' }
+                    foreach ($id in $registrationIds) { if ((Get-AumidRegistrationFingerprint $id) -ne $registrationsBefore[$id]) { throw 'AUMID registration changed.' } }
+                    if ([StaleModesNative]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Clipboard sequence changed; stop launches and report batch times.' }
                 }
             }
         }
     }
     finally {
-        [pscustomobject]@{ source = $sourceEvidence; scenario = $Scenario; results = $allResults; startup = Get-Fingerprint $realStartup; historyUnchanged = (@($realHistories | Where-Object { (Get-Fingerprint $_) -ne $historyBefore[$_] }).Count -eq 0) } |
+        $clipboardAfter = [StaleModesNative]::GetClipboardSequenceNumber()
+        $guards = [ordered]@{ startedUtc = $batchStartedUtc; endedUtc = [DateTime]::UtcNow.ToString('o');
+            startupBefore = $startupBefore; startupAfter = Get-Fingerprint $realStartup;
+            productCustomDestinationsBefore = $destinationsBefore; productCustomDestinationsAfter = Get-Fingerprint $realDestinations;
+            clipboardBefore = $clipboardBefore; clipboardAfter = $clipboardAfter;
+            historiesBefore = $historyBefore; historiesAfter = @{};
+            aumidRegistrationsBefore = $registrationsBefore; aumidRegistrationsAfter = @{} }
+        foreach ($path in $realHistories) { $guards.historiesAfter[$path] = Get-HistoryMetadata $path }
+        foreach ($id in $registrationIds) { $guards.aumidRegistrationsAfter[$id] = Get-AumidRegistrationFingerprint $id }
+        $guards | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $RunRoot 'guard-after.json')
+        [pscustomobject]@{ source = $sourceEvidence; scenario = $Scenario; inheritedCtrlCIgnore = [bool]$ExerciseInheritedCtrlCIgnore; results = $allResults; guards = $guards; guardOptions = $guardOptions;
+            historyUnchanged = (@($realHistories | Where-Object { (Get-HistoryMetadata $_) -ne $historyBefore[$_] }).Count -eq 0) } |
             ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $RunRoot 'summary.json')
+        if ($guards.startupAfter -ne $startupBefore -or $guards.productCustomDestinationsAfter -ne $destinationsBefore -or
+            $clipboardAfter -ne $clipboardBefore -or @($realHistories | Where-Object { $guards.historiesAfter[$_] -ne $historyBefore[$_] }).Count -ne 0) {
+            throw 'Real-profile/clipboard guard changed; stop launches and report guard-before.json and guard-after.json.'
+        }
+        foreach ($id in $registrationIds) { if ($guards.aumidRegistrationsAfter[$id] -ne $registrationsBefore[$id]) { throw 'AUMID registration guard changed; stop launches.' } }
     }
+    if (@($allResults | Where-Object status -ne 'PASS').Count -ne 0) { throw "CtrlC regression matrix failed; evidence=$RunRoot" }
     Write-Host "stale modes: PASS; evidence=$RunRoot; real startup and history unchanged"
     return
 }
@@ -402,18 +509,30 @@ $shell = $Shells[0]
 $fixture = Join-Path $RunRoot 'mode-fixture.exe'
 $runExe = Join-Path $RunRoot 'noctty.exe'
 $checks = [Collections.Generic.List[string]]::new()
-$result = [ordered]@{ shell = $shell; status = 'FAIL'; checks = $checks; error = $null }
+$result = [ordered]@{ shell = $shell; scenario = $Scenario; parentCtrlC = $ParentCtrlC; conPty = $ConPty;
+    inheritedCtrlCIgnore = [bool]$ExerciseInheritedCtrlCIgnore; controllerNormalized = $false;
+    ignoreRequested = $null; ignoreApplied = $false; controlCallSucceeded = $false;
+    backendObserved = $null; desktopVerified = $false; shellDesktopVerified = $false; fixture = $null;
+    status = 'FAIL'; checks = $checks; error = $null }
 $app = $null
 $hostWindow = [IntPtr]::Zero
 
 function Wait-Marker([string] $Path) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while (-not (Test-Path -LiteralPath $Path)) {
+        if ($Path.EndsWith('.ready', [StringComparison]::OrdinalIgnoreCase)) {
+            $errorPath = $Path.Substring(0, $Path.Length - 6) + '.error'
+            if (Test-Path -LiteralPath $errorPath) {
+                $fixtureError = [int][IO.File]::ReadAllText($errorPath)
+                throw "Fixture setup failed with code $fixtureError."
+            }
+        }
         if ($app.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for marker $([IO.Path]::GetFileName($Path))" }
         Start-Sleep -Milliseconds 50
     }
 }
 function Type-Command([string] $Text) {
+    Assert-RuntimeAllowed
     foreach ($ch in $Text.ToCharArray()) {
         [StaleModesNative]::Character($surface, $ch)
     }
@@ -451,36 +570,168 @@ function Wait-Prompt {
         Start-Sleep -Milliseconds 50
     }
 }
+function Assert-FixtureContext([string] $Marker) {
+    # Read only the fixture PID and desktop/mode markers, never command lines.
+    $fixturePid = [int][IO.File]::ReadAllText($Marker + '.ready')
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$fixturePid" | Select-Object ProcessId, ParentProcessId, Name
+    if (-not $processInfo) { throw 'Interrupt fixture exited before Ctrl+C.' }
+    $ancestor = $processInfo.ParentProcessId
+    for ($depth = 0; $depth -lt 8 -and $ancestor -ne $app.Id; $depth++) {
+        $parentInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$ancestor" | Select-Object ProcessId, ParentProcessId
+        if (-not $parentInfo) { break }
+        $ancestor = $parentInfo.ParentProcessId
+    }
+    $actualDesktop = [IO.File]::ReadAllText($Marker + '.desktop')
+    $inputMode = [uint32][IO.File]::ReadAllText($Marker + '.input-mode')
+    $consoleHostPid = [int][IO.File]::ReadAllText($Marker + '.host-pid')
+    $consoleHostImage = [IO.File]::ReadAllText($Marker + '.host-image')
+    $inheritedIgnore = [uint32][IO.File]::ReadAllText($Marker + '.ignore')
+    $expectedHost = if ($ConPty -eq 'Bundled') { Join-Path $RunRoot 'OpenConsole.exe' } else { Join-Path $env:WINDIR 'System32\conhost.exe' }
+    $result.fixture = [ordered]@{ pid = $fixturePid; desktop = $actualDesktop; inputMode = $inputMode;
+        consoleHostPid = $consoleHostPid; consoleHostImage = $consoleHostImage;
+        inheritedIgnore = $inheritedIgnore; hostOracle = 'ProcessConsoleHostProcess';
+        interruptObserved = $false; ignoreResetInFixture = $false }
+    if ($consoleHostImage -ne $expectedHost -or (Get-Process -Id $consoleHostPid).Path -ne $consoleHostImage) {
+        throw 'Console server does not belong to the requested backend executable.'
+    }
+    $result.backendObserved = $ConPty
+    if ($processInfo.Name -ne 'mode-fixture.exe' -or $ancestor -ne $app.Id -or $app.HasExited -or
+        (Get-Process -Id $fixturePid).Path -ne $fixture) { throw 'Interrupt fixture is not an owned descendant of this portable instance.' }
+    if ($actualDesktop -ne $desktopName) { throw "Interrupt fixture escaped its explicit desktop: $actualDesktop" }
+    if (($inputMode -band 1) -eq 0) { throw 'Interrupt fixture lacks ENABLE_PROCESSED_INPUT; Ctrl+C would not test inherited ignore.' }
+}
+function Assert-ShellDesktop {
+    # Verify the console shell before the first keystroke. No title or raw
+    # command-line inspection; walk only this app's child identities.
+    $expectedName = if ($shell -eq 'cmd') { 'cmd.exe' } else { 'pwsh.exe' }
+    $expectedPath = if ($shell -eq 'cmd') { Join-Path $env:WINDIR 'System32\cmd.exe' } else { (Get-Command pwsh.exe).Source }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline -and -not $app.HasExited) {
+        $pending = @($app.Id)
+        for ($depth = 0; $depth -lt 8 -and $pending.Count -ne 0; $depth++) {
+            $next = @()
+            foreach ($parentPid in $pending) {
+                $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$parentPid" -Property ProcessId, ParentProcessId, Name)
+                foreach ($child in $children) {
+                    if ($child.Name -eq $expectedName) {
+                        $ownedShell = Get-Process -Id $child.ProcessId
+                        if ($ownedShell.Path -ne $expectedPath) { throw 'Unexpected shell executable in owned tree.' }
+                        $matchedThreads = 0
+                        foreach ($thread in $ownedShell.Threads) {
+                            if ([StaleModesNative]::VerifyShellThreadDesktop($desktopName, [uint32]$thread.Id)) { $matchedThreads++ }
+                        }
+                        # A console-only cmd thread may never acquire win32k
+                        # state. Preserve that limit; the fixture later makes
+                        # an in-process station/desktop check before Ctrl+C.
+                        $result.shellDesktopVerified = if ($matchedThreads) { 'matched' } else { 'unavailable' }
+                        return
+                    }
+                    $next += [int]$child.ProcessId
+                }
+            }
+            $pending = $next
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    throw 'No owned console shell appeared for desktop verification.'
+}
 $script:PromptSequence = 0
 try {
+    $desktopName = [IO.File]::ReadAllText((Join-Path $RunRoot 'desktop.txt'))
+    [StaleModesNative]::VerifyDesktop($desktopName, [IntPtr]::Zero)
+    if (-not (Test-Path -LiteralPath (Join-Path $RunRoot 'noctty.portable') -PathType Leaf)) { throw 'Portable marker missing.' }
+    # csc is a console helper too. It runs on the driver's explicit desktop,
+    # CREATE_NO_WINDOW and BELOW_NORMAL_PRIORITY_CLASS, inside the owned job.
+    $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $sourcePath = Join-Path $RunRoot 'mode-fixture.cs'
+    $compilerLog = Join-Path $RunRoot 'compile.log'
+    $compilerCommand = '"{0}" /nologo /target:exe /out:"{1}" "{2}"' -f $compiler, $fixture, $sourcePath
+    $compilerExit = Start-Hidden $compiler $compilerCommand $RunRoot $desktopName -LogPath $compilerLog
+    if ($compilerExit -ne 0 -or -not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+        throw "Console fixture compilation failed (exit $compilerExit); see $compilerLog"
+    }
     $config = Join-Path $RunRoot 'config.ghostty'
     $configText = "auto-update = off`nconfirm-close-surface = false`nwindow-save-state = never`nsingle-instance = false`nclipboard-paste-protection = false`nkeybind = ctrl+v=paste_from_clipboard`n"
+    $instanceClass = 'noctty-test-ctrlc-' + [guid]::NewGuid().ToString('N')
+    $configText += "class = $instanceClass`n"
+    if ($Scenario -eq 'CtrlC') {
+        # No selection/copy branch exists for this key, including on main.
+        # A fresh surface receives no mouse/selection actions. Clear bindings
+        # to exclude clipboard actions while retaining normal key encoding,
+        # including ConPTY's win32-input-mode records when negotiated.
+        $configText += 'copy-on-select = false' + "`n" + 'keybind = clear' + "`n"
+        if ($ConPty -eq 'Inbox') { $env:NOCTTY_CONPTY = 'inbox' }
+        else { Remove-Item Env:\NOCTTY_CONPTY -ErrorAction SilentlyContinue }
+    }
     if ($shell -eq 'pwsh') {
         $integration = Join-Path $RunRoot 'share\ghostty\shell-integration\powershell\integration.ps1'
         if (-not (Test-Path -LiteralPath $integration)) { throw 'Copied PowerShell integration missing.' }
         $bootstrap = Join-Path $RunRoot 'bootstrap.ps1'
-        [IO.File]::WriteAllText($bootstrap, "Import-Module PSReadLine`nSet-PSReadLineOption -HistorySavePath '$RunRoot\history.txt' -HistorySaveStyle SaveNothing`n`$Global:__pkg16_prompt_sequence = 0`nfunction global:prompt { `$Global:__pkg16_prompt_sequence++; [IO.File]::WriteAllText('$RunRoot\prompt.sequence', [string]`$Global:__pkg16_prompt_sequence); 'PKG16> ' }`n. '$integration'`n[IO.File]::WriteAllText('$RunRoot\boot.ready','yes')`n")
+        [IO.File]::WriteAllText($bootstrap, "try {`nImport-Module PSReadLine -ErrorAction Stop`nSet-PSReadLineOption -HistorySavePath '$RunRoot\history.txt' -HistorySaveStyle SaveNothing -ErrorAction Stop`nif ((Get-PSReadLineOption).HistorySavePath -cne '$RunRoot\history.txt' -or (Get-PSReadLineOption).HistorySaveStyle -ne 'SaveNothing') { exit 1 }`n} catch { exit 1 }`n`$Global:__pkg16_prompt_sequence = 0`nfunction global:prompt { `$Global:__pkg16_prompt_sequence++; [IO.File]::WriteAllText('$RunRoot\prompt.sequence', [string]`$Global:__pkg16_prompt_sequence); 'PKG16> ' }`n. '$integration'`n[IO.File]::WriteAllText('$RunRoot\boot.ready','yes')`n")
         $configText += 'command = direct:"' + (Get-Command pwsh.exe).Source + '" -NoProfile -NoLogo -NoExit -ExecutionPolicy Bypass -File "' + $bootstrap + '"' + "`n"
     }
     else { $configText += "command = direct:cmd.exe /d /q`n" }
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
-    $desktopName = [IO.File]::ReadAllText((Join-Path $RunRoot 'desktop.txt'))
-    $app = Start-Hidden $runExe ('"' + $runExe + '" --config-file="' + $config + '"') $RunRoot $desktopName
+    Assert-RuntimeAllowed
+    if ($Scenario -eq 'CtrlC') {
+        $ignore = $ParentCtrlC -eq 'Ignoring'
+        $result.ignoreRequested = $ignore
+        # Set the driver's bit immediately before creating noctty. Setting a
+        # managed CancelKeyPress handler here would not provide this control.
+        $result.controlCallSucceeded = [StaleModesNative]::SetConsoleCtrlHandler([IntPtr]::Zero, $ignore)
+        if (-not $result.controlCallSucceeded) { throw "Driver SetConsoleCtrlHandler failed (Win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." }
+        $result.ignoreApplied = [bool][StaleModesNative]::IgnoreFlag()
+        if ($result.ignoreApplied -ne $ignore) { throw 'Driver ignore state does not match its requested control.' }
+        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $RunRoot 'launch-control.json')
+    }
+    elseif ($Scenario -in @('Modes', 'All')) {
+        # #477: start /b or CREATE_NEW_PROCESS_GROUP may seed this driver
+        # with an inherited ignore bit. Normalize only Modes/All, leaving
+        # the focused CtrlC matrix's explicit Ignoring selection intact.
+        $result.ignoreRequested = $false
+        $result.controlCallSucceeded = [StaleModesNative]::SetConsoleCtrlHandler([IntPtr]::Zero, $false)
+        if (-not $result.controlCallSucceeded) { throw "Enabling controller Ctrl+C failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+        $result.controllerNormalized = $true
+        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $RunRoot 'launch-control.json')
+    }
+    $app = Start-Hidden $runExe ('"' + $runExe + '" --config-file="' + $config + '" --single-instance=false --class=' + $instanceClass) $RunRoot $desktopName
     $appStart = $app.StartTime
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($hostWindow -eq [IntPtr]::Zero) {
-        $hostWindow = [StaleModesNative]::Host($app.Id)
+        $hostWindow = [HiddenDesktopNative]::Host($app.Id)
         if ($app.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'No hidden noctty host appeared.' }
         Start-Sleep -Milliseconds 50
     }
-    $surface = [StaleModesNative]::Surface($hostWindow)
+    $surface = [HiddenDesktopNative]::Surface($hostWindow)
     if ($surface -eq [IntPtr]::Zero) { throw 'No terminal surface appeared.' }
+    [StaleModesNative]::VerifyDesktop($desktopName, $hostWindow)
+    [StaleModesNative]::VerifyDesktop($desktopName, $surface)
+    $result.desktopVerified = $true
     if ($shell -eq 'pwsh') { Wait-Marker (Join-Path $RunRoot 'boot.ready') }
+    if ($Scenario -eq 'CtrlC') { Assert-ShellDesktop }
     Wait-Prompt
     Assert-Enter (Join-Path $RunRoot 'initial-enter')
     Wait-Prompt
     $checks.Add('initial Enter executes shell command')
-    $modeFlags = if ($Scenario -ne 'Paste') { @('31', '1-modifyOtherKeys') } else { @() }
+    if ($Scenario -eq 'CtrlC') {
+        # The fixture queries its actual console server to identify the backend.
+        # DLL presence alone also survives a bundled-to-inbox fallback.
+        $marker = Join-Path $RunRoot 'focused-ctrl'
+        Invoke-Fixture 'interrupt' $marker
+        Wait-Marker ($marker + '.ready')
+        Assert-FixtureContext $marker
+        Assert-RuntimeAllowed
+        [StaleModesNative]::VerifyDesktop($desktopName, $surface)
+        [StaleModesNative]::Key($surface, 67, 3, $true)
+        Wait-Marker ($marker + '.interrupted')
+        $result.fixture.interruptObserved = $true
+        $checks.Add("$ParentCtrlC parent / $ConPty / ${shell}: Console.CancelKeyPress observed Ctrl+C")
+        Wait-Prompt
+        Assert-Enter (Join-Path $RunRoot 'after-ctrl-enter')
+        Wait-Prompt
+        $checks.Add('shell survives native interrupt and executes the next command')
+    }
+    $modeFlags = if ($Scenario -in @('All', 'Modes')) { @('31', '1-modifyOtherKeys') } else { @() }
     foreach ($flags in $modeFlags) {
         foreach ($action in @('exit', 'wait')) {
             $marker = Join-Path $RunRoot "$flags-$action"
@@ -517,7 +768,7 @@ try {
             Wait-Prompt
         }
     }
-    if ($shell -eq 'cmd' -and $Scenario -ne 'Modes') {
+    if ($shell -eq 'cmd' -and $Scenario -in @('All', 'Paste')) {
         $marker = Join-Path $RunRoot 'paste'
         Invoke-Fixture 'paste' $marker
         Wait-Marker ($marker + '.ready')
@@ -543,7 +794,7 @@ catch { $result.error = $_.Exception.Message }
 finally {
     if ($app) {
         try {
-            if (-not $app.HasExited -and $hostWindow -ne [IntPtr]::Zero) { [StaleModesNative]::Send($hostWindow, 0x10, 0, 0) }
+            if (-not $app.HasExited -and $hostWindow -ne [IntPtr]::Zero) { [HiddenDesktopNative]::Send($hostWindow, 0x10, 0, 0) }
             if (-not $app.WaitForExit(10000)) { Stop-Owned $app $runExe $appStart }
         }
         catch { $result.status = 'FAIL'; $result.error = "Cleanup: $($_.Exception.Message); earlier: $($result.error)" }
@@ -551,3 +802,7 @@ finally {
     $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $RunRoot 'result.json')
 }
 if ($result.status -ne 'PASS') { exit 1 }
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

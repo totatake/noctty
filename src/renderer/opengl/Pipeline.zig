@@ -20,6 +20,11 @@ pub const Options = struct {
     /// Whether to enable blending.
     blending_enabled: bool = true,
 
+    /// Whether writes go through `GL_FRAMEBUFFER_SRGB`. Off, an sRGB target
+    /// stores the shader's output as it is and blends with the stored
+    /// (gamma-encoded) bytes, which is how the split dim blends in sRGB space.
+    framebuffer_srgb: bool = true,
+
     pub const StepFunction = enum {
         constant,
         per_vertex,
@@ -36,6 +41,8 @@ vao: gl.VertexArray,
 stride: usize,
 
 blending_enabled: bool,
+
+framebuffer_srgb: bool,
 
 pub fn init(comptime VertexAttributes: ?type, opts: Options) !Self {
     // Load and compile our shaders.
@@ -66,6 +73,7 @@ pub fn init(comptime VertexAttributes: ?type, opts: Options) !Self {
         .vao = vao,
         .stride = if (VertexAttributes) |VA| @sizeOf(VA) else 0,
         .blending_enabled = opts.blending_enabled,
+        .framebuffer_srgb = opts.framebuffer_srgb,
     };
 }
 

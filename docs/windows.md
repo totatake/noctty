@@ -98,8 +98,9 @@ fault-injection controls are absent from normal builds. Run
 `test/windows/renderer/Invoke-RendererParity.ps1` against the resulting
 executable; it copies a portable run, redirects app data, and uses a hidden
 desktop. On ARM64/hosts without a suitable OpenGL driver, `-WarpOnly` runs the
-software-rendering lifecycle smoke, including failed GL image/effect fallback,
-without claiming cross-backend parity. The Windows ARM64 workflow runs that
+software-rendering lifecycle smoke, including failed GL image/effect fallback
+and the command palette's theme preview, cancel and commit read back from the
+renderer's frames, without claiming cross-backend parity. The Windows ARM64 workflow runs that
 smoke on a native `windows-11-arm` runner; hardware Direct3D 11 on a Snapdragon
 GPU has not been measured.
 
@@ -183,10 +184,14 @@ checksummed and bound to the canonical release workflow by GitHub build
 provenance. The legacy `SHA256SUMS.txt` file remains an x64 auto-update
 compatibility alias.
 
-A Chocolatey package (`noctty`) is built by the release workflow but has not
-been published yet, so `choco install noctty` does not work today. It will
-after the first push clears chocolatey.org moderation, which can take weeks;
-until a version is approved, later pushes are refused with `403`. See
+The Chocolatey package (`noctty`) is approved on chocolatey.org:
+`choco install noctty` installs it (1.3.134 was approved on 2026-10-23). The
+release workflow builds it and pushes it after WinGet, and Chocolatey reviews
+each version before listing it, so a release can reach Chocolatey after the
+other channels. The package runs the release's setup program for the
+architecture of the machine. On ARM64 Windows it picks the ARM64 one by asking
+the CPU, from the first release built after 1.3.134 (the 1.3.134 package
+installs the x64 build there); see
 [chocolatey-publishing.md](chocolatey-publishing.md).
 
 [getting-started.md](getting-started.md) covers download and install,
@@ -200,13 +205,13 @@ XDG helpers still honor `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and
 `XDG_CACHE_HOME` when set on Windows; `%LOCALAPPDATA%` is the fallback in
 the normal packaged app environment.
 
-| Path                                       | Purpose                                                                                                                                                                                                                                                           |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                                             |
-| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`.                              |
-| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                                                 |
-| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                                                        |
-| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                                                        |
+| Path                                       | Purpose                                                                                                                                                                                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `%LOCALAPPDATA%\noctty\config.ghostty`     | User config, written on first launch.                                                                                                                                                                                                |
+| `%LOCALAPPDATA%\noctty\session-state.json` | Window, tab, split, profile, cwd, and title restore state, saved only by the noctty process that owns it (see Session restore and recovery), and never in safe mode, when elevated through UAC, or with `window-save-state = never`. |
+| `%LOCALAPPDATA%\noctty\layouts\`           | Named layouts, stored as one-window session-state JSON documents.                                                                                                                                                                    |
+| `%LOCALAPPDATA%\noctty\crash\`             | Local crash dumps. Nothing here is uploaded automatically.                                                                                                                                                                           |
+| `%LOCALAPPDATA%\noctty\shell-integration\` | Installed shell-integration payloads and manual fallbacks.                                                                                                                                                                           |
 
 [PRIVACY.md](../PRIVACY.md) describes the other files and registry entries
 noctty writes, including the jump list, command palette history, and update
@@ -250,7 +255,8 @@ new guard. Command text, `PATH`, `PATHEXT`, variable expansion, builtins and
 literal `%` or `!`. Explicit paths such as `.\tool`, and explicitly configured
 relative PATH entries such as `.`, still select programs relative to the pane.
 
-With `command` unset, a new tab runs the first of these that is found:
+With `command` and [`default-profile`](#default-profile-order-and-hidden-profiles)
+unset, a new tab runs the first of these that is found:
 
 1. `pwsh.exe` (PowerShell 7+) on `PATH`.
 2. Windows PowerShell, from the Windows system directory.
@@ -272,8 +278,11 @@ lists the executable a new tab runs. `noctty --safe-mode` always starts
 broke, and Command Prompt loads no profile (`/D` also skips the `AutoRun`
 command that a registry value or Clink can hang there). The profile
 picker, its dropdown check mark and a right or middle click on the new-tab
-button start on the profile this default runs; a `command` you set does not
-move that choice.
+button start on the profile this default runs, or on the one
+`default-profile` names; a `command` you set does not move that choice. Once
+you choose a profile in the picker, the palette or a quick slot, they start on
+that one instead, and a reload that changes `default-profile` moves them only
+until you do.
 
 Discovery also skips drive aliases that map to a folder, such as `subst` drives.
 In safe mode, right or middle click deliberately opens the plain Command Prompt
@@ -296,6 +305,14 @@ The profile picker detects:
 - Command Prompt (`cmd.exe`)
 - Git Bash
 - WSL distributions, when `wsl.exe` is installed and responsive
+
+A shell you open from the picker, the command palette or a quick slot starts
+in your home folder (a WSL one in its Linux home, `--cd ~`), whatever
+`working-directory` says and whichever folder noctty itself was started from
+(for the Start menu shortcut, the install folder). To start one somewhere
+else, define it as a [user profile](#user-profiles) with
+`profile-working-directory`. A restored pane goes back to the last folder its
+shell reported.
 
 Shell integration is automatic for PowerShell and for directly launched
 Unix-like shells such as Git Bash. WSL sessions manage their own
@@ -344,6 +361,20 @@ retain the PROMPT fallback and C/D hooks. Exit codes are truthful only while Cli
 navigation and cwd reporting still work, but there are no command-finish marks
 or exit codes.
 
+After a resize at a Clink prompt, the prompt is on screen once. Clink moves up
+to where its prompt starts after every resize, clears below and draws the
+prompt and the line you were typing again, and a theme that calls
+`clink.refilterafterterminalresize()` gets its prompt filters run again, and its
+prompt drawn again, once the size has held for 1.5 seconds. The prompt marks
+keep `redraw=0`, so noctty leaves the old prompt in place for Clink to draw
+over: measured with Clink 1.9.34, clearing it first (the OSC 133 default) made
+Clink start its redraw one row too high and overwrite the line above the
+prompt. One limit is Clink's own: with a prompt wider than the window and a
+line typed after it, narrowing makes Clink scroll the line sideways, and
+widening again can leave the prompt's first row on screen twice. ConPTY's own
+console buffer holds the same duplicate, so noctty shows what the console
+holds.
+
 Caveats: on a UNC working directory `$P` yields `\\server\share\dir`, which
 noctty reports unchanged, but cmd.exe itself cannot use a UNC cwd (it warns and
 falls back), so a new cmd tab or split will generally not land on the share. A
@@ -387,8 +418,8 @@ as `/d`, `/q`, and `/v:on` are kept in order ahead of it, and it is a no-op
 when the console already uses code page 65001. The PowerShell half runs inside
 the injected shell-integration script, so it does nothing with
 `shell-integration = none` or a command line that injection declines
-(`-Command`, `-File`, `-EncodedCommand`, `-NonInteractive`). WSL and Git Bash
-are unaffected.
+(`-Command` other than a Developer PowerShell's, `-File`, `-EncodedCommand`,
+`-NonInteractive`). WSL and Git Bash are unaffected.
 
 WSL appears in the picker but never becomes the default shell implicitly,
 because `wsl.exe --status` can report a healthy installation even when
@@ -405,26 +436,53 @@ does. `wsl.exe` passes a Linux process only the Windows variables that
 flag so that a Windows program started from inside WSL does not get the Linux
 values back. It adds `TERM` too when the distribution has a terminfo entry for
 noctty's `term`, which noctty asks the distribution itself with `infocmp`; the
-answer for an explicitly selected distribution is remembered until noctty
-exits, so install the entry first, then start noctty again. An implicit
-distribution is probed for each launch, so changing WSL's default while
-noctty runs cannot reuse the previous distribution's answer. To give a
-distribution the entry, compile
+answer is remembered until noctty exits, so install the entry first, then
+start noctty again. For an implicit distribution, noctty reads the current
+default's ID from `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`
+(`DefaultDistribution`) and includes it in the cache key. A different default
+ID uses a separate cache entry. The probe reads that registration's
+`DistributionName` and selects it with `--distribution <name>`; a changed name
+also uses a separate entry. If a recheck observes a different default or name,
+that launch keeps the fallback.
+The session itself stays implicit, so a concurrent change after the final
+check can still affect which distribution starts. If the ID or name cannot be
+read or the name is outside WSL's `[A-Za-z0-9._-]` character set (1–256
+characters), the launch uses an unpinned, uncached probe. No registry value is
+changed.
+The long name selector and `--exec` are documented since
+[Windows build 17666](https://learn.microsoft.com/en-us/windows/wsl/release-notes#build-17666),
+before noctty's Windows 10 1809 floor. Noctty does
+not inject `--distribution-id`, which was added in
+[WSL 2.4.4 (pre-release)](https://github.com/microsoft/WSL/releases/tag/2.4.4)
+and first shipped in a stable release with
+[WSL 2.4.10](https://github.com/microsoft/WSL/releases/tag/2.4.10).
+To give a distribution the entry, compile
 `share/terminfo/ghostty.terminfo` from the noctty folder with `tic -x` inside
 it. Without the entry `TERM` stays `xterm-256color`, the value `wsl.exe` sets,
 and the other three are still forwarded. The first WSL tab of a stopped
-distribution waits for it to start, up to 15 seconds, before its shell
-appears; if it has not answered by then, that run keeps `xterm-256color`.
+distribution waits up to 15 seconds for the probe, plus up to 5 seconds for
+termination cleanup, before starting its shell. Tabs already waiting on that
+probe share its outcome; if it times out, they all keep `xterm-256color`
+without starting another probe. A new launch can try again. Timeouts and WSL's
+own failures (exit `-1`, including an invalid command-line argument) are not
+cached as missing terminfo.
 Entries already in `WSLENV`, their flags and their order are kept, and a
 `WSLENV` set with `env` in the configuration is the one extended. A `TERM` set
-with `env` is forwarded as it is. A WSL shell started from inside cmd or
-PowerShell is not changed: only a launch of `wsl.exe` by noctty is.
+with `env` is forwarded as it is. To keep one of these variables out of WSL,
+list it with `/w`, for example `env = WSLENV=TERM_PROGRAM/w`. A pane that
+noctty starts with WSL's older `bash.exe` launcher (the one in the Windows
+folder, or the WindowsApps alias; a bare `bash` counts when the first `bash` on
+the pane's `PATH` is that launcher) gets the same three variables, but noctty
+does not ask its distribution for a terminfo entry, so its `TERM` stays
+`xterm-256color` unless `env` sets one. Other ways into WSL are not changed: a
+distribution's own launcher such as `ubuntu.exe`, `cmd /c wsl`, and a WSL
+shell started from inside cmd or PowerShell.
 
 An existing `/w` entry stays Windows-only; noctty does not override that
 choice. Automatic `TERM` probing uses the launch environment and working
 directory, including `--cd`, and caches answers separately for different
-environments or directories for explicit distribution selections. The
-optional probe resolves only a local `.exe`;
+environments or directories, including for implicit distribution selections.
+The optional probe resolves only a local `.exe`;
 if resolution would need a network/device path, a mapped network drive, or
 reparse traversal (including directory symlinks and junctions),
 it keeps the fallback. For shell-form commands, automatic `TERM` is limited
@@ -485,14 +543,593 @@ turns the file into a one-click surface.
 SSH entries run without shell integration, which is injected into a local
 shell and cannot apply to a remote session. Session restore does not reopen
 them: an SSH pane comes back as the default shell rather than dialing out
-unattended. SSH entries sort after the detected shells;
-`NOCTTY_WIN32_PROFILE_ORDER` covers shell profiles only. There is no bundled
-SSH client, secrets vault, or fleet/connection management.
+unattended. Restore does not connect for `default-profile = ssh:<alias>`
+either: a restored pane that would run it gets the automatic shell, while a
+new tab or window still connects. SSH entries sort after the detected shells,
+your own [user profiles](#user-profiles) and the
+[Visual Studio developer shells](#visual-studio-developer-shells). `profile-order` can move any
+profile, an SSH entry included, and `profile-hidden` can take one out of the
+lists (see [Default profile, order and hidden profiles](#default-profile-order-and-hidden-profiles)).
+The older `NOCTTY_WIN32_PROFILE_ORDER` environment variable is used only when
+`profile-order` is unset, and orders the detected shell profiles only. There
+is no bundled SSH client, secrets vault, or fleet/connection management.
+
+## Visual Studio developer shells
+
+When Visual Studio 2017 or later is installed, the profile picker and the
+command palette also list each instance's developer shells, as Windows
+Terminal does:
+
+- **Developer Command Prompt for VS 18** runs
+  `cmd.exe /k ""<install>\Common7\Tools\VsDevCmd.bat" -startdir=none -arch=x64 -host_arch=x64"`.
+  The extra pair of quotes, which cmd takes off, keeps an install path with
+  `&` or `^` (or with a parenthesis and no space) whole, where Windows
+  Terminal's line splits it.
+- **Developer PowerShell for VS 18** runs PowerShell 7 when it is installed,
+  else Windows PowerShell, as
+  `-NoExit -Command "&{Import-Module '<install>\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'; Enter-VsDevShell '<instance id>' -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'}"`.
+
+The name ends in the product line (`2022`, `18`), then the instance's
+nickname in parentheses when it has one, else a channel other than Release in
+brackets (`[Preview]`). Both shells start in your home directory
+(`-startdir=none` and `-SkipAutomaticLocation` keep the scripts from moving
+it) and set up the tools for the architecture noctty runs on: x64, or on ARM64
+`-arch=arm64` with `-host_arch=arm64` from Visual Studio 17.4 (`x64` before,
+when its tools ran only under emulation). A shell is listed only when its
+script is there (`VsDevCmd.bat`; the DevShell module, which Developer
+PowerShell needs and which came with 16.2), and only for an install on a local
+drive, reached without a junction or symbolic link.
+
+noctty asks Visual Studio's Setup Configuration API (the one `vswhere` and
+Windows Terminal use), which reads what the Visual Studio Installer recorded.
+Nothing is started to find the instances: not `vswhere`, `VsDevCmd.bat` or
+`Enter-VsDevShell`. A machine without Visual Studio lists none and reports
+nothing.
+
+```
+# One of newest (the default), all or none:
+visual-studio-profiles = all
+```
+
+- `newest` lists the newest instance's pair and hides the others, as Windows
+  Terminal does: a hidden pair is not in the picker, the palette, the jump list
+  or the quick slots, but a saved session or `default-profile` that names one
+  still starts it. If the newest instance has neither script, the next one
+  that has one is shown.
+- `all` lists every instance, newest first (by version, then by install date).
+- `none` lists none, and Visual Studio is not asked.
+
+Their keys are `vs:<instance id>:cmd` and `vs:<instance id>:pwsh`, where the
+instance id is the one Setup Configuration gives (eight hex digits, the
+`Enter-VsDevShell` argument above). It stays the same across Visual Studio
+updates, so a saved session, `default-profile = vs:<instance id>:cmd`,
+`profile-order` and `profile-hidden` keep naming the same install. Session
+restore brings these panes back. They are listed after your own user profiles
+and before the SSH hosts.
+
+`vs:newest:cmd` and `vs:newest:pwsh` name the newest instance's shells in
+`default-profile`, `profile-order` and `profile-hidden`, so such a line keeps
+working after Visual Studio is reinstalled or on another machine. A key that
+names one profile directly, as `new_window_elevated:<key>` does, needs the
+instance id. A pane started this way remembers the instance it ran. They
+name the first instance, newest first, that has that shell, whether
+`visual-studio-profiles` shows it or not; under `none` they name nothing.
+When Setup Configuration answers only in part (an instance it could not
+read is left out), `default-profile = vs:newest:...` is not used, since the
+newest instance may be the one missing: the automatic default starts, the
+config's problems say why, and a reload asks again. A `vs:<instance id>`
+key that came back still starts.
+
+```
+default-profile = vs:newest:cmd
+profile-hidden = vs:newest:pwsh
+```
+
+New Elevated Window for one of these shells names it to the elevated process
+(`--default-profile=vs:<instance id>:cmd`), which finds the instance itself, so
+the `cmd.exe /k` line above reaches it as written. A `--visual-studio-profiles`
+option on noctty's command line is passed on with it. When UAC would run the
+elevated window as another account (a standard user entering an
+administrator's credentials), that account reads its own config, which may
+say `visual-studio-profiles = none`, so the shell's command is passed instead
+(`--command=direct:...`), quoted again in the standard way. cmd then mangles
+an install path with `&` or `^` in it, or one with no space and `(`, `;`, `,`
+or `=`. That case was not run here (it needs a second account at the UAC
+prompt).
+
+The Developer Command Prompt gets cmd's shell integration. The Developer
+PowerShell gets PowerShell's, which Windows Terminal does not give it: noctty
+runs the `-Command` script above first, exactly as it runs on its own, and
+loads the integration after it. Its prompts then carry OSC 133 marks and
+report the folder with OSC 7, so a split of it runs the same Developer
+PowerShell in the folder it is in (`-SkipAutomaticLocation` keeps it there), a
+new tab opens your default shell there, and a restored pane goes back to it.
+With `shell-integration = none` the script runs alone, as before. If your
+PowerShell profile sets `$ErrorActionPreference = 'Stop'` and the script fails
+(the module cannot be loaded, or `Enter-VsDevShell` reports an error), that
+error ends the `-Command` script before the integration loads.
+
+That script is the one `-Command` line noctty adds integration to, because
+noctty wrote it and it changes nothing the integration relies on (the prompt,
+the folder). noctty recognises it by its exact form, wherever the line comes
+from, so a user profile, a `command` line or `-e` that uses exactly the
+generated line also gets the integration (`shell-integration = none` turns it
+off). The recognised forms are the generated line for any install path and
+instance id with one of the three architecture pairs noctty generates
+(`-arch=x64 -host_arch=x64`, `-arch=arm64 -host_arch=arm64` and
+`-arch=arm64 -host_arch=x64`), whichever architecture noctty itself runs on.
+Any other `-Command` line runs as written without marks, including the line
+Windows Terminal generates (which quotes with `"""`). To change a shell
+(another architecture, another start directory), define a
+[user profile](#user-profiles) with your own line and hide the generated one
+with `profile-hidden`; a changed line runs without marks unless it still
+matches one of the recognised forms (switching among those three architecture
+pairs, for example, keeps the marks).
+
+## User profiles
+
+Besides the shells it detects, the profile picker and the command palette
+list profiles you define in your config. A profile has an id, and every line
+that belongs to it starts with that id and a colon. One line is enough:
+
+```
+profile-command = py312: cmd.exe
+```
+
+That adds a profile shown as `py312` that runs Command Prompt. More lines give
+it a label, a starting folder and environment variables:
+
+```
+profile-command = py312: cmd.exe
+profile-name = py312: Python 3.12
+profile-working-directory = py312: %USERPROFILE%\src
+profile-env = py312: PATH=C:\Python312;C:\Python312\Scripts;%PATH%
+```
+
+noctty lists [Visual Studio's developer shells](#visual-studio-developer-shells)
+by itself. To make one of them what new tabs open, write
+`default-profile = vs:newest:cmd`.
+
+### The four lines
+
+- `profile-command` defines the profile. Its value is a Windows command line,
+  the same text as the Command line of a Windows Terminal profile or a
+  shortcut's Target. Everything after the id's colon is used exactly as
+  written: nothing is unquoted or unescaped. noctty starts the program with
+  that line, without a `cmd.exe /C` wrapper, so cmd.exe's own quoting reaches
+  cmd.exe unchanged. When noctty has to change the arguments (PowerShell shell
+  integration, the WSL directory option, the UTF-8 preamble of a plain
+  `cmd.exe`), the changed arguments are quoted again in the standard way. The
+  `direct:` and `shell:` forms of `command` are not accepted here.
+- `profile-name` is the label in the picker and the palette. Without it the id
+  is shown. Quotes around the whole label are removed.
+- `profile-working-directory` takes the values `working-directory` takes:
+  `home`, `inherit`, or a folder (`~/` is your home folder; forward slashes
+  work; a folder with spaces needs no quotes). Without it, a profile opened
+  from the picker or the palette starts in your home folder. `home` and a
+  folder also hold for a split of the profile, though a split still takes its
+  source pane's folder when `split-inherit-working-directory` is on. For a
+  profile that runs `wsl.exe`, home is the Linux home folder (`--cd ~`), as
+  for a detected WSL profile. `inherit` follows the current tab's folder where
+  the `*-inherit-working-directory` settings allow it. With no tab to follow,
+  the `working-directory` setting decides (by default, the folder noctty was
+  started from).
+- `profile-env` sets one environment variable for this profile,
+  `<id>: KEY=VALUE`. Repeat it for more. Names are compared without case, as
+  Windows does: a later `Path=` replaces an earlier `PATH=`, and a profile
+  `PATH` replaces a `Path` set with `env`. `<id>: KEY=` takes back this
+  profile's `KEY`, for example one a shared file set. It does not remove a
+  variable that `env` or Windows gives every shell. `<id>:` takes back all of
+  the profile's variables. A profile `PATH`, like an `env` one, is the whole
+  `PATH` the shell gets: noctty no longer puts its own folder first, and
+  `%PATH%` holds that folder only where your `PATH` already does. If you run
+  `noctty` from such a profile's shell, put the folder in the value yourself;
+  `GHOSTTY_BIN_DIR` still names it.
+- `%NAME%` in `profile-command`, `profile-working-directory` and `profile-env`
+  values is replaced by the value the shell would get without this profile:
+  Windows' variables with your `env` lines applied. So `%PATH%` keeps your
+  search path, including folders an `env` line put on it, and `%USERPROFILE%`
+  is your user folder. A name that is not set stays as written. Each value is
+  replaced once, so a profile cannot use a variable it sets itself. `env`
+  values are not expanded: `env = PATH=C:\tools;%PATH%` passes the text
+  `%PATH%`. Quote a path holding a variable that may expand to spaces:
+  `"%USERPROFILE%\tools\init.cmd"`.
+
+Only whole lines that start with `#` are comments. A `#` later in a line is
+part of the value. A line can be at most 4094 bytes long; a longer one is
+reported and skipped.
+
+### Ids, renaming and removing
+
+Ids are 1 to 64 ASCII letters, digits, `.`, `_` or `-`, compared without case.
+Some are taken because they already name a detected profile or a reference:
+`pwsh.exe`, `powershell.exe`, `cmd.exe`, `git-bash`, `wsl-default`, `pwsh`,
+`powershell`, `powershell-7`, `powershell-core`, `windows-powershell`, `ps`,
+`git`, `gitbash`, `cmd`, `command-prompt`, `wsl`, `default-wsl`,
+`wsl-distro`, `distro`, `user`, `ssh` and `vs`.
+
+Saved sessions and layouts remember a profile by its id, so change
+`profile-name` freely. A new id is a new profile: saved tabs of the old one
+open your `default-profile`, or the automatic shell when none is set.
+
+`profile-command = <id>:`, with nothing after the colon, removes a profile
+together with its other lines, including lines a file read later adds for it.
+`profile-command =` removes every profile defined before it. A later
+`profile-command` line for the same id brings the profile back, with its other
+lines.
+
+A line that cannot be used is reported as a config problem with its file and
+line, and ignored: one without an id (a forgotten id often looks like a drive
+letter, `profile-command = C:\Tools\x.exe`), a taken id, a `direct:` or
+`shell:` command, a command with no program, or text that is not UTF-8
+(save the file as UTF-8). The message never shows the rest of the line, which
+may hold a token. A `profile-name`, `profile-working-directory` or
+`profile-env` line whose id no `profile-command` line names is reported too.
+A command that is empty only once its `%NAME%` variables are expanded is left
+out of the picker and written to the log.
+
+### cmd.exe quoting and copying from other terminals
+
+**cmd.exe quoting.** cmd.exe reads its own command line with its own rules.
+If the path of the batch file after `/k` holds `&` or `^`, or holds `(`, `;`,
+`,` or `=` and no space, cmd splits the path: it reports something like
+`'D:\R' is not recognized`, or runs the wrong thing. Put one more pair of
+quotes around everything after `/k`, which cmd takes off again:
+
+```
+profile-command = vs19: cmd.exe /k ""D:\R&D Tools\BuildTools\Common7\Tools\VsDevCmd.bat" -startdir=none -arch=x64 -host_arch=x64"
+```
+
+This form works for any path, so you can always use it.
+
+**From Windows Terminal.** Copy the Command line field from the profile's page
+in Windows Terminal's Settings, which shows the line itself. If you copy from
+settings.json instead, first turn each `\"` into `"` and each `\\` into `\`.
+`startingDirectory` becomes `profile-working-directory`, and each
+`environment` entry becomes a `profile-env` line. Icons and appearance do not
+carry over.
+
+**From WezTerm.** Write `args` as one command line. Separate the strings with
+spaces, and put a string that holds a space in double quotes. Inside such a
+string, write each `"` as `\"`; single quotes do not group anything on a
+Windows command line. An empty string is `""`, and a quoted string that ends
+in `\` needs `\\` before its closing quote. `cwd` becomes
+`profile-working-directory`, each `set_environment_variables` entry becomes a
+`profile-env` line, Lua's `\\` is `\`, and `.. os.getenv('PATH')` is
+`%PATH%`. For example:
+
+```lua
+args = { 'pwsh.exe', '-NoLogo', '-NoExit', '-Command', '& { Import-Module "C:/Tools/My Module.dll" }' },
+```
+
+```
+profile-command = devps: pwsh.exe -NoLogo -NoExit -Command "& { Import-Module \"C:/Tools/My Module.dll\" }"
+```
+
+These are the standard Windows rules, which PowerShell, Python and most
+programs follow. cmd.exe has its own rules (above).
+
+### Shared files, and sharing a config with Ghostty
+
+A file named with `config-file` is read after the whole file that names it, so
+a line in your main config cannot change what that file sets. Put your changes
+in a second file listed after it:
+
+```
+config-file = team.ghostty
+config-file = mine.ghostty
+```
+
+```
+# team.ghostty
+profile-command = buildbox: ssh.exe build-01
+profile-command = legacy: cmd.exe /k C:\legacy\env.cmd
+```
+
+```
+# mine.ghostty
+profile-command = legacy:
+profile-name = buildbox: Build Box (mine)
+profile-working-directory = buildbox: C:\src
+```
+
+The ids are the words before the colon on the shared file's `profile-command`
+lines. Everything you do not change, and whatever the team adds later, still
+comes from the team's file. On noctty's command line, `--profile-*` options
+also lose to included files, so define profiles in files.
+
+Ghostty on macOS or Linux reports every line it does not know, in any file it
+reads, and `config-file = ?x` only skips a file that does not exist. If you
+share `ghostty\config` with Ghostty on another machine, put profile lines in
+`%LOCALAPPDATA%\noctty\config.ghostty`, which noctty reads after
+`ghostty\config` and Ghostty never reads.
+
+### Order, restore and limits
+
+User profiles are listed after the detected local shells and before Visual
+Studio's developer shells and the SSH hosts, in the order of their first
+`profile-command` line, unless
+`profile-order` moves them (below). A session or a named layout remembers a
+pane's profile by its id (`user:<id>`); a saved pane that names an id that is
+gone, or removed, comes back running your `default-profile` (or the automatic
+shell when none is set), as a pane whose shell was uninstalled does. A restored pane returns to the directory it was in. A tab or
+split that an automation command opens from a user profile pane keeps the
+command and environment that pane started with, even after a reload; an
+ordinary split reads the profile's current definition.
+
+### Default profile, order and hidden profiles
+
+```
+default-profile = py312
+profile-order = py312
+profile-order = pwsh
+profile-hidden = wsl:docker-desktop
+```
+
+`default-profile` names the profile a terminal runs when nothing else chose
+one, in place of the automatic shell above: the first window, a new tab
+(Ctrl+Shift+T), a new window, the quick terminal, a split of a pane that runs
+no profile, and a restored pane whose profile no longer exists. It brings the
+profile's command, its `profile-env` variables and its
+`profile-working-directory`; a profile without a directory of its own starts
+where `working-directory` and the `*-inherit-working-directory` settings say,
+as `command` does. A directory the launch asks for with `--working-directory`
+(Explorer's "Open noctty here", a jump-list recent folder, or the option on a
+second `noctty` that hands its arguments to a running one), or the directory
+`noctty +new-window` runs in, wins over the profile's
+`profile-working-directory`. A second `noctty` that names no directory (from
+the Start menu, say) opens in the profile's directory, as the first one did.
+An SSH profile always starts in your user profile directory. The pane remembers the profile, so its splits
+and a restored session run it again (except a detected `ssh:` profile, which
+restore never reconnects; a user profile that runs `ssh.exe` is restored like
+any other), and the profile picker opens on it until you choose another there.
+
+Settings sets it too: Shell > Default profile lists Automatic and the
+profiles the picker shows. Choosing one writes a single `default-profile`
+line with the profile's key (`user:py312`, `pwsh.exe`, `wsl:Ubuntu`), so
+renaming the profile keeps it selected; Automatic removes the
+`default-profile` lines from the file Settings saves to. A value the file
+already has stays as written until you choose another profile. One that
+starts a profile the list does not show (an `ssh:` alias that is not in your
+SSH config) shows that profile's name, and one that names nothing that can
+start here (an `ssh:` value where `ssh.exe` cannot be found, say) is shown as
+written, marked "(not found)". A `vs:` value that could not be looked up
+when the config was read (Visual Studio's Setup Configuration did not answer
+in full) is shown as written, without the mark, until a reload asks again.
+A Default command, when set, wins over it, as the table below says.
+
+The dropdown's profiles are the ones the open terminal windows have found.
+With no terminal window open (Settings alone), or until the first window's
+search for shells finishes, it shows only Automatic and the saved value. A
+window opened from a taskbar profile entry or with New Elevated Window runs the
+profile it was opened for, but its Settings shows and saves the
+`default-profile` of your config files: a choice saved there is written to
+the file, while new tabs in that window keep starting the profile it was
+opened for.
+
+`profile-order` lists profiles first in the picker and the palette, in the
+order of its lines, and `profile-hidden` takes profiles out of the picker, the
+palette, the [▾] menu, the taskbar jump list and the quick slots. A hidden
+profile still runs where something names it: `default-profile`, a restored
+session or layout, `new_window_elevated:<key>`, a split of a pane that runs
+it. A quick slot pinned to it keeps the pin but does not show it.
+
+All three take a profile by its key: the id of one of your profiles (`py312`,
+or `user:py312`), a detected profile's key (`pwsh.exe`, `powershell.exe`,
+`cmd.exe`, `git-bash`, `wsl-default`, `wsl:<distribution>`, `ssh:<alias>`,
+`vs:<instance id>:cmd`, `vs:<instance id>:pwsh`), `vs:newest:cmd` or
+`vs:newest:pwsh` for the newest Visual Studio, or a short name (`pwsh`,
+`powershell`, `git`, `cmd`, `wsl`). In `profile-order`
+and `profile-hidden`, `wsl` names every WSL profile. A WSL distribution is
+always written `wsl:<distribution>`. Labels are not references, because they
+can change. `noctty +list-profiles` prints the keys
+(see [Listing profiles](#listing-profiles)). A value that cannot name a profile (a typo, an id no
+`profile-command` line defines, a comment after the value) is reported as a
+config problem. One that names a shell this machine does not have
+(`wsl:docker-desktop`, an `ssh:` host, a `vs:` key) is not, so a shared config
+loads quietly everywhere. `default-profile` finds its profile without listing any:
+`wsl:Ubuntu` starts `wsl.exe -d Ubuntu` without asking WSL for its
+distributions, and `ssh:<alias>` starts `ssh.exe <alias>` without reading the
+SSH config. A `default-profile` that names no profile that can start here is
+reported as a config problem, and the automatic shell runs. If Visual Studio's
+Setup Configuration fails when a `vs:` key is looked up, that is reported
+instead, and the automatic shell runs until the config is reloaded.
+`NOCTTY_WIN32_DEFAULT_PROFILE` still chooses where the picker starts when
+`default-profile` is unset, and `NOCTTY_WIN32_PROFILE_ORDER` still orders the
+detected shells when `profile-order` is unset.
+
+What a new terminal runs, highest first:
+
+| Rank | Setting                   | Where it applies                                                                                                                                                                                                                                                                                  |
+| ---- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `initial-command`, `-e`   | The first window of the launch only.                                                                                                                                                                                                                                                              |
+| 2    | Session or layout restore | The profile and the directory the pane was saved with. A pane whose profile is gone, or an SSH pane (never reopened), falls through to rank 4 or below, in its saved directory; an SSH `default-profile` is skipped there (rank 6).                                                               |
+| 3    | A profile you choose      | The picker, the palette, a quick slot, the [▾] menu, `new_window_elevated:<key>`, and a tab or split an automation command opens from a pane (it keeps that pane's launch).                                                                                                                       |
+| 4    | `command`                 | From any config file or the command line. Set in a file together with `default-profile`, it wins and the unused `default-profile` is reported as a config problem; `--command` on the command line wins without one, and `--command=` (empty) undoes any file's `command`, an included one's too. |
+| 5    | `default-profile`         | Everything else: a new tab, a new window, the quick terminal, a split of a pane that runs no profile.                                                                                                                                                                                             |
+| 6    | The automatic shell       | PowerShell 7, else Windows PowerShell, else Command Prompt.                                                                                                                                                                                                                                       |
+
+Safe mode reads none of your config, so it never runs a default profile.
+`default-profile`, `profile-order` and `profile-hidden` are not accepted from
+a second `noctty` that hands its arguments to a running one (single-instance
+forwarding). On the command line, `default-profile`, `command` and
+`initial-command` win over those lines in a file included with
+`config-file`, which is otherwise read after the command line. A command-line
+`command` or `initial-command` that is refused (`--command=direct:`) is
+reported and ignored, so the last value the command line gave that is
+accepted is the one that wins. `-e` wins over those lines too, with or
+without a theme: its command and the settings it implies are applied again
+once every config file has been read. An `-e` with nothing after it is
+refused and changes nothing. A launch that names a
+profile with `--default-profile` (a jump-list entry for a user profile)
+starts without the saved session, as `-e` does.
+
+Limits:
+
+- New Elevated Window for one of your profiles (`new_window_elevated:user:<id>`,
+  or New Elevated Window from a pane that runs it) names the profile
+  (`--command= --initial-command= --default-profile=user:<id>`), as a taskbar
+  entry does. A Visual Studio shell is named the same way
+  (`--default-profile=vs:<instance id>:cmd`); it has no variables, and the
+  account rule below applies to it too (see
+  [Visual Studio developer shells](#visual-studio-developer-shells)). The
+  elevated process reads the same config files and starts the profile
+  itself, so its command line and variables reach it as written, a
+  `command` or `initial-command` line in an included file does not replace
+  it, and none of them appear on the elevated command line. It applies to the
+  whole elevated window, not only its first pane. `%NAME%` in the profile's
+  lines then reads the elevated process's own environment, which Windows
+  builds for the elevated token rather than copying noctty's: a variable that
+  only the shell that started noctty set is not there (an `env` line is). A
+  profile defined only by a
+  `--profile-command` option on noctty's command line, or given a variable by
+  a `--profile-env` option there, or any profile when that command line has
+  an `--env` option (which `%NAME%` may read), or any of your profiles when
+  UAC would run the elevated window as another account (a standard user entering an
+  administrator's credentials; that account reads its own config files, which
+  need not define the profile), is still passed as
+  arguments (`--command=direct:...`, quoted again in the standard way, an empty `--initial-command=`, and
+  `--elevated-profile-env=...`), which process tools and process-creation
+  auditing can read, so do not keep a secret in such a profile's
+  `profile-env`. A default profile is passed the same way as any other.
+- An elevated user profile starts in the directory of the pane it was opened
+  from, as every elevated window does, not in its `profile-working-directory`.
+- Profile lines take effect at a config reload. Previewing a theme in the
+  command palette reads the config files again but keeps the profiles (and the
+  `env` lines their `%NAME%` reads) the running config has. Choosing a theme
+  other than the saved one saves it and reloads the config, which applies
+  profile lines edited since, as any reload does.
+- PowerShell shell integration (OSC 133 and OSC 7 marks) is added only to an
+  interactive PowerShell line. A line with `-Command` or `-File` runs as
+  written without it, as in Windows Terminal, unless it is exactly the
+  Developer PowerShell line noctty builds (see
+  [Visual Studio developer shells](#visual-studio-developer-shells)). A
+  cmd.exe line gets cmd's integration.
+- A user profile's taskbar jump-list entry names the profile
+  (`--command= --initial-command= --default-profile=user:<id>`) rather than
+  carrying its command and variables, so the new process reads the profile
+  from your config files; the empty values undo a `command` or
+  `initial-command` line in any of them. A profile defined only in a file the
+  running noctty was given with `--config-file` is not known to it.
+- A profile that runs `ssh.exe` is restored with the session like any other
+  profile; a detected `ssh:` profile is not.
+- The Settings window edits the `profile-*` lines on its Profiles page (see
+  [Editing profiles in Settings](#editing-profiles-in-settings)) and leaves
+  every line it does not edit as it is. Its Shell page sets `default-profile`
+  (see above).
+
+### Editing profiles in Settings
+
+The Profiles page of Settings lists your profiles in the order of their
+`profile-command` lines. Each one's command line, name, starting folder and
+variables are rows of their own. A variable's value is masked in its row
+(`PATH = ••••••`) and shown only while you type into it, since it can hold a
+secret; screen readers get each row's name without its value, and read the
+value on request (a variable's as "value hidden"). Enter types into the
+selected row's field,
+and Enter, Tab or moving elsewhere keeps what you typed, while Escape puts the
+field back. Delete takes a name, a starting folder or a variable out; on a
+profile's own row it removes the profile, after a second Delete and a status
+line that says what removing it does. Insert or Ctrl+N adds a profile: its id
+first, then its command line. An id cannot be changed, because sessions,
+layouts and the jump list name the profile by it; a new id is a new profile.
+Settings refuses what loading would report (see
+[Ids, renaming and removing](#ids-renaming-and-removing)), an empty command
+line, a line break, a value too long for one line of the file, and a variable
+without a name or a value. The status line says why, without repeating the
+value. A field Settings refuses stays open with what you typed: switching
+pages stops at it, and closing Settings or quitting noctty asks about it as
+about any unsaved change. So does a new profile whose id you typed, until you
+type its command line or press Escape to drop it. Like any other setting, these changes are a draft
+until you Save, and Discard changes or closing without saving drops them.
+
+Save writes only what changed, to the file Settings saves to. The line that
+sets a field is changed where it is, a new field goes after its profile's
+lines, and a new profile's lines go at the end of the file. A removed
+profile's lines are deleted. When something else still names its id
+(another file or noctty's command line defines it or sets one of its
+fields, or `profile-order`, `profile-hidden` or `default-profile` names
+it), its `profile-command` line becomes `profile-command = <id>:` instead,
+which removes the profile whatever the other lines say and keeps those
+references from becoming config problems. Comments, other profiles and every other line
+stay as they were. A field that a file read later (one `config-file` names)
+or the command line sets again is saved all the same, and Settings says which
+line wins.
+
+Removing the profile `default-profile` names leaves `default-profile` as it
+is: new tabs then open the automatic shell, and Shell > Default profile shows
+the value marked "(not found)" until you choose another. A profile defined on
+noctty's command line is shown and not changed. `profile-order` and
+`profile-hidden` are not edited there: a hidden profile is marked, and both
+are changed in the config file.
+
+### Listing profiles
+
+`noctty +list-profiles` prints the profiles the picker and the palette offer,
+with the key each one has for `default-profile`, `profile-order` and
+`profile-hidden`:
+
+```text
+KEY              LABEL                                     SOURCE         STATE
+pwsh.exe         PowerShell                                detected       shown
+powershell.exe   Windows PowerShell                        detected       shown
+cmd.exe          Command Prompt                            detected       shown
+user:py312       Python 3.12                               config         shown
+vs:7b2b9776:cmd  Developer Command Prompt for VS 2022 (2)  visual-studio  shown
+vs:869111bd:cmd  Developer Command Prompt for VS 2022      visual-studio  hidden
+```
+
+The profiles come in the picker's order: the shown ones in the order the
+rules above give, then the hidden ones, which still start when something names
+them. The source is `detected` for a shell, WSL distribution or SSH host found
+on this machine, `config` for a profile you defined with `profile-command`
+(its key is `user:<id>`), and `visual-studio` for a developer shell. The
+command never prints a command line, an environment variable or a working
+directory.
+
+It reads your configuration files and searches for shells the way a new
+noctty does when it starts, with its own environment and for the light or dark
+scheme Windows reports for apps (a `theme = light:A,dark:B` can set profile
+keys, so a dark desktop can list other profiles than a light one), so it lists
+what a new window started from the same shell would: it asks `wsl.exe` for its
+distributions when `wsl.exe` is on `PATH`, reads your SSH config, and asks
+Visual Studio's Setup Configuration, which takes a fraction of a second. A
+running noctty may list differently: it keeps the environment and options it
+started with, and a quick slot you pin in it moves a profile to the front of
+its pickers until it exits, which the command, a separate process, does not
+see. A `profile-command` line the config reader rejects leaves its profile
+out; `noctty +validate-config` reports it.
+
+On a terminal the output is the table above. When it is piped or redirected,
+or with `--plain`, each profile is one line of tab-separated fields (key,
+label, source, state) without a header, for scripts that split on tabs. The
+text forms are UTF-8, and a control character in a label prints as `?`.
+`--format=json` prints one document instead, whatever the destination, with
+`hidden` as true or false in place of the state:
+
+```json
+{"schema":"noctty.profiles.v1","complete":true,"profiles":[{"key":"pwsh.exe","label":"PowerShell","source":"detected","hidden":false}]}
+```
+
+```powershell
+noctty +list-profiles --format=json | ConvertFrom-Json | ForEach-Object profiles | Where-Object hidden
+```
+
+The JSON is ASCII (any other character is a `\u` escape), so a console code
+page cannot garble it on its way through a pipeline.
+
+`complete` is `false`, and a note on stderr says so, when a search did not
+finish in time (WSL, the SSH config or Visual Studio) and profiles may be
+missing. A repeat usually settles it. Actions switch noctty's log off;
+`GHOSTTY_LOG=stderr` switches it on, and a log line says how big a command or
+a directory is (`<2 args, 32 bytes>`), never what it is.
 
 ## App identity
 
 Installed builds create Start menu shortcuts with noctty's AppUserModelID,
-which Windows uses for taskbar grouping and Action Center toast activation.
+which Windows uses for taskbar grouping, and with its toast activator, which
+Action Center uses for a click on a toast (see
+[notifications and progress](#notifications-and-progress)).
 Portable builds have no installer-created shortcuts, so taskbar and
 notification identity may be less stable. If Windows shows a stale icon
 after upgrading or switching between installed and portable builds, restart
@@ -592,7 +1229,8 @@ console sets another one, so cmd's `title`, PowerShell and full-screen
 programs name the window as they do anywhere else. When the client set
 `STARTF_USESHOWWINDOW`, `start /min` and `Start-Process -WindowStyle
 Minimized` open the window minimized without taking focus, `SW_SHOWNOACTIVATE`
-opens it without taking focus, and a maximized start opens it maximized.
+opens it without taking focus, and a maximized start opens it maximized. The
+`maximize` and `fullscreen` settings do not apply to an adopted console.
 `powershell.exe -WindowStyle Hidden` hides its own console window after it
 starts. For an adopted console, noctty follows OpenConsole's show/hide
 notifications as Windows Terminal does: hide minimizes the window, and show
@@ -665,8 +1303,19 @@ become a window.
   `%LOCALAPPDATA%\noctty\jump-list-recents.json`. To clear them, close
   noctty, delete that file, and start noctty once so Windows receives the
   empty list.
-- Profiles: the detected shell profiles. Selecting one launches noctty with
-  that profile's command.
+- Profiles: the profiles the picker shows (`profile-hidden` ones are left
+  out). Selecting a detected one launches noctty with that profile's command.
+  A [user profile](#user-profiles)'s entry names the profile instead
+  (`--default-profile=user:<id>`): a jump-list entry is stored on disk and can
+  roam with your Windows profile, so it never holds the profile's environment
+  variables, and the new process reads them from your config. A
+  [Visual Studio shell](#visual-studio-developer-shells)'s entry names it the
+  same way (`--default-profile=vs:<instance id>:cmd`), and the new process asks
+  Visual Studio for it again. That entry also passes on a
+  `--visual-studio-profiles` option noctty was started with, so a shell listed
+  because of `--visual-studio-profiles=all` still starts from the jump list. A
+  value from your config files is not copied into the entry, so a later edit
+  of that line still applies to the windows it starts.
 
 From 1.3.133 a portable copy builds no jump list and writes no
 `jump-list-recents.json`, so a machine with only a portable copy gets none;
@@ -722,13 +1371,68 @@ package.
 ## Notifications and progress
 
 Desktop notifications use WinRT toasts when available and fall back to
-in-app banners when Windows notification policy, Focus Assist, app identity,
-or runtime availability prevents a toast. `desktop-notifications` gates every
+in-app banners when Windows refuses a toast: when notifications are turned
+off for noctty or for the user, or when app identity or runtime availability
+prevents one. Under Focus Assist (Do not disturb) Windows may refuse the toast,
+which brings the banner, or file it in Action Center without a popup, which
+does not; which one happens has not been measured for noctty.
+`desktop-notifications` gates every
 toast, including command-finish toasts, which additionally need
 `notify-on-command-finish` and a `notify-on-command-finish-action` that
 includes `notify`, and [program status](#program-status-osc-7501) toasts.
-Command-finish and program status toasts focus the originating pane when
-clicked; OSC 9 and OSC 777 toasts are display-only.
+
+Every toast from a terminal pane (OSC 9, OSC 777, command finished, program
+status, and noctty's own "Copied ... to clipboard" notices) ends with a line
+that names its tab: `Tab 2: <tab title>`, `Tab 2 of window 1: <tab title>`
+while more than one window is open, or `Tab 1 of the quick terminal: <tab
+title>`. The quick terminal is not counted as a window. A window's number
+appears nowhere else in noctty and can change when another window closes. The
+tab title is that of the tab's focused pane, without bidirectional overrides,
+invisible characters or control characters, and cut to 64 bytes. An OSC 9
+notification, which has no title, is titled by its tab. When the toast falls
+back to a banner, the banner ends with the same tab line. Clicking the toast's
+popup focuses the pane that sent it: noctty restores its window if it is
+minimized, switches to its tab and pane, and asks Windows to bring the window
+forward, which Windows may refuse.
+
+A click on a toast's entry in Action Center (or on a toast Focus Assist sent
+there without a popup) reaches noctty through a COM activator that only a
+copy installed with the installer has: the installer registers it and sets it
+on the Start menu and desktop shortcuts, and the installed copy names it in
+its AppUserModelID registration (`CustomActivator`) and listens for it while
+it runs, unless it runs as administrator, in safe mode, or as the process
+Windows starts to host a console while noctty is the default terminal. Such a click focuses the pane the
+same way, and a running noctty with no window open opens one for it. When the toast came from another noctty process (the toast's
+process has ended, or a second instance showed it), noctty brings its own
+window forward instead of guessing at that process's tabs. When no installed
+noctty is running, Windows starts one, which hands the click to a running
+single-instance noctty together with its right to come to the foreground,
+or else opens as an ordinary launch would and brings
+its window forward. A portable copy registers nothing, so without an
+installed copy only its popup clicks focus a pane. Where one is installed, a
+click on a portable copy's entry in Action Center goes to the installed
+copy's activator, which hands it to the portable copy when that is the
+running single-instance noctty. Uninstalling removes the activator and its
+`CustomActivator` value. None of this has been exercised against Windows'
+notification platform yet; the release checklist (W10-23) carries the
+checks.
+
+A pane keeps at most one toast in Action Center: a newer toast from the same
+pane that Windows takes replaces its older one (one Windows refuses, or one
+whose tag and group noctty cannot set, becomes a banner and leaves the older
+toast where it is). noctty takes a pane's toast
+out of Action Center when you look at its tab (its window comes forward with
+that tab active, or a pane in the tab gets focus), when the pane closes, and
+when its tab is closed, also while that close can still be undone; an undo
+does not bring the toast back. A toast from a pane whose tab is in undo
+history is taken out right after Windows shows it. When noctty exits it removes
+every toast it showed for a pane. Toasts are grouped by process id, so a
+noctty never removes those of another noctty that is running. A noctty that
+ends without exiting (a crash, or Windows ending it at sign-out) leaves its
+toasts until you dismiss them, or until a later noctty that Windows happens to
+give the same process id shows a pane toast and then exits.
+noctty's own notices that come from no pane (configuration reloaded, Settings
+saved) are not removed.
 
 Terminal progress reports map to Windows taskbar progress for the active
 surface in each host window when `progress-style` is enabled; with
@@ -779,15 +1483,15 @@ terminfo capability, so a program can check before it reports.
   look, so repeating it works through them. It has no default key binding;
   bind it with, for example,
   `keybind = ctrl+shift+g=goto_attention`. `noctty +perform-action
-  goto_attention` runs it from scripts.
+goto_attention` runs it from scripts.
 - **Screen readers.** Each tab's UI Automation `ItemStatus` reads the status,
   such as "claude needs permission: Allow edit to main.rs?". A new state,
   request or result raises a property-change event; progress updates
   don't.
 
-Program text shown outside the terminal (in toasts and UI Automation) has
-bidirectional overrides and invisible formatting characters removed and is
-cut to 240 bytes. noctty never sends anything a program reported back to a
+Program status text shown outside the terminal (in toasts and UI
+Automation) has bidirectional overrides and invisible formatting characters
+removed and is cut to 240 bytes. noctty never sends anything a program reported back to a
 program.
 
 With Windows' built-in console host, replies to OSC queries, including this
@@ -858,6 +1562,31 @@ Set `NOCTTY_RENDER_TRACE_FILE` to an absolute output path to write a JSON
 render trace when the first traced surface is destroyed. Presented fps is
 `(swap_buffers_count - 1) * 1000 / (last_swap_at_ms - first_swap_at_ms)`
 when at least two swaps are present and the time difference is positive.
+
+## Installed variable fonts
+
+Font discovery includes the system and per-user font directories and both
+the HKCU and HKLM Windows font registrations, including registered fonts
+outside those directories. Config reload checks both registry keys for
+changes before deciding whether to rescan.
+
+For a variable font with a `wght` axis reaching at least 600, a bold request
+uses `wght=700` (limited to the font's supported range by FreeType). For
+example, `font-family = Cascadia Code` can use the font's variable weight
+for bold text. An explicit `wght` in `font-variation-bold` or
+`font-variation-bold-italic` takes precedence; other configured axes are
+preserved. Regular and italic-only requests receive no automatic weight
+override.
+For bold requests, otherwise equal matches prefer a static face unless
+variations were explicitly requested. A variable font's Regular name does
+not outrank the same family's static Bold. Regular and fallback queries
+retain their existing ordering.
+
+`noctty +list-fonts --family="Cascadia Code" --bold` lists matching installed
+faces. Discovery does not enumerate variable fonts' named instances or add
+localized family-name aliases. Scan cancellation is checked between files;
+one blocked font-file open, including an unreachable network path in an
+HKCU or HKLM registration, can still delay shutdown.
 
 ## Font stroke weight
 
@@ -948,6 +1677,15 @@ a DWM dark caption; high-contrast palette switching; IME support;
 drag-and-drop of files, plain text, URLs, and HTML into a pane; and native
 right-click context menus.
 
+In a tab with two or more panes, the renderer dims every pane but the one the
+tab has selected (`unfocused-split-opacity`, toward `unfocused-split-fill`,
+which defaults to the configured `background`), and `split-divider-color`
+colors the gap between them. The selected pane of a window that is not in
+front stays undimmed, and a zoomed pane is never dimmed. The dim covers the
+terminal content, after any custom shader, but not the overlay scrollbar or a
+docked search bar; High Contrast turns it off and keeps the system colors for
+the gap.
+
 The dark caption is chosen at runtime, not by build number:
 `DWMWA_USE_IMMERSIVE_DARK_MODE` (20) is tried first and the legacy attribute
 (19) is used when DWM rejects it. Windows 11 additionally gets an integrated
@@ -973,14 +1711,40 @@ Windows 10 the window is frameless: no border, shadow, or resize edges, no
 Alt+Space menu, and no tab-strip drag, and maximizing it covers the taskbar.
 The quick terminal is frameless on both, so it sits flush with its screen edge.
 
+`maximize = true` and `fullscreen = true` apply to every new window: the
+first one, `new_window`, a profile opened in a new window, a window forwarded
+from another launch (`noctty --maximize`, `noctty +new-window
+--fullscreen=true`), a launched layout, and a window restored from the saved
+session (see [Session restore and recovery](#session-restore-and-recovery)).
+They do not apply to new tabs or splits, to the quick terminal, or to a
+console handed off as the default terminal, which starts in the show state
+its program asked for. Changing them with a config reload does not
+change windows that are already open. A window with no other window to copy
+(the first one, or one opened when none is open) is shown in that state from
+the start. A window opened from another one (`new_window`, a forwarded
+launch) is shown first and then maximized or made fullscreen, as a window
+opened from a maximized one already was. A window that starts fullscreen
+leaves fullscreen to the window it would otherwise have been: its normal size
+and place, or maximized when `maximize` is also set. The settings win over a
+minimized launch (`start /min`, a shortcut set to Run: Minimized): such a
+window starts maximized or fullscreen, not minimized, and the windows opened
+after it (Settings, a new window) are not minimized either.
+
 The universal palette puts actions, live tabs, panes, Windows profiles,
 named layouts, and native settings in one fuzzy-ranked, keyboard-driven
 list. Type a prefix to filter one category: `>` actions, `@` tabs, `/`
 panes, `~` profiles, `:` settings, `%` themes, `!` recent commands, `^`
 layouts, or `?` for help. The native Settings window stages edits until Save
 (or Discard changes, which first asks how many fields would be lost) and
-patches your config without rewriting unrelated text. Its "Open in default
-editor" button, and `noctty +edit-config` when neither `VISUAL` nor `EDITOR`
+patches your config without rewriting unrelated text. While you edit, Window
+theme and Background opacity preview in the open windows; the other fields,
+font size among them, take effect when you save.
+A preview stays a preview: a config reload or a Windows light/dark switch
+keeps it unsaved and still shown, and Discard changes or closing without
+saving takes it back. The one exception is a reload whose file now has the
+same value: Settings takes that as saved, and the preview ends with it in
+effect. The window's "Open in default editor" button, and
+`noctty +edit-config` when neither `VISUAL` nor `EDITOR`
 is set, open the config through the `.txt` association rather than the
 file's own; they refuse a network or mapped-drive path and a link (symlink
 or junction) whose target is not a local file, but follow a checked local
@@ -989,6 +1753,119 @@ failure shows in Settings' status line (a banner from the app, stderr from
 the CLI).
 Details for both
 are in the [capability matrix notes](windows-capability-matrix.md#notes).
+
+A Settings field whose value differs from noctty's built-in default has a bar
+in front of it (the accent color, or the text color in High Contrast) and a
+**Reset** button after it, and UI Automation reports its `ItemStatus` (MSAA
+its description) as "Changed from the default". The button, the field's context menu (right-click
+the field's label, a dropdown or a checkbox, or press Shift+F10 on one; a text
+field keeps its own Cut/Copy/Paste menu) and Ctrl+Shift+Delete in the field
+all put the default back. A reset is an edit like any other: it previews where
+the field previews, waits for Save, and Discard changes takes it back. Save
+writes the default as that key's line (`font-size = 12`); for Default profile
+it removes the line, since its default is no line at all. The comparison is
+with the value in effect, so a field an included file sets is marked too, and
+after a reset and Save the include still wins: Settings then says the saved
+value is overridden, as it does for any edit. A reset made after the file changed under
+an edit is measured against the file as it is now, so Save writes the
+default over the file's value. Background blur and link
+previews, which Windows does not support, keep whatever the file says and
+offer no reset.
+
+A field's label also says, at its right end, where the saved value comes from
+when a line sets it: "Set in noctty.conf, line 4" for a line of a config file
+(the one Settings saves to, or a file `config-file` names, by its file name),
+"Set by the theme Nord, line 7" for a line of the theme's file, and "Set on
+the command line" for an argument noctty was started with. A field that no
+line sets says nothing there: its value is the default, or one noctty worked
+out when it read the config. MSAA reads the same in the field's description,
+after "Changed from the default" when that applies. The label describes the
+saved value in effect, not an edit waiting for Save, so a field whose value
+comes from an included file or the command line says so before you change it.
+Save writes the edit to the config file Settings saves to, and to no other
+file. When a file read after it (one that `config-file` names) or the command
+line sets the same key, that value still wins, and Settings says so, naming
+each such setting with the line that wins: "overrides font-size (line 2 of
+included.conf)". The theme is read before the config file, so a value the
+config file sets wins over the theme's. When noctty's command line names a
+Default profile (a jump-list entry does), that choice is for that process
+only: Settings shows and saves the config files' value, and its label names
+the file and line that set that value, if any.
+
+**Search settings** at the right of the Settings header (Ctrl+F from
+anywhere in the window) narrows every page to the settings whose name,
+description or keywords contain every word typed, ignoring the case of ASCII
+letters; `@modified`
+narrows it to the settings that differ from their defaults, and combines with
+words (`@modified font`). Each page keeps its own place: its button on the left
+shows how many settings the search found there, and a page with none says
+which pages have them. The line under the page title says how many match in
+all and on the page shown (or, on a page with none, how many the first page
+with matches has), and screen readers hear it as a polite live region once
+typing pauses. Enter in the field goes to the first setting found, on the
+page shown or else on the first page that has one; Escape in the field clears
+it. Escape in an empty field, or while the close prompt is up, does what it
+does elsewhere in Settings: it asks to close, or is the prompt's Keep editing. Rows the search hides
+are out of the Tab order and the UI Automation tree. With `@modified`, the list
+is taken when the search runs: an edit, a reset, Discard changes or a reload
+leaves the rows where they are until the search changes or a page is shown
+again. A command palette jump to a setting the search hides clears the search,
+and so does Settings showing a field whose value it will not take.
+
+**All settings**, the last page on the left, lists every key the config file
+can hold, with the value in effect and the first sentence of what it does; a
+key that Windows accepts but does not honour (background blur, the GTK keys)
+says so instead. Up and Down select a key, which opens to its whole
+description and the line of the config file that sets it. A value set
+elsewhere names the file and line that set it (a file `config-file` names,
+the theme's file) or the command line, and says when a line of the config
+file sets the key too and does not take effect (for a key whose lines can add
+up, such as `font-family` or `keybind`, only that the file has a line for it
+too, since a later line can clear or replace it). Only a line noctty took when
+it read the file is said to set a key: a line whose value it refused, or one
+written since it last read the file, is said to mention the key and not to
+take effect. A command
+line's `command` or `initial-command` wins over a file read after it, and is
+named as the command line's. A command line's `default-profile` is for that
+process only: the page shows the config files' value, as the Shell page does,
+and names the file and line that set it. A value no line sets but
+noctty worked out when it read the config (`click-repeat-interval`, from
+Windows' double-click time) says that. The file is read
+for this only from a local drive, as UTF-8 or as UTF-16 with a byte order
+mark. It is never read through a symlink or junction, on the file or a folder
+above it, that leads anywhere else, such as a network share. Nor is it read
+when it or a folder above it is a cloud placeholder of OneDrive or another
+cloud-file provider, which a read would make the provider fetch first while
+the window waits. When it cannot be read, the page says so instead of a line.
+Enter, or double-clicking
+the key, opens the config file the way "Open in default editor" does (through
+the `.txt` association), which takes no line number, and the editor may put
+the cursor anywhere: go to the line shown. Ctrl+C copies the key's name. A key
+that has a control in Settings (font size, opacity, the clipboard policies and
+the rest) has an **Edit on _page_** action: F2, or clicking it, goes to that
+control on its own page, focused, so the edit is the control's own, previews
+or waits for Save as it does there, and Save patches only that key's line. A
+key with no control says it is changed in the config file; background blur and
+link previews, whose controls Windows does not support, have no Edit and say
+why. Shift+F10 or a
+right-click offers the row's actions. The value shown is the one in effect: a field you
+have changed on another page but not saved yet, even one whose change you can
+already see in the open windows, keeps its saved value here and is marked as
+changed and not saved yet. The search covers
+this page too, by each key's name, value and description, so its count counts
+every setting once: searching "padding" finds the three padding fields on
+Appearance and the four `window-padding-*` keys here, "4 settings match".
+
+**Keybindings** lists every key binding in effect: the defaults, with the
+config file's `keybind` lines applied, key tables and sequences included. Each
+row shows the keys (with a key table's name and `/` first, and flags such as
+`global:`), the action, and the first sentence of what the action does; Up and
+Down select a binding, which opens to the action's whole description and says
+whether it is one of noctty's defaults or the config file's own. The list is
+read-only: Enter opens the config file, where bindings are changed, and Ctrl+C
+copies the binding as `keybind = ...` lines to paste there. The search covers
+the bindings too, by keys, action and description, and counts each as one
+match on this page; `@modified` keeps the ones the defaults do not have.
 
 ## Running elevated
 
@@ -1000,10 +1877,15 @@ the prompt leaves the current window unchanged. The relaunch call is
 synchronous, so the initiating window is unresponsive while the UAC prompt is
 open.
 
-The roadmap originally asked for a per-profile `run elevated` flag. Windows
-profiles in noctty are detected from installed shells rather than declared in
-a user-authored profile schema, so there is no profile property to set. The
-per-profile equivalent is a `new_window_elevated:<profile-key>` binding.
+The roadmap originally asked for a per-profile `run elevated` flag. There is no
+such profile property, for the detected shells or for
+[user profiles](#user-profiles); the per-profile equivalent is a
+`new_window_elevated:<profile-key>` binding, for example
+`new_window_elevated:user:py312`. An elevated user profile from a config file
+is named to the elevated process, which builds it from the same files, and so
+is a [Visual Studio shell](#visual-studio-developer-shells)
+(`new_window_elevated:vs:<instance id>:cmd`), unless UAC would run the window
+as another account (see [User profiles](#user-profiles), Limits).
 
 An elevated noctty is a separate process and a separate window. Its title is
 prefixed with `Administrator: `. Elevated and non-elevated tabs cannot be
@@ -1039,11 +1921,32 @@ because there is no non-elevated split-token counterpart to protect.
 Configuration and other per-user state still resolve from the same
 `%LOCALAPPDATA%\noctty\` profile as the non-elevated process.
 
-An elevated noctty loads the same `%LOCALAPPDATA%\noctty\config.ghostty` and
-the same explicit `--config-file` overrides as a non-elevated process. Those
-files remain writable by the ordinary user account, so anything that can
-modify the configuration, including `command`, `shell-integration`, and theme
-paths, runs at high integrity the next time an elevated window opens.
+An elevated noctty loads the same config files as the non-elevated process:
+`%LOCALAPPDATA%\noctty\config.ghostty` (unless that process was started with
+`--config-default-files=false`) and the same explicit `--config-file`
+overrides. Those files remain writable by the ordinary user account, so
+anything that can modify the configuration, including `command`,
+`shell-integration`, and theme paths, runs at high integrity the next time an
+elevated window opens. When a standard user enters an administrator's
+credentials instead, the elevated process runs as that administrator and reads
+that account's `%LOCALAPPDATA%` config; a forwarded `--config-file` still names
+the same file.
+
+An elevated window started by noctty is given only a short command line: the
+config files above (`--config-file` and `--config-default-files`),
+`--visual-studio-profiles`, the working directory of the pane it was opened
+from (noctty's own when there is none), the `class` setting when one is set,
+and the profile it should run. Other command-line
+overrides are not forwarded, so `--env=NAME=value`, `--font-size` and the rest
+do not reach it. That is deliberate for `--env=`: a forwarded value would
+appear on the elevated process's command line, where other programs can read
+it (process tools and process-creation auditing), and an `--env=` value may be
+a secret. To give an elevated window a setting, put it in a config file both
+processes read (an `env = NAME=value` line, for example) or in a profile
+defined there. Such a profile's command and variables stay off the elevated
+command line, except in the cases listed under Limits in
+[User profiles](#user-profiles) and when Windows cannot say what kind of token
+the process has.
 
 At process startup, noctty restricts bare-name DLL resolution to the
 application directory, System32, and explicitly added DLL directories. The
@@ -1085,17 +1988,51 @@ the indicator is later turned off.
 
 One noctty process owns the saved session: the first one started normally,
 which restores it (or opens its first window when there is nothing to
-restore). Only that process saves it, on exit, at sign-out, shutdown or
-reboot, when the display configuration changes, and one second after a burst
-of window, tab or pane structural changes settles. These checkpoints use the
-same ownership, scrollback opt-in and sensitive-input exclusions as the exit
-save; startup restoration completes before checkpointing is enabled. The save at sign-out,
-shutdown or reboot is the last one and never deletes the file, even with no
-windows left: the sign-out also ends the shells, so an empty window list
-then says nothing about what was closed on purpose. A launch that forwards
+restore). Only that process saves it: as the session's last window goes, at
+sign-out, shutdown or reboot, when the display configuration changes, and one
+second after a burst of window, tab or pane structural changes settles. These
+checkpoints use the same ownership, scrollback opt-in and sensitive-input
+exclusions as the save when the last window goes; startup restoration
+completes before checkpointing is enabled.
+
+The saved session is what was open when the session ended, taken just before
+it went. When windows close one at a time, that is what the last window held,
+however it went: its close button, Alt+F4 or the taskbar, `close_window`, the
+X of its only tab, `close_tab:this` on its last tab (saved as the tab closes,
+not when its undo time runs out), `close_surface` on its last pane, or its last
+shell exiting. A `quit`, `close_all_windows` or an update install saves every
+window it closes. The quick terminal is never a session window, and neither is
+a window left empty after its last tab closed, which stays only for undo. Undo
+history is never saved: a tab or pane closed while other tabs or windows stayed
+open does not come back on the next launch, even if noctty quits before its
+undo time runs out. Undoing the close of the last tab, or opening a new tab or
+window, continues the session. No save deletes the file: with no window to
+record, a save writes nothing.
+
+One exception: a restore that ended by itself before anyone used it. If
+nothing has used the session since startup restored it, and every program in
+the panes it still holds has ended by itself (a WSL distribution that fails to
+start, say), saving it back would open and close it again at every launch.
+"Used" means input reached a pane while its program ran: a key, a click, the
+mouse wheel, a paste or drop, a command run from the command palette, or text
+sent by automation (`+send-text`). Opening a tab, pane, window or the quick
+terminal counts too. An action sent with `+perform-action` counts only when
+it opens one of those: it cannot send input to a program. A key pressed in a pane whose program has already ended only closes it,
+and does not count. When the session ends that way, noctty renames the saved
+session to `session-state.json.restore-ended` (or `.1` up to `.4`) instead of
+saving it, writes no checkpoint for it meanwhile, and the next launch opens a
+fresh window. Rename the file back to try that session again. Nothing is
+deleted or replaced: with all five names taken, the file is left where it is
+and the next launch restores it again. These names are separate from the
+`.restore-failed` names below, so they never stop a session that keeps
+ending the process from being moved aside.
+
+The save at sign-out, shutdown or reboot is the last one: the sign-out also
+ends the shells, and the panes they leave are not saved over it. A launch that forwards
 to a running noctty, a window opened with `--working-directory` (Explorer's
-"Open noctty here" and the jump list's recent folders) or with `-e` or
-`initial-command`, the startup profile picker, a `--launch-layout` or
+"Open noctty here" and the jump list's recent folders), with
+`--default-profile` (the jump list's user profiles and Visual Studio shells)
+or with `-e` or `initial-command`, the startup profile picker, a `--launch-layout` or
 `initial-window = false` run, a default terminal handoff and a second
 instance under `single-instance = false` start without the saved session and
 leave it untouched when they exit. When one of these is the first noctty
@@ -1122,7 +2059,10 @@ it for the rest of that run. The startup history (`startup-attempts.json`) is
 read the same way, and `integration.ps1` is not replaced by a build whose copy
 declares an older `noctty-integration-revision`. Builds that predate this
 still parse strictly, so downgrading to one while a saved state contains
-`scrollback` can quarantine that file as `.corrupt`.
+`scrollback` can quarantine that file as `.corrupt`. For a saved fullscreen
+window, v1.3.132 and later restore it as normal at its saved rectangle if they
+do not understand fullscreen; v1.3.131 and older reject the unknown state and
+move the session file aside as `.corrupt`.
 
 A restored window comes back at the rect it was saved with, in screen
 coordinates, and as maximized if it was or was minimized from maximized. If
@@ -1131,7 +2071,27 @@ unplugged or the layout changed, or Windows capped an extreme size or position),
 the window moves to the nearest monitor's
 work area, its size capped to it. A window with a caption's worth of title bar
 (48 px wide) on some monitor stays where it was, even if the rest
-of it hangs off the screen.
+of it hangs off the screen. A launch that asked for a minimized window
+(`start /min`, a shortcut set to Run: Minimized) restores windows the same
+way: they come back at their saved rect, not minimized.
+
+`maximize = true` and `fullscreen = true` (or `--maximize` and
+`--fullscreen=true` on the command line) apply to restored windows too: each
+is placed at its saved rect first and then maximized or made fullscreen, so
+the saved rect is the one it returns to. Without them a window comes back in
+its saved state, including fullscreen. A window saved while fullscreen comes
+back fullscreen even with `fullscreen = false`. With `fullscreen = true`, every
+window starts fullscreen and is saved that way unless you leave fullscreen before
+the session saves. This includes windows made fullscreen by that setting.
+After changing it to `fullscreen = false`, restored windows still come back
+fullscreen until you leave fullscreen in each window (F11) and the session saves
+again; this matches Windows Terminal's persisted layouts. Leaving fullscreen returns to
+its saved normal rectangle, or to maximized if it was maximized before entering
+fullscreen; restoring that maximized window then returns to the saved normal
+rectangle. Named layouts continue to save only their tab and pane shape.
+The state file remains schema version 1: older builds that tolerate unknown
+state names restore a saved fullscreen window as normal at its saved rectangle
+and ignore the optional `fullscreen_maximized` field.
 
 A snapshot that merely exceeds the limits above (too many lines, a line over
 16 KiB, or the shared budget) is dropped on load and the window's layout still
@@ -1244,6 +2204,8 @@ the response headers, and each body read. A stalled request is canceled before
 the worker finishes, so a later check can retry. A download that keeps making
 progress may take longer than 30 seconds. Requests use Windows' certificate
 trust with TLS 1.2 or later; checksum and publisher verification still apply.
+They accept only uncompressed responses, and a response that arrives
+compressed anyway is refused.
 
 Upstream Ghostty is leaving GitHub, so the maintainer periodically checks
 that the `upstream` remote and the release-feed host are still live and
@@ -1317,6 +2279,52 @@ Portable apply fails closed until a release publishes that signed complete-file
 manifest. Releases without it are not downloaded or staged for portable apply;
 the update notice opens the normal GitHub release page for manual updating.
 
+### Installing and upgrading while noctty runs
+
+Setup (run by hand, by WinGet or by Chocolatey) asks a running noctty to close
+through Windows Restart Manager before it replaces the files. noctty agrees
+when quitting would ask nothing, and closes. The process that owns the saved
+session, the first noctty started normally, first saves its windows, tabs and
+splits, as `quit` does; the quick terminal is not saved. It also asks Windows
+to let Setup start it again when Setup finishes, with the last
+`--config-file` and the `--class` it was started with (no other arguments,
+and no earlier `--config-file`), and that start restores the session; the
+programs that ran in its terminals are not started again. Any other noctty
+process closes without saving and is not started again; the session owner
+brings the session back. No process saves or is started again in safe mode,
+when elevated through UAC, or with `window-save-state = never`. Ownership
+is per process: a process started with `--working-directory` (Explorer's
+"Open noctty here"), `-e` or `initial-command`, the startup profile picker,
+`--launch-layout` or `initial-window = false`, or as a default terminal
+handoff, does not own the session, and windows forwarded into it are not
+saved either, but a later noctty started normally that does not forward to
+it (under `single-instance = false`) can still own the session
+([Session restore and recovery](#session-restore-and-recovery)). Setup
+starts noctty before its last page, so in the setup wizard, leaving
+**Launch noctty** checked there opens one more window.
+Setup's restart of noctty itself has not been tried on a real install.
+
+With the default `confirm-close-surface`, noctty declines, without a prompt,
+while a terminal runs a program (the programs `confirm-close-surface` asks
+about), and it always declines while Settings has unsaved edits. The
+declining process stays open and loses nothing, but Setup cannot replace the
+files and stops; a silent Setup under a package manager exits with code 5.
+When several noctty processes run, one that agreed may already have closed
+(as described above); a Setup that stops does not start it again. Finish or
+close those programs and run the upgrade again. For the same reason an
+upgrade started from inside a noctty tab is declined: the package manager is
+a program running in that terminal, and closing noctty would end it. Run it
+from another terminal. With `confirm-close-surface = false`, noctty asks
+about no program, so it agrees and closes even while a package manager runs
+in one of its tabs, which ends that upgrade.
+
+When the copy being upgraded is 1.3.134 or older, the running old version
+answers Setup, so it behaves as that version did: Setup may fail to close it,
+or close its windows one at a time so that the saved session keeps only the
+last one. Quit noctty before such an upgrade. The in-app **Install** is not
+affected: it quits noctty itself and Setup starts it again, through Explorer,
+as described under [Updates](#updates).
+
 ## Quick select & copy mode
 
 `Ctrl+Shift+Space` runs `toggle_quick_select` for the focused terminal
@@ -1329,7 +2337,8 @@ on resize, on a click, and when the surface loses focus.
 Completing a label copies the matched text to the clipboard. Hold Ctrl while
 completing to open a target that begins with an allowed URL scheme or names a
 file or folder on this machine (`C:\dir\file.txt`, `.\src\main.zig:12:5`,
-`src\a.cs(3,4)`); other targets, network shares included, are copied. A path
+`src\a.cs(3,4)`, and outside WSL `/c/dir/file.txt`, as described below);
+other targets, network shares included, are copied. A path
 opens through the same checks as a Ctrl+click on it, with a trailing
 `:line:col` or `(line,col)` left off: it must exist and must not be a program
 or script. When it is refused, a banner says it was not opened. Hold Alt to
@@ -1340,6 +2349,15 @@ terminal output. Alt-paste also runs the same classifier as the
 drag-and-drop path, so a match carrying shell metacharacters,
 environment-variable expansion, or control bytes raises the paste
 confirmation.
+
+A Ctrl+click (or Ctrl in quick select) opens an `http`, `https` or `mailto`
+link at once. A link with one of the other schemes noctty opens (`ftp`,
+`ssh`, `git`, `tel`, `magnet`, `ipfs`, `ipns`, `gemini`, `gopher`, `news`)
+asks first: the prompt shows the exact link and the app currently set to
+open it (or says no app is set), and starts on Cancel. Windows opens the
+link with whatever app is set when you accept. A Ctrl+click on a `file:`
+link to this machine follows the path rules below. Links with any other
+scheme are not opened.
 
 The same matcher finds paths for Ctrl+click links and double-click selection:
 `C:\dir\file`, `C:/dir/file`, `\\server\share\file`, `.\file` and
@@ -1356,6 +2374,28 @@ its own link. So `C:\a.txt copied` ends at `.txt` and
 has no dot still takes the words after it (`C:\Users\amant and then` is one
 match), because that cannot be told from a folder with a space in its name.
 A path inside single or double quotes ends at its closing quote.
+
+In a pane that does not run WSL, an absolute drive path as MSYS2, Git Bash
+and Cygwin print it opens as the Windows path it names: `/c/Users/me` and
+`/cygdrive/c/Users/me` open `C:\Users\me`, and a relative link resolves
+against a pane directory reported in that form (`/c` included). The Windows
+path then goes through the same checks as one written `C:\Users\me`: it
+opens only if it exists on a local drive and is not a program or a file
+Windows would run or install when opened (`.cmd`, `.ps1`, `.msi`, `.lnk` and
+the like). So a letter that is not a local drive, a network drive, a missing
+file and `/c/x/run.cmd` are refused, while `/c/x/config.fish` opens like any
+document. A drive's root is never opened from text, just as `C:\` is not a
+link: `/c` alone is a switch in `cmd /c` far more often than a drive.
+
+A pane counts as WSL when its command starts `wsl.exe` or WSL's `bash.exe`
+launcher (the one in the Windows folder, or the WindowsApps alias), directly
+or as `command = wsl.exe ...`; a bare `bash` counts when the first `bash` on
+the pane's `PATH` is that launcher. There `/c/...` is a Linux path and is
+not opened. Some WSL sessions are not recognized, so a `/c/x` printed in
+them opens `C:\x` when that exists: WSL started by another program in the
+pane (`cmd /c wsl`, `wsl` typed at a prompt), a distribution's own launcher
+such as `ubuntu.exe`, and a session handed to noctty as the default
+terminal.
 
 A quick select with nothing to label, or with too many targets to label
 without overlap, says so in the banner.
@@ -1423,6 +2463,59 @@ reports per notch retains the Windows scroll-lines setting and the configured
 multiplier. If a mouse-reporting TUI scrolls too quickly, try
 `mouse-scroll-multiplier = discrete:1`; this also slows normal viewport
 scrolling.
+
+## Clipboard and paste
+
+Pasting a clipboard that holds text sends the text, bracketed when the
+program turned on bracketed paste (mode 2004), after the usual paste
+protection.
+
+Files copied in Explorer (Copy, Ctrl+C) put no text on the clipboard, only
+their names. Pasting such a clipboard types the paths of all the copied files,
+space-separated and quoted the way a drop quotes them (`"C:\a b\x.txt"
+C:\plain\y.txt`); Windows Terminal pastes only the first. The paths go through
+the same paste protection as a drop: with `clipboard-paste-protection` on, a
+path with shell metacharacters (`&`, `;`, `%VAR%` and so on) or control
+characters raises the paste prompt, and the paths are typed only once you
+allow it. Text on the clipboard always wins over copied files, a program's
+OSC 52 read never returns file names, and a clipboard with neither text nor
+files falls through to the empty paste below.
+
+When a paste finds no text and no copied files on the clipboard, such as an
+image copied from a screenshot tool, and the program has bracketed paste on in
+a writable pane,
+noctty sends an empty
+bracketed paste, `ESC[200~ESC[201~`, the same twelve bytes Windows Terminal
+sends. A program can take that as "the user pasted" and read the clipboard
+itself, which is how herdr and opencode attach an image. noctty transfers no
+image bytes: the program reads the clipboard through its own means, so it
+works only where the program runs on this machine or has its own clipboard
+bridge. An empty text on the clipboard counts as no text.
+
+This applies to every way of pasting from the clipboard: `paste_from_clipboard`
+(Ctrl+Shift+V, Shift+Insert, the Paste key, the command palette, your own
+bindings), the context menu's Paste, `right-click-action = paste` and
+`copy-or-paste` with nothing selected, and the middle mouse button. A program
+that has mouse reporting on receives the mouse gestures instead, as before.
+Drops, automation `send_text`, quick select and typed text never send an
+empty paste, and neither does a program's OSC 52 read of an empty clipboard,
+which still gets its empty reply.
+
+With bracketed paste off, or in a read-only pane, a clipboard with neither
+text nor copied files sends nothing and the paste action counts as not
+performed. The default Ctrl+Shift+V binding is `performable`, so on such a
+clipboard, in a writable pane with bracketed paste off, it still reaches the
+program as a key; a read-only pane discards the key, as it discards all input.
+With bracketed paste on, in a writable pane, the key no longer reaches the
+program: the empty paste consumes it, as in Windows Terminal. A program that
+exits without turning bracketed paste off leaves the shell receiving the empty
+paste on such a clipboard.
+
+A clipboard of copied files is a paste like one of text, so Ctrl+Shift+V is
+consumed whether bracketed paste is on or off, and a paste prompt for a flagged
+path takes the key too. The files are read on the UI thread with the clipboard
+open, as text is, so a source that renders them late (Explorer on a large
+folder or a network share) can stall the window for a moment.
 
 ## Quick terminal and global hotkeys
 
@@ -1506,10 +2599,37 @@ layout without prompting, and only for the focused target.
 `+new-window` forwards command-line arguments to the running instance, which
 honors only allowlisted window-scoped presentation settings: window geometry
 and decoration (`--window-width`, `--window-height`, `--window-position-*`,
-`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen`),
+`--window-padding-*`, `--window-decoration`, `--maximize`, `--fullscreen=true`),
 `--title`, non-name font settings (`--font-size`, `--font-thicken`), and
 colors (`--background`, `--foreground`, `--palette`, `--cursor-color`,
-`--background-opacity`).
+`--background-opacity`). They are set on the new window's first terminal; a
+tab or split opened in it later starts from the instance's own configuration.
+These settings apply to every window of the instance and are not forwarded:
+`--window-theme`, `--window-titlebar-background`,
+`--window-titlebar-foreground`, `--split-divider-color`,
+`--window-show-tab-bar` and `--window-new-tab-position`, and neither is
+`--accent-follow-system`, which no longer has any effect. A second `noctty` and
+`noctty +new-window` leave them out (with a warning on standard error, where
+there is one) and still open the window.
+
+The new window copies one of the running instance's windows, the way a
+`new_window` copies the window it is pressed in: the window that was active
+last, never the quick terminal or a window whose last tab was closed and is
+kept only for undo (if none of the others has been active yet, as with windows
+started minimized, one of them). A window a forward opens becomes the active
+one as it is shown, so the next forward usually copies it, with any
+decorations or opacity it was given. The new window takes the copied window's
+size, one step down and right of it, its maximized or fullscreen state,
+always-on-top, its decorations and its background opacity. Forwarded arguments
+win over the copy: `--window-width` and `--window-height` give it its own size
+(both must be set, by the arguments or the config; from a maximized or
+fullscreen window, it is the size the new window returns to),
+`--window-decoration` its decorations and `--background-opacity` its opacity.
+`--window-position-*` place it as the config's `window-position-*` do, at the
+copied size unless a size is forwarded, except that a window opened from a
+maximized or fullscreen one returns to that window's normal place. When there
+is nothing to copy (no window is open, or only the quick terminal and windows
+kept for undo), the arguments apply as they do to a first window.
 
 Anything that runs code (`--command`, `--initial-command`, `-e`, `--input`,
 `--env`), loads a file (`--background-image`, `--custom-shader`,
@@ -1588,6 +2708,46 @@ config.
 
 WSL fails to launch: set `command = wsl.exe` explicitly. If it still fails,
 verify the distribution starts in a normal PowerShell session first.
+
+### A copy does not reach a Remote Desktop session
+
+noctty writes a copy in one Win32 clipboard transaction, owned by the
+pane's window. `Surface.writeClipboardText` in
+`src/apprt/win32/terminal_window.zig` writes `CF_UNICODETEXT` for
+`copy_to_clipboard:plain` and a program's OSC 52
+write. The default copy bindings (including Ctrl+Shift+C) and
+`copy-on-select` use the `mixed` format: `Surface.writeClipboardHtml`
+writes `HTML Format` and `CF_UNICODETEXT` together. `copy_to_clipboard:html`
+also uses that writer. Windows adds `CF_LOCALE`, `CF_TEXT` and
+`CF_OEMTEXT`. noctty never writes an OLE data object.
+
+A program can replace that copy with its own clipboard write. Claude Code
+on Windows also runs Windows PowerShell 5.1 `Set-Clipboard` about a quarter
+second after its OSC 52 write. That second, OLE write happens in several
+steps, and RDP clipboard redirection can announce an offer with no text
+formats. Windows Terminal users have reported the same failure:
+[anthropics/claude-code#101328](https://github.com/anthropics/claude-code/issues/101328)
+and [#87480](https://github.com/anthropics/claude-code/issues/87480) describe
+the two writes and the RDP observations. Both reports concern copies out
+of a session. The same double write is a likely cause when copying into
+one, but that direction has not been measured.
+
+To check which write remains, inspect metadata only: list formats with
+`EnumClipboardFormats` and the owner with `GetClipboardOwner`, without
+reading the contents. `DataObject` plus `Ole Private Data` with no owner
+means the last writer was not noctty. A missing owner alone does not
+identify the writer.
+
+Hold Shift while dragging so noctty makes the selection, then use noctty's
+copy binding (Ctrl+Shift+C by default). `mouse-shift-capture` controls
+whether Shift goes to the program; if the program overrides the default,
+set `mouse-shift-capture = never` to keep Shift selection in noctty.
+`copy-on-select` also works with a Shift selection. A copy binding with no
+noctty selection copies nothing, leaving the program's earlier write on
+the clipboard.
+
+The clipboard writers were compared in an isolated window station. RDP
+itself was not exercised.
 
 ### Neovim types base64 after an OSC 52 paste
 

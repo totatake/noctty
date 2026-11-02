@@ -322,7 +322,8 @@ const Entry = struct {
             },
             else => {},
         };
-        for ([_][]const Extended{ self.ext_booleans, self.ext_numbers, self.ext_strings }) |list| {
+        const ext_lists = [_][]const Extended{ self.ext_booleans, self.ext_numbers, self.ext_strings };
+        for (ext_lists) |list| {
             for (list) |ext| names_size += ext.name.len + 1;
         }
 
@@ -346,7 +347,7 @@ const Entry = struct {
             },
         };
         offset = 0;
-        for ([_][]const Extended{ self.ext_booleans, self.ext_numbers, self.ext_strings }) |list| {
+        for (ext_lists) |list| {
             for (list) |ext| {
                 try writeShort(w, offset);
                 offset += ext.name.len + 1;
@@ -360,7 +361,7 @@ const Entry = struct {
             },
             else => {},
         };
-        for ([_][]const Extended{ self.ext_booleans, self.ext_numbers, self.ext_strings }) |list| {
+        for (ext_lists) |list| {
             for (list) |ext| {
                 try w.writeAll(ext.name);
                 try w.writeByte(0);

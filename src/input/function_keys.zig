@@ -43,6 +43,9 @@ pub const Entry = struct {
 
     /// The sequence to send to the pty if this entry matches.
     sequence: []const u8,
+
+    /// Sequence to send to the PTY if DECBKM is set.
+    sequence_decbkm: ?[]const u8 = null,
 };
 
 /// The list of modifier combinations for modify other key sequences.
@@ -85,8 +88,10 @@ pub const keys = keys: {
     result.set(.delete, pcStyle("\x1b[3;{}~") ++ .{Entry{ .sequence = "\x1B[3~" }});
     result.set(.page_up, pcStyle("\x1b[5;{}~") ++ .{Entry{ .sequence = "\x1B[5~" }});
     result.set(.page_down, pcStyle("\x1b[6;{}~") ++ .{Entry{ .sequence = "\x1B[6~" }});
+    result.set(.help, pcStyle("\x1b[28;{}~") ++ .{Entry{ .sequence = "\x1B[28~" }});
+    result.set(.context_menu, pcStyle("\x1b[29;{}~") ++ .{Entry{ .sequence = "\x1B[29~" }});
 
-    // Function keys, including the distinct xterm codes for F13-F24.
+    // Function Keys. todo: f26-f35 but we need to add to input.Key
     result.set(.f1, pcStyle("\x1b[1;{}P") ++ .{Entry{ .sequence = "\x1BOP" }});
     result.set(.f2, pcStyle("\x1b[1;{}Q") ++ .{Entry{ .sequence = "\x1BOQ" }});
     result.set(.f3, pcStyle("\x1b[13;{}~") ++ .{Entry{ .sequence = "\x1BOR" }});
@@ -111,24 +116,25 @@ pub const keys = keys: {
     result.set(.f22, pcStyle("\x1b[43;{}~") ++ .{Entry{ .sequence = "\x1B[43~" }});
     result.set(.f23, pcStyle("\x1b[44;{}~") ++ .{Entry{ .sequence = "\x1B[44~" }});
     result.set(.f24, pcStyle("\x1b[45;{}~") ++ .{Entry{ .sequence = "\x1B[45~" }});
+    result.set(.f25, pcStyle("\x1b[46;{}~") ++ .{Entry{ .sequence = "\x1B[46~" }});
 
     // Keypad keys
-    result.set(.numpad_0, kpKeys("p"));
-    result.set(.numpad_1, kpKeys("q"));
-    result.set(.numpad_2, kpKeys("r"));
-    result.set(.numpad_3, kpKeys("s"));
-    result.set(.numpad_4, kpKeys("t"));
-    result.set(.numpad_5, kpKeys("u"));
-    result.set(.numpad_6, kpKeys("v"));
-    result.set(.numpad_7, kpKeys("w"));
-    result.set(.numpad_8, kpKeys("x"));
-    result.set(.numpad_9, kpKeys("y"));
-    result.set(.numpad_decimal, kpKeys("n"));
-    result.set(.numpad_divide, kpKeys("o"));
-    result.set(.numpad_multiply, kpKeys("j"));
-    result.set(.numpad_subtract, kpKeys("m"));
-    result.set(.numpad_add, kpKeys("k"));
-    result.set(.numpad_enter, kpKeys("M") ++ .{Entry{ .sequence = "\r" }});
+    result.set(.numpad_0, kpKeys("p", "0"));
+    result.set(.numpad_1, kpKeys("q", "1"));
+    result.set(.numpad_2, kpKeys("r", "2"));
+    result.set(.numpad_3, kpKeys("s", "3"));
+    result.set(.numpad_4, kpKeys("t", "4"));
+    result.set(.numpad_5, kpKeys("u", "5"));
+    result.set(.numpad_6, kpKeys("v", "6"));
+    result.set(.numpad_7, kpKeys("w", "7"));
+    result.set(.numpad_8, kpKeys("x", "8"));
+    result.set(.numpad_9, kpKeys("y", "9"));
+    result.set(.numpad_decimal, kpKeys("n", "."));
+    result.set(.numpad_divide, kpKeys("o", "/"));
+    result.set(.numpad_multiply, kpKeys("j", "*"));
+    result.set(.numpad_subtract, kpKeys("m", "-"));
+    result.set(.numpad_add, kpKeys("k", "+"));
+    result.set(.numpad_enter, kpKeys("M", "\r"));
     result.set(.numpad_up, pcStyle("\x1b[1;{}A") ++ cursorKey("\x1b[A", "\x1bOA"));
     result.set(.numpad_down, pcStyle("\x1b[1;{}B") ++ cursorKey("\x1b[B", "\x1bOB"));
     result.set(.numpad_right, pcStyle("\x1b[1;{}C") ++ cursorKey("\x1b[C", "\x1bOC"));
@@ -148,6 +154,7 @@ pub const keys = keys: {
         .{ .mods = .{ .alt = true, .shift = true }, .modify_other_keys = .set, .sequence = "\x1b\x7f" },
         .{ .mods = .{ .ctrl = true, .shift = true }, .modify_other_keys = .set, .sequence = "\x08" },
         .{ .mods = .{ .alt = true, .ctrl = true }, .modify_other_keys = .set, .sequence = "\x1b\x08" },
+        .{ .mods = .{ .alt = true, .shift = true, .ctrl = true }, .modify_other_keys = .set, .sequence = "\x1b\x08" },
         .{ .mods = .{ .super = true }, .modify_other_keys = .set, .sequence = "\x7f" },
         .{ .mods = .{ .super = true, .shift = true }, .modify_other_keys = .set, .sequence = "\x7f" },
         .{ .mods = .{ .alt = true, .super = true }, .modify_other_keys = .set, .sequence = "\x1b\x7f" },
@@ -173,8 +180,8 @@ pub const keys = keys: {
         .{ .mods = .{ .alt = true, .super = true, .ctrl = true }, .modify_other_keys = .set_other, .sequence = "\x1b[27;15;127~" },
         .{ .mods = .{ .alt = true, .super = true, .ctrl = true, .shift = true }, .modify_other_keys = .set_other, .sequence = "\x1b[27;16;127~" },
 
-        .{ .mods = .{ .ctrl = true }, .sequence = "\x08" },
-        .{ .sequence = "\x7f" },
+        .{ .mods = .{ .ctrl = true }, .sequence = "\x08", .sequence_decbkm = "\x7f" },
+        .{ .sequence = "\x7f", .sequence_decbkm = "\x08" },
     });
 
     result.set(.tab, &.{
@@ -233,7 +240,8 @@ pub const keys = keys: {
 
     result.set(.escape, &.{
         .{ .mods = .{ .shift = true }, .sequence = "\x1b[27;2;27~" },
-        .{ .mods = .{ .alt = true }, .sequence = "\x1b\x1b" },
+        .{ .mods = .{ .alt = true }, .modify_other_keys = .set, .sequence = "\x1b\x1b" },
+        .{ .mods = .{ .alt = true }, .modify_other_keys = .set_other, .sequence = "\x1b[27;3;27~" },
         .{ .mods = .{ .alt = true, .shift = true }, .sequence = "\x1b[27;4;27~" },
         .{ .mods = .{ .ctrl = true }, .sequence = "\x1b[27;5;27~" },
         .{ .mods = .{ .ctrl = true, .shift = true }, .sequence = "\x1b[27;6;27~" },
@@ -266,10 +274,12 @@ fn kpDefault(comptime suffix: []const u8) []const Entry {
 
 /// Returns the entries for a keypad key. The suffix is the final character
 /// of the sent sequence, such as "r" for kp_2.
-fn kpKeys(comptime suffix: []const u8) []const Entry {
+fn kpKeys(comptime suffix: []const u8, comptime normal: []const u8) []const Entry {
     const pc = pcStyle("\x1bO{}" ++ suffix);
     for (pc) |*entry| entry.keypad = .application;
-    return kpDefault(suffix) ++ pc;
+    return kpDefault(suffix) ++ pc ++ .{
+        Entry{ .keypad = .normal, .sequence = normal },
+    };
 }
 
 /// Returns entries that are dependent on cursor key settings.

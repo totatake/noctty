@@ -41,9 +41,11 @@ const help_strings = @import("help_strings");
 pub const Command = @import("command.zig").Command;
 const RepeatableReadableIO = @import("io.zig").RepeatableReadableIO;
 const RepeatableStringMap = @import("RepeatableStringMap.zig");
+const ProfileMap = @import("profile_map.zig");
 pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
 const windows_shell = @import("windows_shell.zig");
+const pane_launch = @import("pane_launch.zig");
 const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
 const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
 pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
@@ -818,12 +820,12 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 /// The null character (U+0000) is always treated as a boundary and does not
 /// need to be included in this configuration.
 ///
-/// Default: `` \t'"│`|:;,()[]{}<>$ ``
+/// Default: ``\t '"│`|:;,()[]{}<>$``
 ///
 /// To add or remove specific characters, you can set this to a custom value.
 /// For example, to treat semicolons as part of words:
 ///
-///     selection-word-chars = " \t'\"│`|:,()[]{}<>$"
+///     selection-word-chars = "\t '\"│`|:,()[]{}<>$"
 ///
 /// Available since: 1.3.0
 @"selection-word-chars": SelectionWordChars = .{},
@@ -970,10 +972,10 @@ palette: Palette = .{},
 /// Enables the ability to move the cursor at prompts by clicking on a
 /// location in the prompt text.
 ///
-/// This feature requires shell integration, specifically prompt marking
-/// via `OSC 133`. Some shells like Fish (v4) and Nu (0.111+) natively
-/// support this while others may require additional configuration or
-/// Ghostty's shell integration features to be enabled.
+/// This feature requires prompt marking via `OSC 133`. Some shells like Fish
+/// (v4.1+) and Nu (0.111+) natively support this while others may require
+/// additional configuration or Ghostty's shell integration features to be
+/// enabled.
 ///
 /// Depending on the shell, this works either by translating your click
 /// position into a series of synthetic arrow key movements or by sending
@@ -1108,6 +1110,14 @@ palette: Palette = .{},
 /// is 0.15. This value still looks weird but you can at least see what's going
 /// on. A value outside of the range 0.15 to 1 will be clamped to the nearest
 /// valid value.
+///
+/// On Windows the renderer draws the dim over the split's terminal content,
+/// after any `custom-shader` (so a shader that dims an unfocused terminal
+/// itself, for example through `iFocus`, dims it twice). The overlay
+/// scrollbar and a docked search bar are not dimmed. The dim follows the
+/// split each tab has selected, not keyboard focus, so the selected split of
+/// a window that is not in front stays undimmed, and a zoomed split is never
+/// dimmed. High Contrast turns it off.
 @"unfocused-split-opacity": f64 = 0.7,
 
 /// The color to dim the unfocused split. Unfocused splits are dimmed by
@@ -1116,11 +1126,18 @@ palette: Palette = .{},
 ///
 /// This will default to the background color.
 ///
+/// On Windows that is the configured `background`, not a color a program
+/// sets with OSC 11.
+///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"unfocused-split-fill": ?Color = null,
 
 /// The color of the split divider. If this is not set, a default will be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+///
+/// On Windows this colors the gap between split panes, but not the accent line
+/// around the focused split. If it is not set, the window theme's divider color
+/// is used. High Contrast uses the system colors instead.
 ///
 /// Available since: 1.1.0
 @"split-divider-color": ?Color = null,
@@ -1182,7 +1199,13 @@ palette: Palette = .{},
 /// PowerShell 7 (`pwsh.exe`) when it is found on `PATH`, else Windows
 /// PowerShell, else Command Prompt (`cmd.exe`). WSL is never the default,
 /// because `wsl.exe --status` can report a healthy installation when starting
-/// a session would still fail; use `command = wsl.exe` to choose it. A launch
+/// a session would still fail; use `command = wsl.exe` to choose it. With
+/// `default-profile` set, its profile runs in place of that default, and a
+/// `command` set in a config file overrides it (reported as a config
+/// problem; `--command` on the command line overrides it quietly).
+/// `--command` and `--initial-command` on the command line win over those
+/// lines in a file included with `config-file`, though it is read after the
+/// command line. A launch
 /// with `--safe-mode` always starts `cmd.exe /D`: no PowerShell profile and no
 /// `AutoRun` command can get in the way of recovery.
 ///
@@ -1243,6 +1266,11 @@ command: ?Command = null,
 ///     shell integration with a `-e`-executed command, you must either
 ///     name your binary appropriately or source the shell integration script
 ///     manually.
+///
+/// `-e` wins over a file `config-file` names, which is read after the
+/// command line: the command and the settings above are applied again once
+/// every config file has been read, with or without a theme. An `-e` with
+/// nothing after it is refused and changes nothing.
 @"initial-command": ?Command = null,
 
 /// Controls when command finished notifications are sent. There are
@@ -1432,6 +1460,13 @@ input: RepeatableReadableIO = .{},
 /// This can be changed at runtime but will only affect new terminal surfaces.
 @"scrollback-limit": usize = 10_000_000, // 10MB
 
+/// Compatibility setting from upstream Ghostty, which uses it to compress
+/// scrollback pages while the terminal is idle.
+///
+/// This has no effect in the Windows-only fork, which does not compress
+/// scrollback.
+@"scrollback-compression": bool = true,
+
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
 /// The default value is `system`.
@@ -1486,6 +1521,22 @@ link: RepeatableLink = .{},
 /// `link`). If you want to customize URL matching, use `link` and disable this.
 @"link-url": bool = true,
 
+/// Enable hyperlinks created with the OSC 8 escape sequence. When disabled,
+/// noctty does not use the target a program puts behind OSC 8 link text:
+/// Ctrl+hover, Ctrl+click, the context menu's link selection and
+/// `copy_url_to_clipboard` see only what `link` and `link-url` match in the
+/// text itself.
+///
+/// Two things still show OSC 8 hyperlinks when disabled. A copy that
+/// includes HTML, as the default copy bindings do, keeps a web, mail or ftp
+/// target as a link. The Ctrl+hover highlight can still light an OSC 8
+/// hyperlink when the hovered text is itself a matched URL.
+///
+/// This does not affect URL matching controlled by `link-url`.
+///
+/// Available since: 1.4.0
+@"link-osc8": bool = true,
+
 /// Show link previews for a matched URL.
 ///
 /// When true, link previews are shown for all matched URLs. When false, link
@@ -1500,12 +1551,26 @@ link: RepeatableLink = .{},
 /// to new windows and does not apply to tabs, splits, etc. However, this setting
 /// will apply to all new windows, not just the first one.
 ///
+/// On Windows this includes a window restored from the saved session (see
+/// `window-save-state`) and a window opened from a named layout. A restored
+/// window is maximized over the rect it was saved at, and that rect is the
+/// one it returns to. It does not apply to the quick terminal or to a console
+/// handed off as the default terminal, which starts in the show state its
+/// program asked for. Changing it does not change windows that are already
+/// open.
+///
 /// Available since: 1.1.0
 maximize: bool = false,
 
 /// Start new windows in fullscreen. This setting applies to new windows and
 /// does not apply to tabs, splits, etc. However, this setting will apply to all
 /// new windows, not just the first one.
+///
+/// On Windows it applies to the same windows as `maximize`. A window that
+/// starts fullscreen leaves fullscreen to the window it would otherwise have
+/// been, maximized when `maximize` is also set. The saved session does not
+/// record fullscreen: a fullscreen window is saved as the window it leaves
+/// fullscreen to. On the command line it needs a value: `--fullscreen=true`.
 ///
 /// Allowable values are:
 ///
@@ -1586,6 +1651,185 @@ class: ?[:0]const u8 = null,
 /// configuration — including any `ProxyCommand` it specifies. Set this to
 /// `false` to remove the SSH entries.
 @"ssh-config-hosts": bool = true,
+
+/// List the developer shells of each installed Visual Studio (2017 or later)
+/// in the profile picker and the command palette, as Windows Terminal does:
+/// "Developer Command Prompt for VS 18", which runs `VsDevCmd.bat`, and
+/// "Developer PowerShell for VS 18", which runs `Enter-VsDevShell`. They are
+/// listed after your own profiles and before the SSH hosts, start in your
+/// home directory, and set up the tools for the architecture noctty runs on.
+/// Their keys (for `default-profile`, `profile-order` and `profile-hidden`)
+/// are `vs:<instance id>:cmd` and `vs:<instance id>:pwsh`; the instance id
+/// survives Visual Studio updates.
+///
+/// Visual Studio is asked through its Setup Configuration API, which reads
+/// what the Visual Studio Installer recorded; nothing is run to find it.
+///
+///   * `newest` - Every instance, with all but the newest hidden: the hidden
+///     ones are not listed, but a saved session or `default-profile` that
+///     names one still starts it.
+///
+///   * `all` - Every instance, listed.
+///
+///   * `none` - None, and Visual Studio is not asked.
+@"visual-studio-profiles": VisualStudioProfiles = .newest,
+
+/// Define a profile of your own: a named command the profile picker and the
+/// command palette list next to the shells noctty detects (after the local
+/// shells, before the SSH hosts), and that session restore brings back.
+///
+/// The value is `<id>: <command line>`. The id names the profile: 1 to 64
+/// ASCII letters, digits, `.`, `_` or `-`, compared without case. It is how
+/// a saved session or layout remembers the profile, so renaming the label
+/// (`profile-name`) keeps it, while changing the id makes a new profile.
+/// Some ids are taken because they already name a detected profile or a
+/// word for one: `pwsh.exe`, `powershell.exe`, `cmd.exe`, `git-bash`,
+/// `wsl-default`, `pwsh`, `powershell`, `powershell-7`, `powershell-core`,
+/// `windows-powershell`, `ps`, `git`, `gitbash`, `cmd`, `command-prompt`,
+/// `wsl`, `default-wsl`, `wsl-distro`, `distro`, `user`, `ssh` and `vs`.
+///
+/// The command line is a Windows command line, the same text as the Command
+/// line of a Windows Terminal profile or a shortcut's Target: everything
+/// after the id's `:` is used exactly as written, and nothing is unquoted or
+/// unescaped. `%NAME%` is replaced by the value the shell would get without
+/// this profile: Windows' variables with your `env` lines applied (a name
+/// that is not set stays as written), so quote a path that holds a variable
+/// which may expand to spaces. noctty starts the program with that line,
+/// without a `cmd.exe /C` wrapper. When noctty has to change the arguments
+/// (PowerShell shell integration, the WSL directory option, the UTF-8
+/// preamble of a plain `cmd.exe`, `initial-command`), the changed arguments
+/// are quoted again in the standard way. The `direct:` and `shell:` forms of
+/// `command` are not accepted here.
+///
+///   * `profile-command = py312: cmd.exe`
+///
+/// `profile-command = <id>:`, with nothing after the colon, removes the
+/// profile together with its other `profile-*` lines, including lines a file
+/// read later adds for it; a later `profile-command` line for the id brings
+/// it back with them, in its old place. `profile-command =` removes every
+/// profile defined before it. Profiles are listed in the order of the first
+/// `profile-command` line naming each id.
+///
+/// Settings' Profiles page edits the `profile-command`, `profile-name`,
+/// `profile-working-directory` and `profile-env` lines of the file it saves
+/// to, one field at a time: it changes the line that sets the field in place,
+/// puts a field the file has no line for after its profile's last line (or,
+/// for a profile the file has no line for, in a block of its own at the end
+/// of the file), and removes a profile by
+/// deleting its lines, or with `profile-command = <id>:` when something else
+/// still names it (another file or the command line, `profile-order`,
+/// `profile-hidden` or `default-profile`). Every other line stays as it is.
+///
+/// Only whole lines that start with `#` are comments, and a line can be at
+/// most 4094 bytes long (a longer one is reported and skipped).
+@"profile-command": ProfileMap.Command = .{},
+
+/// The label of a profile defined by `profile-command`, as
+/// `<id>: <label>`, in the picker and the palette. The id itself is shown
+/// when no label is set. Quotes around the whole label are removed.
+///
+///   * `profile-name = py312: Python 3.12`
+@"profile-name": ProfileMap.Name = .{},
+
+/// Where a profile defined by `profile-command` starts, as `<id>: <value>`,
+/// with the values `working-directory` takes: `home`, `inherit`, or a path
+/// (`~/` is your home folder, `%NAME%` is expanded as in `profile-command`,
+/// forward slashes work, and a folder with spaces needs no quotes). Without
+/// it, a profile opened from the picker or the palette starts in the home
+/// directory (for `wsl.exe`, the Linux home). `home` and a path also hold for
+/// a split of the profile, unless `split-inherit-working-directory` gives it
+/// the source pane's. `inherit` follows the usual rules instead
+/// (`working-directory` and the `*-inherit-working-directory` settings). A
+/// restored pane always returns to the directory it was in, and an elevated
+/// window (`new_window_elevated:user:<id>`) starts in the directory of the
+/// pane it was opened from.
+///
+///   * `profile-working-directory = py312: %USERPROFILE%\src`
+@"profile-working-directory": ProfileMap.Text = .{},
+
+/// One environment variable for a profile defined by `profile-command`, as
+/// `<id>: KEY=VALUE`. Repeat it for more. Names are compared without case,
+/// as Windows does: a later `Path=` replaces an earlier `PATH=`, and a
+/// profile `PATH` replaces a `Path` set with `env`. `<id>: KEY=` takes back
+/// this profile's `KEY` (one a shared file set, for example); it does not
+/// remove a variable that `env` or Windows gives every shell. `<id>:` takes
+/// back all of the profile's variables. `%NAME%` in a value is replaced as
+/// in `profile-command`, by the value the shell would get without this
+/// profile, so `profile-env = py: PATH=C:\Python312;%PATH%` puts a directory
+/// in front of the search path, `env` lines included. A profile cannot use a
+/// variable it sets itself. Like an `env` one, a profile `PATH` is the
+/// shell's whole `PATH`: noctty's own folder is no longer put first, and
+/// `%PATH%` holds it only if noctty's own `PATH` does (`GHOSTTY_BIN_DIR`
+/// still names it). An elevated window of a profile defined in a config
+/// file (`new_window_elevated:user:<id>`, or New Elevated Window from a
+/// pane that runs it) names the profile and reads the same files, so these
+/// variables are not on its command line. For a profile defined only by a
+/// `--profile-command` option on noctty's command line, or given a variable
+/// by a `--profile-env` option there, or when that command line has an
+/// `--env` option, they are, and a command line is not private (process
+/// tools and process-creation auditing can show it).
+@"profile-env": ProfileMap.Env = .{},
+
+/// The profile a terminal runs when nothing else chose one, in place of the
+/// automatic default (PowerShell 7, else Windows PowerShell, else Command
+/// Prompt): the first window, a new tab, a new window, the quick terminal, a
+/// split of a pane that runs no profile, and a restored pane whose profile no
+/// longer exists. The value names a profile: the id of one defined with
+/// `profile-command` (or `user:<id>`), a detected profile's key (`pwsh.exe`,
+/// `powershell.exe`, `cmd.exe`, `git-bash`, `wsl-default`,
+/// `wsl:<distribution>`, `ssh:<alias>`, `vs:<instance id>:cmd`,
+/// `vs:<instance id>:pwsh`), `vs:newest:cmd` or `vs:newest:pwsh` for the
+/// newest Visual Studio, or a short name (`pwsh`, `powershell`, `git`,
+/// `cmd`, `wsl`). A distribution is always written `wsl:<distribution>`.
+/// Labels are not references, because they can change.
+///
+/// The profile brings its command, its `profile-env` variables and its
+/// `profile-working-directory`. Without a directory of its own it starts
+/// where `working-directory` and the `*-inherit-working-directory` settings
+/// say, as `command` does. A directory the launch asks for with
+/// `--working-directory` (also on a second `noctty` that forwards to a
+/// running one), or the directory `noctty +new-window` runs in, wins over the
+/// profile's, except an SSH profile's; a second `noctty` that names none
+/// opens in the profile's directory, as the first one did. The terminal
+/// remembers the profile, so its splits and a restored session run it again,
+/// and the profile picker opens on it until another profile is chosen there.
+///
+/// `command` wins when it is set. Set in a config file, that is reported as a
+/// config problem, since this setting then does nothing; `--command` on the
+/// command line wins without one. `initial-command` (`-e`) still runs in the
+/// first window, and a restored pane or a profile chosen in the picker runs
+/// its own profile. A value that names no profile that can start here is a
+/// config problem, and the automatic default runs. Finding the profile
+/// starts nothing: WSL is not asked for its distributions, and only a `vs:`
+/// value asks Visual Studio's Setup Configuration for its installs. When
+/// Setup Configuration does not answer, that is reported as its own problem
+/// and the automatic default runs until the config is reloaded.
+/// Safe mode does not read it. On the command line it also wins over a
+/// `default-profile` line in a file included with `config-file`, and makes
+/// an explicit launch, which starts without the saved session.
+@"default-profile": ?[:0]const u8 = null,
+
+/// A profile to list first in the profile picker and the command palette;
+/// repeat it to list several, in that order. A value names profiles as
+/// `default-profile` does, and a name such as `wsl` can name several. The
+/// other profiles keep their order after them. When this is set,
+/// `NOCTTY_WIN32_PROFILE_ORDER` is not used. `profile-order =` clears it. A
+/// value that cannot name a profile (a typo, an id no `profile-command` line
+/// defines, a comment after the value) is reported as a config problem; one
+/// that names a shell this machine does not have (`wsl:docker-desktop`, an
+/// `ssh:` host) is not, so a shared config loads quietly everywhere.
+@"profile-order": RepeatableString = .{},
+
+/// A profile to leave out of the profile picker, the command palette, the
+/// taskbar jump list and the quick slots; repeat it for each one. A value
+/// names profiles as `default-profile` does (`profile-hidden = wsl` hides the
+/// default distribution and every other one). A hidden profile still runs
+/// where something names it: `default-profile`, a restored session or
+/// layout, `new_window_elevated:<key>`, a split of a pane that runs it. A
+/// quick slot pinned to it keeps the pin but does not show it.
+/// `profile-hidden =` clears it. Values are reported as `profile-order`'s
+/// are.
+@"profile-hidden": RepeatableString = .{},
 
 /// Key bindings. The format is `trigger=action`. Duplicate triggers will
 /// overwrite previously set values. The list of actions is available in
@@ -2180,18 +2424,14 @@ keybind: Keybinds = .{},
 /// Supported in the Windows-only fork.
 @"window-theme": WindowTheme = .auto,
 
-/// Follow the Windows accent color (Settings > Personalization > Colors) in
-/// the window chrome. When `false`, the chrome keeps the built-in accent of
-/// the resolved `window-theme`.
+/// Deprecated compatibility setting retained for configuration parsing.
+/// It has no effect in this Windows-only fork.
 ///
-/// The tab strip is the first part of the chrome that follows it: the active
-/// tab's border and underline, and the accent strip above a separate tab row.
-/// The color is lightened or darkened only as far as needed to stay readable
-/// against the tab strip. Changing the Windows accent applies immediately.
-/// Windows High Contrast always uses system colors, regardless of this
-/// setting.
-///
-/// Supported in the Windows-only fork.
+/// It made the active tab's border and underline follow the Windows accent
+/// color. The tab strip no longer uses an accent color: the active tab takes
+/// the terminal's background instead, as in Windows Terminal, so nothing in
+/// the window chrome follows the Windows accent. Existing configurations that
+/// set it still load without an error.
 @"accent-follow-system": bool = true,
 
 /// The color space to use when interpreting terminal colors. "Terminal colors"
@@ -2277,11 +2517,23 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// On Windows the session's owning process saves on exit, at sign-out or
-/// shutdown, when the display configuration changes, and one second after
-/// a burst of window, tab or pane structural changes settles. Checkpoints
-/// use the same ownership and privacy rules as the exit save and never run
-/// during startup restore. The practical window/session shape includes:
+/// On Windows the session's owning process saves as the session ends (the
+/// last window going, however it goes: its close, its last tab or pane, its
+/// last shell exiting; or a quit, which saves every window it closes), at
+/// sign-out or shutdown, when the display configuration changes, and one
+/// second after a burst of window, tab or pane structural changes settles.
+/// The next launch restores what was open when the session ended; undo
+/// history is not saved, and no save deletes the file. One exception: a
+/// session restored at startup that nothing used (no input reached a running
+/// program, and no tab, pane, window or quick terminal was opened) and
+/// whose programs all ended by themselves is not saved back, since it would
+/// open and close again at every launch. Its saved file is renamed to
+/// `session-state.json.restore-ended` instead (up to five copies), and the
+/// next launch starts fresh. With all five names taken, the file is left in
+/// place and the next launch restores it again.
+/// Checkpoints use the same ownership and privacy rules as the save when the
+/// last window goes and never run during startup restore. The practical
+/// window/session shape includes:
 /// host window rectangle/state plus tab, split, profile, working-directory,
 /// and explicit title metadata. Child process state is not restored. The
 /// opt-in `window-save-state-scrollback` setting can additionally restore a
@@ -2358,6 +2610,13 @@ keybind: Keybinds = .{},
 ///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"window-titlebar-foreground": ?Color = null,
+
+/// Compatibility setting from upstream Ghostty's macOS and GTK apps, where it
+/// controls when drag handles are shown over splits. Valid values are
+/// `always`, `auto` and `never`.
+///
+/// This has no effect in the Windows-only fork.
+@"drag-handle": DragHandle = .auto,
 
 /// This controls when resize overlays are shown. Resize overlays are a
 /// transient popup that shows the size of the terminal while the surfaces are
@@ -2943,9 +3202,16 @@ keybind: Keybinds = .{},
 /// command-palette-entry = title:"noctty",description:"Add a little noctty to your terminal.",action:"text:\xf0\x9f\x91\xbb"
 /// ```
 ///
+/// There are some additional special values that can be specified for
+/// command-palette-entry:
+///
+///   * `command-palette-entry=clear` will clear all command entries. Warning: this
+///     removes ALL entries up to this point, including the default
+///     entries. Available since: 1.4.0
+///
 /// By default, the command palette is preloaded with most actions that might
 /// be useful in an interactive setting yet do not have easily accessible or
-/// memorizable shortcuts. The default entries can be cleared by setting this
+/// memorizable shortcuts. The default entries can be restored by setting this
 /// setting to an empty value:
 ///
 /// ```ini
@@ -3312,6 +3578,11 @@ keybind: Keybinds = .{},
 /// Retained compatibility setting from the removed GTK runtime.
 ///
 /// This has no effect in the Windows-only fork.
+@"gtk-tabs-inverted": bool = false,
+
+/// Retained compatibility setting from the removed GTK runtime.
+///
+/// This has no effect in the Windows-only fork.
 @"gtk-titlebar-hide-when-maximized": bool = false,
 
 /// Retained compatibility setting from the removed GTK runtime.
@@ -3328,6 +3599,11 @@ keybind: Keybinds = .{},
 ///
 /// This has no effect in the Windows-only fork.
 @"gtk-wide-tabs": bool = true,
+
+/// Retained compatibility setting from the removed GTK runtime.
+///
+/// This has no effect in the Windows-only fork.
+@"gtk-horizontal-tab-scroll": bool = true,
 
 /// Retained compatibility setting from the removed GTK runtime.
 ///
@@ -3469,9 +3745,15 @@ term: []const u8 = "xterm-ghostty",
 /// This is set by the CLI parser for deinit.
 _arena: ?ArenaAllocator = null,
 
-/// Command was filled by automatic Windows shell resolution, rather than
-/// supplied by a config layer. The executable stays available to runtime callers.
-_command_defaulted: bool = false,
+/// What a load decided of the launch (`pane_launch.Ledger`).
+_launch: pane_launch.Ledger = .{},
+
+/// The command `-e` was given on the command line, word by word, when the
+/// parse took it: `finalize` applies it and the settings `-e` implies again
+/// (`pane_launch.finalizeECommand`), so `-e` wins over a file `config-file`
+/// names (read after the command line) whether or not a theme replays the
+/// log. Null for no `-e`, and for an `-e` refused for want of a command.
+_e_command: ?[]const [:0]const u8 = null,
 
 /// The last config file that was skipped whole because it is UTF-16 text that
 /// does not decode (see `loadReader`); everything it set is missing from this
@@ -3577,10 +3859,14 @@ pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
     try self.loadFsFile(alloc, &file, path);
 }
 
+/// The read buffer for a config or theme file. Lines are read through it with
+/// `cli.args.LineIterator`, so the tests place lines on its boundary.
+const file_read_buffer_len = 2048;
+
 /// Load config from the given File.
 fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const u8) !void {
     std.log.info("reading configuration file path={s}", .{path});
-    var buf: [2048]u8 = undefined;
+    var buf: [file_read_buffer_len]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     try self.loadReader(alloc, reader, path);
@@ -3612,7 +3898,7 @@ const ConfigFileIterator = struct {
 };
 
 /// Load config from the given Reader.
-fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
+pub fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
     bom: {
         // If the file starts with a UTF-8 byte order mark, skip it.
         // https://en.wikipedia.org/wiki/Byte_order_mark#UTF-8
@@ -3645,8 +3931,53 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
     var line_iter: cli.args.LineIterator = .{ .r = source, .filepath = path };
     var iter: ConfigFileIterator = .{ .inner = &line_iter };
     try self.loadIter(alloc, &iter);
+    // A read that failed partway through reads as the end of the file, and
+    // what came after is missing: a problem, as a file that will not open
+    // is (`loadRecursiveFiles`).
+    if (line_iter.read_failed) try self.noteReadFailure("config-file", path, true);
 
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+test "a config file whose read fails partway through is a problem, and what was read before it applies" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var buf: [16]u8 = undefined;
+    var failing = cli.args.TestFailingReader.init("font-size = 13\nprofile-command = py: x\nfont-fam", &buf);
+    try cfg.loadReader(alloc, &failing.interface, "C:\\noctty-test\\more.conf");
+    try testing.expect(cfg.@"font-size" == 13);
+    try testing.expect(cfg.@"profile-command".get("py") != null);
+    var found: usize = 0;
+    for (cfg._diagnostics.items()) |diag| {
+        if (!std.mem.startsWith(u8, diag.message, "error reading ")) continue;
+        // The path and the error; never the file's text.
+        try testing.expectEqualStrings("error reading config-file C:\\noctty-test\\more.conf: error.ReadFailed", diag.message);
+        found += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), found);
+    // A whole file records nothing of the kind.
+    var whole = try Config.default(alloc);
+    defer whole.deinit();
+    var reader: std.Io.Reader = .fixed("font-size = 13\nprofile-command = py: x\n");
+    try whole.loadReader(alloc, &reader, "C:\\noctty-test\\more.conf");
+    try testing.expect(whole._diagnostics.empty());
+    try testing.expect(whole.@"font-size" == 13);
+}
+
+/// A read of `what` (`config-file`, `theme`) at `path` that failed partway
+/// through (`LineIterator.read_failed`): recorded as a problem, "error
+/// reading <what> <path>: error.ReadFailed", which never holds the file's
+/// text. `replay` keeps it in the replay log too, as the other problems of a
+/// config file are kept.
+fn noteReadFailure(self: *Config, what: []const u8, path: []const u8, replay: bool) !void {
+    const arena_alloc = self._arena.?.allocator();
+    const diag: cli.Diagnostic = .{
+        .message = try std.fmt.allocPrintSentinel(arena_alloc, "error reading {s} {s}: {}", .{ what, path, error.ReadFailed }, 0),
+    };
+    try self._diagnostics.append(arena_alloc, diag);
+    if (replay) try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
 }
 
 /// The byte order of the UTF-16 text `reader` starts with, if its first two
@@ -3719,11 +4050,7 @@ pub fn dropLaunchLayoutReplaySteps(self: *Config, from: usize) ?[]const u8 {
     }
     while (i > from) {
         i -= 1;
-        const arg: []const u8 = switch (self._replay_steps.items[i]) {
-            .arg => |value| value.value,
-            .conditional_arg => |value| value.arg,
-            else => continue,
-        };
+        const arg = self._replay_steps.items[i].argText() orelse continue;
         const value = launchLayoutArgValue(arg) orelse continue;
         // Iterating backwards, so the first match is the file's last word.
         if (found == null) found = value;
@@ -3763,11 +4090,7 @@ test "launch-layout is ignored in configuration files" {
         // and `changeConditionalState` both re-run `_replay_steps` through
         // `loadIter`, which does not pass through `loadReader`.
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.startsWith(u8, arg, "--launch-layout"));
         }
 
@@ -3833,11 +4156,7 @@ test "launch-layout is ignored in configuration files" {
         try testing.expectEqualStrings("CLI Layout", cfg.@"launch-layout".?);
 
         for (cfg._replay_steps.items) |step| {
-            const arg: []const u8 = switch (step) {
-                .arg => |value| value.value,
-                .conditional_arg => |value| value.arg,
-                else => continue,
-            };
+            const arg = step.argText() orelse continue;
             try testing.expect(!std.mem.eql(u8, arg, "--launch-layout=Theme Layout"));
         }
     }
@@ -4048,6 +4367,100 @@ test "a UTF-16 config file on disk is read through loadFile" {
     try cfg.loadFile(alloc, path);
     try testing.expect(cfg._diagnostics.empty());
     try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
+}
+
+/// `len` bytes of comment lines, each at most 65 bytes, for placing the next
+/// line at a chosen offset in a test config file. `len` must be at least 2.
+fn testCommentLines(alloc: Allocator, len: usize) ![]u8 {
+    assert(len >= 2);
+    const out = try alloc.alloc(u8, len);
+    var pos: usize = 0;
+    while (pos < len) {
+        const remaining = len - pos;
+        // The last line takes what is left, so no 1-byte remainder is left
+        // over for a line that cannot hold a '#'.
+        const line_len = if (remaining >= 66) 64 else remaining;
+        out[pos] = '#';
+        @memset(out[pos + 1 .. pos + line_len - 1], 'x');
+        out[pos + line_len - 1] = '\n';
+        pos += line_len;
+    }
+    return out;
+}
+
+test "loadFile reads lines after an ignored line that ends at the read buffer boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const boundary = file_read_buffer_len;
+    const setting = "font-size = 77\n";
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Case = struct {
+        name: []const u8,
+        /// Bytes before `setting`: comment lines, then `blank` blank lines.
+        before: usize,
+        blank: usize = 0,
+        /// Comment bytes after `setting`, then `tail`.
+        after: usize = 0,
+        tail: []const u8 = "",
+    };
+    const cases = [_]Case{
+        // A comment line ends exactly at the end of the buffer. Before the
+        // fix the loader took that for the end of the file and silently
+        // dropped every setting after it.
+        .{ .name = "comment run", .before = boundary },
+        // The same with blank lines.
+        .{ .name = "blank line run", .before = boundary, .blank = 40 },
+        // The setting itself crosses the boundary.
+        .{ .name = "setting across the boundary", .before = boundary - 8 },
+        // The file ends exactly at the boundary, on the setting...
+        .{ .name = "setting ends the file at the boundary", .before = boundary - setting.len },
+        // ...and on a comment after it.
+        .{ .name = "comment ends the file at the boundary", .before = 100, .after = boundary - 100 - setting.len },
+        // The next call after the setting refills the buffer from just past
+        // the setting, so a comment run of exactly one buffer after it ends
+        // on the next boundary, before a second setting.
+        .{
+            .name = "comment runs end at two boundaries",
+            .before = boundary,
+            .after = boundary,
+            .tail = "cursor-style = underline\n",
+        },
+    };
+
+    for (cases, 0..) |case, i| {
+        errdefer std.debug.print("case failed: {s}\n", .{case.name});
+
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(alloc);
+        const comments_before = try testCommentLines(alloc, case.before - case.blank);
+        defer alloc.free(comments_before);
+        try data.appendSlice(alloc, comments_before);
+        try data.appendNTimes(alloc, '\n', case.blank);
+        try testing.expectEqual(case.before, data.items.len);
+        try data.appendSlice(alloc, setting);
+        if (case.after > 0) {
+            const comments_after = try testCommentLines(alloc, case.after);
+            defer alloc.free(comments_after);
+            try data.appendSlice(alloc, comments_after);
+        }
+        try data.appendSlice(alloc, case.tail);
+
+        const name = try std.fmt.allocPrint(alloc, "case{d}.ghostty", .{i});
+        defer alloc.free(name);
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = data.items });
+        const path = try tmp.dir.realpathAlloc(alloc, name);
+        defer alloc.free(path);
+
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadFile(alloc, path);
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(@as(f32, 77), cfg.@"font-size");
+        if (case.tail.len > 0) try testing.expect(cfg.@"cursor-style" == .underline);
+    }
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
@@ -4716,12 +5129,27 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     errdefer new_config.deinit();
 
     // Load our theme
-    var buf: [2048]u8 = undefined;
+    var buf: [file_read_buffer_len]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     var line_iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
     var iter: ConfigFileIterator = .{ .inner = &line_iter };
     try new_config.loadIter(alloc_gpa, &iter);
+    // As for a config file (`loadReader`); kept out of the replay log, as
+    // the theme's other problems are (below).
+    if (line_iter.read_failed) try new_config.noteReadFailure("theme", path, false);
+
+    // The theme file's own problems (an over-long line) stay in
+    // `_diagnostics` but not in the replay log: every `finalize` reads the
+    // current theme again, so a replayed copy would only carry one theme's
+    // problem into the other theme's config.
+    var kept: usize = 0;
+    for (new_config._replay_steps.items) |step| {
+        if (step == .diagnostic) continue;
+        new_config._replay_steps.items[kept] = step;
+        kept += 1;
+    }
+    new_config._replay_steps.shrinkRetainingCapacity(kept);
 
     // Setup our replay to be conditional.
     conditional: for (new_config._replay_steps.items) |*item| {
@@ -4768,8 +5196,10 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     }
 
     // Replay our previous inputs so that we can override values
-    // from the theme.
+    // from the theme. The theme lines an earlier `loadTheme` left in the
+    // log (a config finalized again) are not: the theme was just read.
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
+    slice_it.skip_theme_lines = true;
     try new_config.loadIter(alloc_gpa, &slice_it);
 
     // The replay re-applies values, not the loader's record of a file it
@@ -4836,6 +5266,10 @@ pub fn finalize(self: *Config) !void {
         self.term = "xterm-ghostty";
     }
 
+    // `default-profile`, and on Windows the automatic default when neither
+    // it nor a layer set `command`.
+    try pane_launch.finalize(self);
+
     // The default for the working directory depends on the system.
     var wd: WorkingDirectory = self.@"working-directory" orelse if (probable_cli)
         .inherit
@@ -4850,9 +5284,11 @@ pub fn finalize(self: *Config) !void {
     {
         if (self.command == null or wd == .home) command: {
             // First look up the command using the SHELL env var if needed.
-            if (self.command) |cmd|
-                log.info("shell src=config value={}", .{cmd})
-            else shell_env: {
+            if (self.command) |cmd| {
+                // The automatic default logged its own line where it was
+                // chosen (`pane_launch.finalize`).
+                if (self._launch.command_from != .automatic) log.info("shell src=config value={f}", .{cmd.redacted()});
+            } else shell_env: {
                 // Windows shell resolution is handled explicitly below so that
                 // an unset `command` consistently follows pwsh, then Windows
                 // PowerShell, then cmd.exe (never WSL).
@@ -4864,7 +5300,7 @@ pub fn finalize(self: *Config) !void {
                 if (!probable_cli) break :shell_env;
 
                 if (std.process.getEnvVarOwned(alloc, "SHELL")) |value| {
-                    log.info("default shell source=env value={s}", .{value});
+                    log.info("default shell source=env value={f}", .{internal_os.redact.bytes(value)});
 
                     const copy = try alloc.dupeZ(u8, value);
                     self.command = .{ .shell = copy };
@@ -4876,10 +5312,6 @@ pub fn finalize(self: *Config) !void {
 
             switch (builtin.os.tag) {
                 .windows => {
-                    if (self.command == null) {
-                        try self.resolveWindowsDefaultCommand();
-                    }
-
                     if (wd == .home and !windows_shell.isWslCommand(self.command.?)) {
                         var buf: [std.fs.max_path_bytes]u8 = undefined;
                         if (try internal_os.home(&buf)) |home| {
@@ -4895,14 +5327,14 @@ pub fn finalize(self: *Config) !void {
                     const pw = try internal_os.passwd.get(alloc);
                     if (self.command == null) {
                         if (pw.shell) |sh| {
-                            log.info("default shell src=passwd value={s}", .{sh});
+                            log.info("default shell src=passwd value={f}", .{internal_os.redact.bytes(sh)});
                             self.command = .{ .shell = sh };
                         }
                     }
 
                     if (wd == .home) {
                         if (pw.home) |home| {
-                            log.info("default working directory src=passwd value={s}", .{home});
+                            log.info("default working directory src=passwd value={f}", .{internal_os.redact.bytes(home)});
                             wd = .{ .path = home };
                         } else {
                             wd = .inherit;
@@ -4989,25 +5421,684 @@ pub fn finalize(self: *Config) !void {
     self.@"key-remap".finalize();
 }
 
-/// Resolve the automatic Windows command without hiding whether it was explicit.
-pub fn resolveWindowsDefaultCommand(self: *Config) !void {
-    if (self.command != null) return;
-    const cmd = try windows_shell.defaultCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-default value={}", .{cmd});
-    self.command = cmd;
-    self._command_defaulted = true;
+/// What `-e` with `command` sets: the command, and the settings it implies
+/// (see `initial-command`). This is the one place those settings are
+/// written: the parse calls it when `-e` has a command, and
+/// `pane_launch.finalizeECommand` calls it to apply `-e` again over the files
+/// read after the command line, so both give the same values.
+pub fn applyECommand(self: *Config, command: []const [:0]const u8) void {
+    self.@"initial-command" = .{ .direct = command };
+    self.@"single-instance" = .false;
+    self.@"gtk-single-instance" = .false;
+    self.@"quit-after-last-window-closed" = true;
+    self.@"quit-after-last-window-closed-delay" = null;
+    if (self.@"shell-integration" != .none) {
+        self.@"shell-integration" = .detect;
+    }
 }
 
-/// Give a config with no `command` the one safe mode starts, so a recovery
-/// launch runs neither the user's PowerShell profile nor AutoRun. Call it before
-/// `finalize`, which then has no default to look for: safe mode searches no
-/// `PATH`. The command stays marked automatic. A command already set stays.
-pub fn useWindowsRecoveryCommand(self: *Config) !void {
-    if (self.command != null) return;
-    const cmd = try windows_shell.recoveryCommand(self._arena.?.allocator());
-    log.info("default shell src=windows-recovery value={}", .{cmd});
-    self.command = cmd;
-    self._command_defaulted = true;
+/// `pane_launch.filesDefaultProfile`, under the name
+/// win32_settings_reference.zig still calls until it moves to the query.
+pub const defaultProfileFromFiles = pane_launch.filesDefaultProfile;
+
+/// Load `text` as one config file and finalize it, as a real load does.
+fn testLoadProfileText(alloc: Allocator, text: []const u8) !Config {
+    var cfg = try Config.default(alloc);
+    errdefer cfg.deinit();
+    var reader: std.Io.Reader = .fixed(text);
+    try cfg.loadReader(alloc, &reader, "C:\\noctty-test\\config.ghostty");
+    try cfg.finalize();
+    return cfg;
+}
+
+/// The config as `+show-config` writes it (only the changed keys).
+fn testFormatChanged(alloc: Allocator, cfg: *const Config) ![]u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+    const FileFormatter = @import("formatter_file.zig").FileFormatter;
+    try buf.writer.print("{f}", .{FileFormatter{ .alloc = alloc, .config = cfg, .changed = true }});
+    return try buf.toOwnedSlice();
+}
+
+/// The user profile example of the design (discussion #529, VS 18), plus
+/// values that a Windows command line holds and a loader must not touch.
+const test_profile_text =
+    \\profile-name = vs18-cmd: Developer Command Prompt for VS 18
+    \\profile-command = vs18-cmd: cmd.exe /k "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -startdir=none -arch=x64 -host_arch=x64
+    \\
+    \\profile-name = vs18-ps: Developer PowerShell for VS 18
+    \\profile-command = vs18-ps: powershell.exe -NoExit -Command "&{Import-Module 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'; Enter-VsDevShell 1234abcd -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'}"
+    \\
+    \\profile-name = py312: Python 3.12
+    \\profile-command = py312: cmd.exe
+    \\profile-working-directory = py312: ~/src
+    \\profile-env = py312: PATH=C:\Python312;C:\Python312\Scripts;%PATH%
+    \\profile-command = quoting: cmd.exe /k ""C:\Tools Dir\init.cmd" "some arg"" & echo "a&b" %USERPROFILE%\x\
+    \\profile-working-directory = quoting: "%USERPROFILE%\a b\"
+    \\profile-env = quoting: WEIRD="quoted" \back\slash\ 100%
+    \\
+;
+
+test "profile keys keep every value exactly as written and format back to the same lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const long_arg = "x" ** 320;
+    const long_line = "profile-command = long: tool.exe " ++ long_arg ++ "\n";
+    const text = test_profile_text ++ long_line;
+
+    var cfg = try testLoadProfileText(alloc, text);
+    defer cfg.deinit();
+    // On a build without these keys, each line is an unknown-field problem.
+    for (cfg._diagnostics.list.items) |diag| std.debug.print("unexpected diagnostic: {s}: {s}\n", .{ diag.key, diag.message });
+    try testing.expect(cfg._diagnostics.empty());
+
+    const formatted = try testFormatChanged(alloc, &cfg);
+    defer alloc.free(formatted);
+    // Every profile line comes back byte for byte, in first-seen order, with
+    // `name = id: value` spacing (the original lines already use it).
+    var last: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or !std.mem.startsWith(u8, line, "profile-command")) continue;
+        const found = std.mem.indexOf(u8, formatted, line) orelse {
+            std.debug.print("missing line: {s}\n", .{line});
+            return error.TestExpectedEqual;
+        };
+        try testing.expect(found >= last);
+        last = found;
+    }
+    lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, formatted, line) == null) {
+            std.debug.print("missing line: {s}\n", .{line});
+            return error.TestExpectedEqual;
+        }
+    }
+
+    // And the formatted text loads back into the same configuration.
+    var again = try testLoadProfileText(alloc, formatted);
+    defer again.deinit();
+    try testing.expect(again._diagnostics.empty());
+    const reformatted = try testFormatChanged(alloc, &again);
+    defer alloc.free(reformatted);
+    try testing.expectEqualStrings(formatted, reformatted);
+}
+
+test "profile keys: a line of the longest length the reader takes formats to a line it takes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const max = cli.args.LineIterator.max_line_len;
+    const fill = struct {
+        fn line(comptime head: []const u8, comptime byte: u8, comptime tail: []const u8) []const u8 {
+            return head ++ [_]u8{byte} ** (max - head.len - tail.len) ++ tail;
+        }
+    }.line;
+    // Each line is exactly `max` bytes as written, without the optional
+    // spaces; written back with them it would be 3 bytes too long.
+    const long_lines = comptime [_][]const u8{
+        fill("profile-command=long:tool.exe ", 'c', ""),
+        fill("profile-name=long:", 'n', ""),
+        fill("profile-name=quoted:\" ", 'q', "\""),
+        fill("profile-working-directory=long:C:\\", 'd', ""),
+        fill("profile-env=long:LONGVAR=", 'v', ""),
+    };
+    const text = comptime text: {
+        var text: []const u8 = "profile-command = quoted: q.exe\n";
+        for (long_lines) |line| text = text ++ line ++ "\n";
+        break :text text;
+    };
+    for (long_lines) |line| try testing.expectEqual(max, line.len);
+
+    var cfg = try testLoadProfileText(alloc, text);
+    defer cfg.deinit();
+    try testExpectNoProblems(&cfg);
+    try testing.expectEqual(@as(usize, max - "profile-name=quoted:\" ".len), cfg.@"profile-name".get("quoted").?.len);
+
+    const formatted = try testFormatChanged(alloc, &cfg);
+    defer alloc.free(formatted);
+    var lines = std.mem.splitScalar(u8, formatted, '\n');
+    while (lines.next()) |line| try testing.expect(line.len <= max);
+    // A short line keeps the usual spacing.
+    try testing.expect(std.mem.indexOf(u8, formatted, "profile-command = quoted: q.exe\n") != null);
+
+    var again = try testLoadProfileText(alloc, formatted);
+    defer again.deinit();
+    try testExpectNoProblems(&again);
+    try testing.expect(cfg.@"profile-command".equal(again.@"profile-command"));
+    try testing.expect(cfg.@"profile-name".equal(again.@"profile-name"));
+    try testing.expect(cfg.@"profile-working-directory".equal(again.@"profile-working-directory"));
+    try testing.expect(cfg.@"profile-env".equal(again.@"profile-env"));
+    try testing.expectEqual(@as(usize, 2), again.@"profile-command".count());
+}
+
+test "default-profile, profile-order and profile-hidden load and format back" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const text =
+        \\profile-command = vs18-cmd: cmd.exe /k init.cmd
+        \\default-profile = vs18-cmd
+        \\profile-order = vs18-cmd
+        \\profile-order = pwsh
+        \\profile-hidden = wsl:docker-desktop
+        \\profile-hidden = ssh:Prod
+        \\
+    ;
+    var cfg = try testLoadProfileText(alloc, text);
+    defer cfg.deinit();
+    // On a build without these keys, each line is an unknown-field problem.
+    for (cfg._diagnostics.list.items) |diag| std.debug.print("unexpected diagnostic: {s}: {s}\n", .{ diag.key, diag.message });
+    try testing.expect(cfg._diagnostics.empty());
+    const formatted = try testFormatChanged(alloc, &cfg);
+    defer alloc.free(formatted);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, formatted, line) == null) {
+            std.debug.print("missing line: {s}\n", .{line});
+            return error.TestExpectedEqual;
+        }
+    }
+    // An empty value clears each.
+    var cleared = try testLoadProfileText(alloc, text ++ "default-profile =\nprofile-order =\nprofile-hidden =\n");
+    defer cleared.deinit();
+    try testing.expect(cleared.@"default-profile" == null);
+    try testing.expectEqual(@as(usize, 0), cleared.@"profile-order".list.items.len);
+    try testing.expectEqual(@as(usize, 0), cleared.@"profile-hidden".list.items.len);
+}
+
+/// Load `files` (name, text), the first as the main config, through the real
+/// file reader and include order, and finalize, as a real load does.
+fn testLoadProfileFiles(alloc: Allocator, dir: std.fs.Dir, files: []const [2][]const u8) !Config {
+    for (files) |file| try dir.writeFile(.{ .sub_path = file[0], .data = file[1] });
+    const path = try dir.realpathAlloc(alloc, files[0][0]);
+    defer alloc.free(path);
+    var cfg = try Config.default(alloc);
+    errdefer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try cfg.loadRecursiveFiles(alloc);
+    try cfg.finalize();
+    return cfg;
+}
+
+fn testExpectNoProblems(cfg: *const Config) !void {
+    for (cfg._diagnostics.list.items) |diag| std.debug.print("unexpected diagnostic: {s}: {s}\n", .{ diag.key, diag.message });
+    try std.testing.expect(cfg._diagnostics.empty());
+}
+
+test "profile keys: removing a profile removes it whole, across includes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An include is read after the file that names it: `team` defines `a`,
+    // `b` and `old`; `other` (read next) adds a field for `old`; `mine`
+    // renames `a`, removes `b` and `old`, adds `c`. Removing `old` takes the
+    // field a file read before the removal added with it, with no problem.
+    var cfg = try testLoadProfileFiles(alloc, tmp.dir, &.{
+        .{
+            "main.ghostty",
+            \\profile-command = early: early.exe
+            \\config-file = team.ghostty
+            \\config-file = other.ghostty
+            \\config-file = mine.ghostty
+            \\
+        },
+        .{
+            "team.ghostty",
+            \\profile-command = a: one.exe
+            \\profile-name = a: First
+            \\profile-command = b: two.exe
+            \\profile-env = b: TOKEN=secret
+            \\profile-command = old: old.exe
+            \\profile-working-directory = old: C:\old
+            \\
+        },
+        .{
+            "other.ghostty",
+            \\profile-name = old: Old one
+            \\profile-env = old: A=1
+            \\
+        },
+        .{
+            "mine.ghostty",
+            \\profile-name = A: Renamed
+            \\profile-command = b:
+            \\profile-command = old:
+            \\profile-command = c: three.exe
+            \\
+        },
+    });
+    defer cfg.deinit();
+    try testExpectNoProblems(&cfg);
+    try testing.expectEqualStrings("one.exe", cfg.@"profile-command".get("a").?);
+    try testing.expectEqualStrings("Renamed", cfg.@"profile-name".get("a").?);
+    try testing.expect(cfg.@"profile-command".get("b") == null);
+    try testing.expect(cfg.@"profile-command".get("old") == null);
+    // Removed profiles keep their slots and their fields, dormant.
+    try testing.expectEqualStrings("Old one", cfg.@"profile-name".get("old").?);
+
+    // `+show-config` writes the removals, and what it writes loads back into
+    // an equal configuration.
+    const formatted = try testFormatChanged(alloc, &cfg);
+    defer alloc.free(formatted);
+    try testing.expect(std.mem.indexOf(u8, formatted, "profile-command = b:\n") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "profile-command = old:\n") != null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "two.exe") == null);
+    // Order follows each id's first `profile-command` line.
+    const order = [_][]const u8{ "= early:", "= a:", "= b:", "= old:", "= c:" };
+    var last: usize = 0;
+    for (order) |needle| {
+        const at = std.mem.indexOf(u8, formatted, needle).?;
+        try testing.expect(at >= last);
+        last = at;
+    }
+    var again = try testLoadProfileText(alloc, formatted);
+    defer again.deinit();
+    try testExpectNoProblems(&again);
+    try testing.expect(again.@"profile-command".equal(cfg.@"profile-command"));
+    try testing.expect(again.@"profile-env".equal(cfg.@"profile-env"));
+    var copy = try cfg.clone(alloc);
+    defer copy.deinit();
+    try testing.expect(copy.@"profile-command".equal(cfg.@"profile-command"));
+    try testing.expect(copy.@"profile-command".get("old") == null);
+}
+
+test "profile keys: an empty profile-command removes what came before, and a definition brings a profile back" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try testLoadProfileText(alloc,
+        \\profile-command = a: one.exe
+        \\profile-name = a: A
+        \\profile-command = b: two.exe
+        \\profile-command =
+        \\profile-command = z: zed.exe
+        \\profile-env = a: MODE=dormant
+        \\
+    );
+    defer cfg.deinit();
+    try testExpectNoProblems(&cfg);
+    try testing.expect(cfg.@"profile-command".get("a") == null);
+    try testing.expect(cfg.@"profile-command".get("b") == null);
+    try testing.expectEqualStrings("zed.exe", cfg.@"profile-command".get("z").?);
+
+    // A later definition of `a` brings it back in its first place, with the
+    // fields it had and the one added while it was removed.
+    var back = try testLoadProfileText(alloc,
+        \\profile-command = a: one.exe
+        \\profile-name = a: A
+        \\profile-command = b: two.exe
+        \\profile-command =
+        \\profile-command = z: zed.exe
+        \\profile-env = a: MODE=dormant
+        \\profile-command = a: again.exe
+        \\
+    );
+    defer back.deinit();
+    try testExpectNoProblems(&back);
+    const entries = back.@"profile-command".entries.items;
+    try testing.expectEqualStrings("a", entries[0].id);
+    try testing.expectEqualStrings("again.exe", back.@"profile-command".get("a").?);
+    try testing.expectEqualStrings("A", back.@"profile-name".get("a").?);
+    try testing.expectEqualStrings("dormant", back.@"profile-env".get("a").?.map.get("MODE").?);
+    try testing.expect(!back.@"profile-command".equal(cfg.@"profile-command"));
+}
+
+test "profile keys: a line the loader refuses is reported at its line, without its value" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Case = struct { line: []const u8, key: []const u8, message: []const u8, hidden: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .line = "profile-command = C:\\Tools\\x.exe", .key = "profile-command", .message = "\"C:\" looks like a drive letter; start the line with a profile id: profile-command = <id>: C:\\...", .hidden = "Tools" },
+        .{ .line = "profile-command = \"C:\\Program Files\\T\\t.exe\" --mode \"fast\"", .key = "profile-command", .message = "\"C:\" looks like a drive letter", .hidden = "fast" },
+        .{ .line = "profile-working-directory = D:\\My Projects\\api", .key = "profile-working-directory", .message = "\"D:\" looks like a drive letter", .hidden = "Projects" },
+        .{ .line = "profile-command = pwsh -File D:\\x.ps1", .key = "profile-command", .message = "the text before the first ':' is not a profile id", .hidden = "x.ps1" },
+        .{ .line = "profile-env = PYTHONHOME=C:\\Python312", .key = "profile-env", .message = "the text before the first ':' is not a profile id", .hidden = "Python312" },
+        .{ .line = "profile-command = caf\xc3\xa9: cmd.exe", .key = "profile-command", .message = "the text before the first ':' is not a profile id", .hidden = "caf" },
+        .{ .line = "profile-command = CMD.EXE: x", .key = "profile-command", .message = "\"CMD.EXE\" names a detected profile or a reference word; choose another id", .hidden = null },
+        .{ .line = "profile-command = pwsh: x", .key = "profile-command", .message = "\"pwsh\" names a detected profile or a reference word", .hidden = null },
+        .{ .line = "profile-name = wsl:Ubuntu: X", .key = "profile-name", .message = "\"wsl\" is not a profile you defined", .hidden = "Ubuntu" },
+        .{ .line = "profile-command = user:py: cmd.exe", .key = "profile-command", .message = "write the id without \"user:\"", .hidden = "cmd.exe" },
+        .{ .line = "profile-command = d1: direct:cmd.exe", .key = "profile-command", .message = "\"d1\": direct: and shell: belong to command", .hidden = "cmd.exe" },
+        .{ .line = "profile-command = p: \"\"", .key = "profile-command", .message = "\"p\" has no program to run", .hidden = null },
+        .{ .line = "profile-env = e1: =s3cret", .key = "profile-env", .message = "\"e1\": a variable name is needed before the '='", .hidden = "s3cret" },
+        .{ .line = "profile-command = tool.exe --token=abc", .key = "profile-command", .message = "needs a profile id and a ':' before the value (the value is not shown)", .hidden = "abc" },
+        // Text in an ANSI code page (Windows-1252 here), for each key.
+        .{ .line = "profile-command = jose: C:\\Users\\Jos\xe9\\tool.exe /k", .key = "profile-command", .message = "\"jose\": the line is not UTF-8; save the file as UTF-8 (the value is not shown)", .hidden = "tool.exe" },
+        .{ .line = "profile-name = n: Pyth\xf6n", .key = "profile-name", .message = "\"n\": the line is not UTF-8", .hidden = "Pyth" },
+        .{ .line = "profile-working-directory = w: C:\\Caf\xe9", .key = "profile-working-directory", .message = "\"w\": the line is not UTF-8", .hidden = "Caf" },
+        .{ .line = "profile-env = e2: NAME=Gr\xfc\xdfe", .key = "profile-env", .message = "\"e2\": the line is not UTF-8", .hidden = "NAME" },
+    };
+    const body = comptime body: {
+        var body: []const u8 = "";
+        for (cases) |case| body = body ++ case.line ++ "\n";
+        break :body body ++ "profile-command = ok: ok.exe\n";
+    };
+    // Theme files that exist, so `finalize` swaps in a config rebuilt by
+    // replay before the conditional replay below.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "light", .data = "background = #ffffff\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark", .data = "background = #000000\n" });
+    const light = try tmp.dir.realpathAlloc(alloc, "light");
+    defer alloc.free(light);
+    const dark_theme = try tmp.dir.realpathAlloc(alloc, "dark");
+    defer alloc.free(dark_theme);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n{s}", .{ light, dark_theme, body });
+    defer alloc.free(text);
+
+    var cfg = try testLoadProfileText(alloc, text);
+    defer cfg.deinit();
+    // A conditional state change rebuilds the config by replay: each problem
+    // is there once, at its line, in both.
+    var dark = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark.deinit();
+    for ([_]*const Config{ &cfg, &dark }) |config| {
+        var found: usize = 0;
+        for (config._diagnostics.list.items) |diag| {
+            if (!std.mem.startsWith(u8, diag.key, "profile-")) continue;
+            const case = cases[found];
+            try testing.expectEqualStrings(case.key, diag.key);
+            testing.expect(std.mem.startsWith(u8, diag.message, case.message)) catch |err| {
+                std.debug.print("line {d}: {s}\n", .{ found + 2, diag.message });
+                return err;
+            };
+            if (case.hidden) |hidden| try testing.expect(std.mem.indexOf(u8, diag.message, hidden) == null);
+            try testing.expectEqualStrings("C:\\noctty-test\\config.ghostty", diag.location.file.path);
+            try testing.expectEqual(found + 2, diag.location.file.line);
+            found += 1;
+        }
+        try testing.expectEqual(cases.len, found);
+        // What was refused is gone; what was valid stays.
+        try testing.expectEqual(@as(usize, 1), config.@"profile-command".count());
+        try testing.expectEqualStrings("ok.exe", config.@"profile-command".get("ok").?);
+        try testing.expectEqual(@as(usize, 0), config.@"profile-name".count());
+    }
+}
+
+test "a config line longer than the reader takes is reported once and the next line loads" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The longest line the reader takes, line ending excluded. Written out
+    // (and only keys main has used) so this fails on main by its assertions:
+    // there the long line silently ended the file.
+    const max = 4094;
+    // The line ends past the first 2048-byte read buffer and past the
+    // second; a three-byte character crosses the limit.
+    const prefix = "env = LONG=";
+    const long_env = prefix ++ "x" ** (max - prefix.len - 2) ++ "\xe2\x82\xac";
+    // Theme files that exist: `finalize` then swaps in a config rebuilt by
+    // replay (`loadTheme`), which `changeConditionalState` replays again.
+    try tmp.dir.writeFile(.{ .sub_path = "light", .data = "background = #ffffff\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark", .data = "background = #000000\n" });
+    const light = try tmp.dir.realpathAlloc(alloc, "light");
+    defer alloc.free(light);
+    const dark_theme = try tmp.dir.realpathAlloc(alloc, "dark");
+    defer alloc.free(dark_theme);
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n" ++
+        "env = BEFORE=1\n" ++
+        long_env ++ "\n" ++
+        "title = after the long line\n" ++
+        "config-file = missing-include.ghostty\n", .{ light, dark_theme });
+    defer alloc.free(text);
+    try tmp.dir.writeFile(.{ .sub_path = "main.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "main.ghostty");
+    defer alloc.free(path);
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try cfg.loadRecursiveFiles(alloc);
+    try cfg.finalize();
+    var dark = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark.deinit();
+    var light_again = (try dark.changeConditionalState(.{ .theme = .light })).?;
+    defer light_again.deinit();
+    for ([_]*const Config{ &cfg, &dark, &light_again }, 0..) |config, i| {
+        var found: usize = 0;
+        var include: usize = 0;
+        for (config._diagnostics.list.items) |diag| {
+            // A missing include's problem is the same kind of replay step.
+            if (std.mem.startsWith(u8, diag.message, "error opening config-file")) include += 1;
+            if (!std.mem.startsWith(u8, diag.message, "line is longer")) continue;
+            try testing.expectEqualStrings("line is longer than 4094 bytes and was skipped", diag.message);
+            try testing.expectEqualStrings(path, diag.location.file.path);
+            try testing.expectEqual(@as(usize, 3), diag.location.file.line);
+            found += 1;
+        }
+        testing.expectEqual(@as(usize, 1), found) catch |err| {
+            std.debug.print("config {d}: {d} long-line problems\n", .{ i, found });
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 1), include);
+        // The theme was applied, and the file's lines after it.
+        try testing.expectEqual(@as(u8, if (i == 1) 0 else 0xff), config.background.r);
+        // No part of the long line is applied, and the line after it is.
+        try testing.expect(config.env.map.get("LONG") == null);
+        try testing.expectEqualStrings("1", config.env.map.get("BEFORE").?);
+        try testing.expectEqualStrings("after the long line", config.title.?);
+    }
+
+    // 4094 bytes is still read.
+    const fits = prefix ++ "x" ** (max - prefix.len);
+    var reader: std.Io.Reader = .fixed(fits ++ "\n");
+    var ok = try Config.default(alloc);
+    defer ok.deinit();
+    try ok.loadReader(alloc, &reader, "C:\\noctty-test\\config.ghostty");
+    try ok.finalize();
+    try testing.expect(ok._diagnostics.empty());
+    try testing.expectEqual(max - prefix.len, ok.env.map.get("LONG").?.len);
+}
+
+test "a theme file's problems are its own and are reported once, however the config is rebuilt" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Three problems of the light theme: an over-long line (a problem that
+    // is only a replay step), an unknown key and a refused profile line
+    // (both parse problems of a line that is replayed).
+    const long = "background = #" ++ "1" ** (cli.args.LineIterator.max_line_len - "background = #".len + 1);
+    try tmp.dir.writeFile(.{ .sub_path = "light", .data = long ++ "\nforeground = #111111\n" ++
+        "foo-bogus = 1\nprofile-command = C:\\Tools\\x.exe\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dark", .data = "foreground = #eeeeee\n" });
+    const light = try tmp.dir.realpathAlloc(alloc, "light");
+    defer alloc.free(light);
+    const dark_theme = try tmp.dir.realpathAlloc(alloc, "dark");
+    defer alloc.free(dark_theme);
+    // And one of the main file, which every config keeps.
+    const text = try std.fmt.allocPrint(alloc, "theme = light:{s},dark:{s}\n" ++
+        "config-file = missing-include.ghostty\n", .{ light, dark_theme });
+    defer alloc.free(text);
+    try tmp.dir.writeFile(.{ .sub_path = "main.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "main.ghostty");
+    defer alloc.free(path);
+
+    // Start light and start dark (a cold start in that mode), finalize twice
+    // as `+validate-config` does, then switch back and forth, finalizing each
+    // config again: each config has its own theme's problems once, whatever
+    // came before it, and the replay log keeps only the main file's problem.
+    for ([_]conditional.State{ .{ .theme = .light }, .{ .theme = .dark } }) |start| {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        cfg._conditional_state = start;
+        try cfg.loadFile(alloc, path);
+        try cfg.loadRecursiveFiles(alloc);
+        try cfg.finalize();
+        try cfg.finalize();
+
+        var configs: [5]Config = undefined;
+        var made: usize = 0;
+        defer for (configs[0..made]) |*config| config.deinit();
+        configs[0] = try cfg.clone(alloc);
+        made = 1;
+        while (made < configs.len) : (made += 1) {
+            const next: conditional.State = .{ .theme = switch (configs[made - 1]._conditional_state.theme) {
+                .light => .dark,
+                .dark => .light,
+            } };
+            configs[made] = (try configs[made - 1].changeConditionalState(next)).?;
+            try configs[made].finalize();
+        }
+        for (configs[0..made], 0..) |*config, i| {
+            const is_light = config._conditional_state.theme == .light;
+            var long_line: usize = 0;
+            var bogus: usize = 0;
+            var profile: usize = 0;
+            var include: usize = 0;
+            for (config._diagnostics.list.items) |diag| {
+                if (std.mem.startsWith(u8, diag.message, "error opening config-file")) {
+                    include += 1;
+                    continue;
+                }
+                try testing.expectEqualStrings(light, diag.location.file.path);
+                if (std.mem.startsWith(u8, diag.message, "line is longer")) {
+                    try testing.expectEqual(@as(usize, 1), diag.location.file.line);
+                    long_line += 1;
+                } else if (std.mem.eql(u8, diag.key, "foo-bogus")) {
+                    try testing.expectEqual(@as(usize, 3), diag.location.file.line);
+                    bogus += 1;
+                } else if (std.mem.eql(u8, diag.key, "profile-command")) {
+                    try testing.expectEqual(@as(usize, 4), diag.location.file.line);
+                    profile += 1;
+                } else return error.TestUnexpectedResult;
+            }
+            var steps: usize = 0;
+            for (config._replay_steps.items) |step| {
+                if (step == .diagnostic) steps += 1;
+            }
+            const want: usize = if (is_light) 1 else 0;
+            testing.expect(long_line == want and bogus == want and profile == want and include == 1 and steps == 1) catch |err| {
+                std.debug.print("start {s}, config {d} ({s}): long {d}, unknown {d}, profile {d}, include {d}, steps {d}\n", .{
+                    @tagName(start.theme), i, @tagName(config._conditional_state.theme), long_line, bogus, profile, include, steps,
+                });
+                return err;
+            };
+            // The long line was skipped, the line after it read.
+            try testing.expectEqual(@as(u8, if (is_light) 0x11 else 0xee), config.foreground.r);
+        }
+    }
+}
+
+/// The text of every unlabelled code block in the `## <heading>` section of
+/// `docs/windows.md` (and its subsections), read from the checkout at test
+/// time (`zig build test` runs from its root), joined in order.
+fn testDocExamples(alloc: Allocator, comptime heading: []const u8, blocks: *usize) ![]u8 {
+    const raw = std.fs.cwd().readFileAlloc(alloc, "docs/windows.md", 4 << 20) catch |err| {
+        std.debug.print("cannot read docs/windows.md from the current directory: {}\n", .{err});
+        return err;
+    };
+    defer alloc.free(raw);
+    // A checkout with CRLF line endings reads the same.
+    const doc = try std.mem.replaceOwned(u8, alloc, raw, "\r\n", "\n");
+    defer alloc.free(doc);
+    const start = std.mem.indexOf(u8, doc, "\n## " ++ heading ++ "\n") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, doc, start + 1, "\n## ") orelse doc.len;
+    var rest = doc[start..end];
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    blocks.* = 0;
+    while (std.mem.indexOf(u8, rest, "\n```")) |open| {
+        const after = rest[open + 4 ..];
+        const lang_end = std.mem.indexOfScalar(u8, after, '\n') orelse return error.TestUnexpectedResult;
+        const body = after[lang_end + 1 ..];
+        const close = std.mem.indexOf(u8, body, "\n```") orelse return error.TestUnexpectedResult;
+        if (lang_end == 0) {
+            try out.appendSlice(alloc, body[0 .. close + 1]);
+            blocks.* += 1;
+        }
+        rest = body[close + 4 ..];
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "every example in the user profile docs loads with no problem" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var blocks: usize = 0;
+    const text = try testDocExamples(alloc, "User profiles", &blocks);
+    defer alloc.free(text);
+    try testing.expect(blocks >= 7);
+    // Read as a file in a folder that exists, since the `config-file`
+    // example's paths are made absolute against it (the files it names are
+    // not read: a load reads includes in a later step).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config.ghostty", .data = text });
+    const path = try tmp.dir.realpathAlloc(alloc, "config.ghostty");
+    defer alloc.free(path);
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadFile(alloc, path);
+    try cfg.finalize();
+    try testExpectNoProblems(&cfg);
+    for ([_][]const u8{ "py312", "vs19", "devps", "buildbox" }) |id| {
+        try testing.expect(cfg.@"profile-command".get(id) != null);
+    }
+    try testing.expect(cfg.@"profile-command".get("legacy") == null);
+    try testing.expectEqualStrings("Build Box (mine)", cfg.@"profile-name".get("buildbox").?);
+
+    // The WezTerm example: the line splits into exactly the strings of the
+    // Lua `args` it was written from.
+    const argv = try windows_shell.splitWindowsCommandLine(alloc, cfg.@"profile-command".get("devps").?);
+    defer {
+        for (argv) |arg| alloc.free(arg);
+        alloc.free(argv);
+    }
+    const want = [_][]const u8{ "pwsh.exe", "-NoLogo", "-NoExit", "-Command", "& { Import-Module \"C:/Tools/My Module.dll\" }" };
+    try testing.expectEqual(want.len, argv.len);
+    for (want, argv) |w, got| try testing.expectEqualStrings(w, got);
+}
+
+test "every example in the Visual Studio docs loads with no problem" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var blocks: usize = 0;
+    const text = try testDocExamples(alloc, "Visual Studio developer shells", &blocks);
+    defer alloc.free(text);
+    try testing.expect(blocks >= 2);
+    var cfg = try testLoadProfileText(alloc, text);
+    defer cfg.deinit();
+    try testExpectNoProblems(&cfg);
+    try testing.expectEqual(VisualStudioProfiles.all, cfg.@"visual-studio-profiles");
+    // `default-profile = vs:newest:cmd` found the (test) instance.
+    try testing.expectEqualStrings("vs:6bb7cfd9:cmd", (pane_launch.defaultProfile(&cfg) orelse return error.TestUnexpectedResult).key);
+}
+
+test "a profile line without an id is a config problem that does not show the line" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var cfg = try testLoadProfileText(alloc,
+        \\profile-env = API_KEY=secret
+        \\profile-command = tool.exe --token=abc
+        \\
+    );
+    defer cfg.deinit();
+    const found = cfg._diagnostics.list.items;
+    try testing.expectEqual(@as(usize, 2), found.len);
+    for (found, [_][]const u8{ "profile-env", "profile-command" }) |got, key| {
+        try testing.expectEqualStrings(key, got.key);
+        try testing.expect(std.mem.startsWith(u8, got.message, "needs a profile id"));
+        try testing.expect(std.mem.indexOf(u8, got.message, "secret") == null);
+        try testing.expect(std.mem.indexOf(u8, got.message, "token") == null);
+    }
+}
+
+/// Callback for src/cli/args.zig: true when `arg` is a command-line argument
+/// that is not a field and was taken here. `parseManuallyHook` has already
+/// recorded it for replay, so a rebuilt config takes it again.
+pub fn consumeManuallyHook(
+    self: *Config,
+    alloc: Allocator,
+    arg: []const u8,
+    iter: anytype,
+) !bool {
+    return pane_launch.consume(self, alloc, arg, iter);
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
@@ -5018,12 +6109,14 @@ pub fn parseManuallyHook(
     arg: []const u8,
     iter: anytype,
 ) !bool {
-    if (std.mem.eql(u8, arg, "--command") or std.mem.startsWith(u8, arg, "--command=")) {
-        self._command_defaulted = false;
-    }
-    if (builtin.os.tag == .windows and std.ascii.eqlIgnoreCase(arg, "-Embedding")) {
-        // COM's SCM appends this switch for local-server activation. It is a
-        // process-mode marker, not a user configuration field.
+    try pane_launch.note(self, alloc, arg, iter);
+
+    if (builtin.os.tag == .windows and
+        (std.ascii.eqlIgnoreCase(arg, "-Embedding") or std.ascii.eqlIgnoreCase(arg, "-ToastActivated")))
+    {
+        // COM's SCM appends -Embedding for local-server activation, after the
+        // toast activator's -ToastActivated (src/apprt/win32_toast_activator.zig).
+        // Both are process-mode markers, not user configuration fields.
         return false;
     }
 
@@ -5061,15 +6154,13 @@ pub fn parseManuallyHook(
             return false;
         }
 
-        // See "command" docs for the implied configurations and why.
-        self.@"initial-command" = .{ .direct = command.items };
-        self.@"single-instance" = .false;
-        self.@"gtk-single-instance" = .false;
-        self.@"quit-after-last-window-closed" = true;
-        self.@"quit-after-last-window-closed-delay" = null;
-        if (self.@"shell-integration" != .none) {
-            self.@"shell-integration" = .detect;
-        }
+        // `-e` comes after any `--initial-command=` and wins over it, when it
+        // has a command: a refused `-e` changes nothing.
+        self._launch.initial_command_cli = null;
+
+        // See "initial-command" docs for the implied configurations and why.
+        self._e_command = command.items;
+        self.applyECommand(command.items);
 
         // Do not continue, we consumed everything.
         return false;
@@ -5265,7 +6356,15 @@ pub fn clone(
 
     // Copy our diagnostics
     result._diagnostics = try self._diagnostics.clone(alloc_arena);
-    result._command_defaulted = self._command_defaulted;
+    // An app config is installed as a clone: keep what the load decided of
+    // the launch and where each profile line was read, which the problems,
+    // Settings and New Elevated Window read.
+    result._launch = try self._launch.clone(alloc_arena);
+    if (self._e_command) |words| {
+        const copy = try alloc_arena.alloc([:0]const u8, words.len);
+        for (words, copy) |word, *slot| slot.* = try alloc_arena.dupeZ(u8, word);
+        result._e_command = copy;
+    }
     if (self._undecodable_file) |skipped| result._undecodable_file = try alloc_arena.dupeZ(u8, skipped);
 
     // Preserve our replay steps. We copy them exactly to also preserve
@@ -5454,6 +6553,16 @@ const Replay = struct {
         /// not an additional "arg" with "-e" value.
         @"-e": cli.Location,
 
+        /// The argument text of an `arg` or `conditional_arg` step, or null
+        /// for any other step.
+        fn argText(self: Step) ?[]const u8 {
+            return switch (self) {
+                .arg => |v| v.value,
+                .conditional_arg => |v| v.arg,
+                else => null,
+            };
+        }
+
         fn clone(
             self: Step,
             alloc: Allocator,
@@ -5486,6 +6595,10 @@ const Replay = struct {
         slice: []const Replay.Step,
         idx: usize = 0,
         current_location: cli.Location = .none,
+        /// Skip the steps conditional on the theme. Only `loadTheme` makes
+        /// those, from the theme file's lines, so they are a theme read by
+        /// an earlier `loadTheme`; set when the theme has just been read.
+        skip_theme_lines: bool = false,
 
         pub fn location(self: *const Self, alloc: Allocator) Allocator.Error!?cli.Location {
             // The replay source may be freed as soon as this load completes.
@@ -5518,11 +6631,18 @@ const Replay = struct {
                             log.warn("error appending diagnostic err={}", .{err});
                             break :diag;
                         };
+                        // Keep it as a step too, as `.expand` does: a config
+                        // rebuilt by replay (the one `loadTheme` swaps in)
+                        // is replayed again by `changeConditionalState`.
+                        self.config._replay_steps.append(arena_alloc, .{ .diagnostic = cloned }) catch |err| {
+                            log.warn("error appending diagnostic replay step err={}", .{err});
+                        };
                     },
 
                     .conditional_arg => |v| conditional: {
                         // All conditions must match.
                         for (v.conditions) |cond| {
+                            if (self.skip_theme_lines and cond.key == .theme) break :conditional;
                             if (!self.config._conditional_state.match(cond)) {
                                 break :conditional;
                             }
@@ -5704,8 +6824,8 @@ pub const WorkingDirectory = union(enum) {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const expanded = internal_os.expandHome(path, &buf) catch |err| {
             log.warn(
-                "error expanding home directory for working-directory path={s}: {}",
-                .{ path, err },
+                "error expanding home directory for working-directory path={f}: {}",
+                .{ internal_os.redact.bytes(path), err },
             );
             return;
         };
@@ -9745,6 +10865,9 @@ pub const ShellIntegration = enum {
 /// See utf8-console.
 pub const Utf8Console = windows_shell.Utf8Console;
 
+/// See `visual-studio-profiles`.
+pub const VisualStudioProfiles = windows_shell.VisualStudioProfiles;
+
 /// Shell integration features
 pub const ShellIntegrationFeatures = packed struct {
     cursor: bool = true,
@@ -9794,9 +10917,16 @@ pub const RepeatableCommand = struct {
         alloc: Allocator,
         input_: ?[]const u8,
     ) !void {
-        // Unset or empty input clears the list
+        // Unset or empty input restores the default entries
         const input = input_ orelse "";
         if (input.len == 0) {
+            log.info("config has 'command-palette-entry =', using default entries", .{});
+            try self.init(alloc);
+            return;
+        }
+
+        if (std.mem.eql(u8, input, "clear")) {
+            log.info("config has 'command-palette-entry = clear', all command entries cleared", .{});
             self.value.clearRetainingCapacity();
             self.value_c.clearRetainingCapacity();
             return;
@@ -9824,10 +10954,46 @@ pub const RepeatableCommand = struct {
             item.* = try item.clone(alloc);
         }
 
+        // Cloning value_c directly would copy Command.C structs
+        // whose string pointers still reference the source config's
+        // memory — the clone must stay valid after the source is
+        // freed.
+        var value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty;
+        try value_c.ensureTotalCapacityPrecise(alloc, value.items.len);
+        for (value.items) |item| {
+            value_c.appendAssumeCapacity(try item.cval(alloc));
+        }
+
         return .{
             .value = value,
-            .value_c = try self.value_c.clone(alloc),
+            .value_c = value_c,
         };
+    }
+
+    test "RepeatableCommand clone owns C command strings" {
+        const testing = std.testing;
+        var copy_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer copy_arena.deinit();
+        const copy = copy: {
+            var source_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer source_arena.deinit();
+            var source: Self = .{};
+            try source.parseCLI(source_arena.allocator(), "title:Custom,description:Description,action:text:payload");
+            const result = try source.clone(copy_arena.allocator());
+            const original_c = source.value_c.items[0];
+            const copied_c = result.value_c.items[0];
+            // Check ownership before releasing the source, so the regression
+            // fails without reading freed memory on the broken clone.
+            try testing.expect(copied_c.action != original_c.action);
+            try testing.expect(copied_c.title == result.value.items[0].title.ptr);
+            try testing.expect(copied_c.description == result.value.items[0].description.ptr);
+            break :copy result;
+        };
+        const command_c = copy.cval().commands[0];
+        try testing.expectEqualStrings("text:payload", std.mem.span(command_c.action));
+        try testing.expectEqualStrings("Custom", std.mem.span(command_c.title));
+        try testing.expectEqualStrings("Description", std.mem.span(command_c.description));
+        try testing.expectEqualStrings("text", std.mem.span(command_c.action_key));
     }
 
     /// Compare if two of our value are equal. Required by Config.
@@ -9866,7 +11032,16 @@ pub const RepeatableCommand = struct {
                 ) catch return error.OutOfMemory;
             }
 
-            writer.print(",action:\"{f}\"", .{item.action}) catch return error.OutOfMemory;
+            // Action.format writes string parameters as they are; quoted,
+            // they need the Zig escapes parseAutoStruct decodes, as the
+            // title and description get.
+            var action_buf: [4096]u8 = undefined;
+            var action: std.Io.Writer = .fixed(&action_buf);
+            action.print("{f}", .{item.action}) catch return error.OutOfMemory;
+            writer.print(
+                ",action:\"{f}\"",
+                .{std.zig.fmtString(action.buffered())},
+            ) catch return error.OutOfMemory;
 
             try formatter.formatEntry([]const u8, writer.buffered());
         }
@@ -9908,8 +11083,11 @@ pub const RepeatableCommand = struct {
         try testing.expectEqualStrings("Baz", list.value.items[3].title);
         try testing.expectEqualStrings("Raspberry Pie", list.value.items[3].description);
 
-        try list.parseCLI(alloc, "");
+        try list.parseCLI(alloc, "clear");
         try testing.expectEqual(@as(usize, 0), list.value.items.len);
+
+        try list.parseCLI(alloc, "");
+        try testing.expectEqual(inputpkg.command.defaults.len, list.value.items.len);
     }
 
     test "RepeatableCommand formatConfig empty" {
@@ -9951,6 +11129,26 @@ pub const RepeatableCommand = struct {
         try list.parseCLI(alloc, "title:Ja,   description: pierdole,  action:text:jakie bydle");
         try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
         try std.testing.expectEqualSlices(u8, "a = title:\"Bobr\",action:\"text:kurwa\"\na = title:\"Ja\",description:\"pierdole\",action:\"text:jakie bydle\"\n", buf.written());
+    }
+
+    test "RepeatableCommand formatConfig escapes a quoted action's string parameter" {
+        const testing = std.testing;
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: RepeatableCommand = .{};
+        try list.parseCLI(alloc, "title:Bobr,action:\"text:\\\"hi\\\" \\\\x15\"");
+        try testing.expectEqualStrings("\"hi\" \\x15", list.value.items[0].action.text);
+        try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
+        try testing.expectEqualStrings("a = title:\"Bobr\",action:\"text:\\\"hi\\\" \\\\x15\"\n", buf.written());
+
+        var parsed: RepeatableCommand = .{};
+        try parsed.parseCLI(alloc, buf.written()["a = ".len .. buf.written().len - 1]);
+        try testing.expect(list.equal(parsed));
     }
 
     test "RepeatableCommand parseCLI commas" {
@@ -10024,7 +11222,7 @@ pub const RepeatableCommand = struct {
         try list.parseCLI(alloc, "title:Foo,action:ignore");
         try testing.expectEqual(@as(usize, 1), list.cval().len);
 
-        try list.parseCLI(alloc, "");
+        try list.parseCLI(alloc, "clear");
         try testing.expectEqual(@as(usize, 0), list.cval().len);
     }
 };
@@ -10230,6 +11428,13 @@ pub const WindowNewTabPosition = enum {
 
 /// See window-show-tab-bar
 pub const WindowShowTabBar = enum {
+    always,
+    auto,
+    never,
+};
+
+/// See drag-handle
+pub const DragHandle = enum {
     always,
     auto,
     never,
@@ -11423,6 +12628,85 @@ test "clone default" {
     // try testing.expectEqualDeep(dest, source);
 }
 
+test "clone command C view survives source config deinit" {
+    const testing = std.testing;
+    var copy = copy: {
+        var source = try Config.default(testing.allocator);
+        defer source.deinit();
+        const alloc = source._arena.?.allocator();
+        try source.@"command-palette-entry".parseCLI(alloc, "title:Custom,action:open_config");
+        var result = try source.clone(testing.allocator);
+        errdefer result.deinit();
+        const original = source.@"command-palette-entry".cval();
+        const cloned = result.@"command-palette-entry".cval();
+        try testing.expectEqual(original.len, cloned.len);
+        // Assert ownership before deinit so broken clones fail without UAF.
+        const custom = cloned.len - 1;
+        try testing.expect(original.commands[custom].action != cloned.commands[custom].action);
+        try testing.expect(original.commands[custom].title != cloned.commands[custom].title);
+        break :copy result;
+    };
+    defer copy.deinit();
+    const commands = copy.@"command-palette-entry".cval();
+    try testing.expectEqual(inputpkg.command.defaults.len + 1, commands.len);
+    for (inputpkg.command.defaultsC, 0..) |expected, i| {
+        try testing.expectEqualStrings(std.mem.span(expected.action), std.mem.span(commands.commands[i].action));
+        try testing.expectEqualStrings(std.mem.span(expected.title), std.mem.span(commands.commands[i].title));
+    }
+    const custom = commands.commands[commands.len - 1];
+    try testing.expectEqualStrings("open_config", std.mem.span(custom.action));
+    try testing.expectEqualStrings("Custom", std.mem.span(custom.title));
+    try testing.expectEqualStrings("", std.mem.span(custom.description));
+
+    // Clearing the palette must stay empty through another complete clone.
+    try copy.@"command-palette-entry".parseCLI(copy._arena.?.allocator(), "clear");
+    var empty = try copy.clone(testing.allocator);
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.@"command-palette-entry".cval().len);
+}
+
+test "command-palette-entry in a config file: clear empties the palette, an empty value restores the defaults" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cleared = try Config.default(alloc);
+    defer cleared.deinit();
+    var clear_reader: std.Io.Reader = .fixed(
+        "command-palette-entry = clear\ncommand-palette-entry = title:Custom,action:open_config\n",
+    );
+    try cleared.loadReader(alloc, &clear_reader, "C:\\noctty-test\\config.ghostty");
+    try testing.expect(cleared._diagnostics.empty());
+    try testing.expectEqual(@as(usize, 1), cleared.@"command-palette-entry".cval().len);
+    try testing.expectEqualStrings("Custom", cleared.@"command-palette-entry".value.items[0].title);
+
+    var restored = try Config.default(alloc);
+    defer restored.deinit();
+    var restore_reader: std.Io.Reader = .fixed(
+        "command-palette-entry = clear\ncommand-palette-entry =\n",
+    );
+    try restored.loadReader(alloc, &restore_reader, "C:\\noctty-test\\config.ghostty");
+    try testing.expect(restored._diagnostics.empty());
+    try testing.expectEqual(inputpkg.command.defaults.len, restored.@"command-palette-entry".cval().len);
+}
+
+test "a config shared with upstream 1.4 on macOS or Linux loads its platform keys without a problem" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var reader: std.Io.Reader = .fixed(
+        "drag-handle = never\n" ++
+            "scrollback-compression = false\n" ++
+            "gtk-tabs-inverted = true\n" ++
+            "gtk-horizontal-tab-scroll = false\n",
+    );
+    try cfg.loadReader(alloc, &reader, "C:\\noctty-test\\config.ghostty");
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(DragHandle.never, cfg.@"drag-handle");
+    try testing.expect(!cfg.@"scrollback-compression");
+}
+
 test "default quit-after-last-window-closed is enabled in the Windows fork" {
     const testing = std.testing;
 
@@ -12054,6 +13338,20 @@ test "compatibility: removed selection-invert-fg-bg" {
     }
 }
 
+test "compatibility: accent-follow-system still loads without a diagnostic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_][]const u8{ "--accent-follow-system=false", "--accent-follow-system=true", "--accent-follow-system" }) |arg| {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{arg} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+    }
+}
+
 test "compatibility: removed bold-is-bright" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -12072,33 +13370,4 @@ test "compatibility: removed bold-is-bright" {
             cfg.@"bold-color",
         );
     }
-}
-
-test "Windows safe mode swaps only the automatic command for cmd.exe" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    // With no command, recovery gives `cmd.exe /D` (no profile, no AutoRun),
-    // marked automatic, before `finalize` has anything to look up.
-    var automatic = try Config.default(alloc);
-    defer automatic.deinit();
-    try automatic.useWindowsRecoveryCommand();
-    try testing.expect(automatic._command_defaulted);
-    try testing.expect(automatic.command.? == .direct);
-    try testing.expect(std.ascii.eqlIgnoreCase(
-        std.fs.path.basename(automatic.command.?.direct[0]),
-        "cmd.exe",
-    ));
-    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
-    // The default lookup leaves a command that is already set alone.
-    try automatic.resolveWindowsDefaultCommand();
-    try testing.expectEqualStrings("/D", automatic.command.?.direct[1]);
-
-    // A command somebody set is not replaced.
-    var explicit = try Config.default(alloc);
-    defer explicit.deinit();
-    explicit.command = .{ .shell = "pwsh.exe" };
-    try explicit.useWindowsRecoveryCommand();
-    try testing.expectEqualStrings("pwsh.exe", explicit.command.?.shell);
 }

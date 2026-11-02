@@ -1,4 +1,9 @@
 $ErrorActionPreference = 'Stop'
+$savedMeasureAumid = $env:NOCTTY_INTERACTIVE_MEASURE_AUMID
+try {
+# The legacy timestamp cases below use synthetic paths, even when the composite
+# invokes this self-test with measurement mode inherited.
+$env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $null
 
 function Assert-Equal {
     param(
@@ -76,7 +81,9 @@ Assert-True ($layout.SandboxRoot -ne $otherLayout.SandboxRoot) 'different sandbo
 Assert-True ($layout.SandboxId -ne $otherLayout.SandboxId) 'different sandbox names should produce unique sandbox ids'
 
 $launchArgs = @(Get-InteractiveWin11LaunchArguments -Layout $layout)
-Assert-Equal $launchArgs.Count 5 'launch args should include containment and isolation overrides'
+Assert-Equal $launchArgs.Count 6 'launch args should include containment, isolation and cmd overrides'
+Assert-True ($launchArgs -contains '--command=cmd.exe') 'shell-agnostic harnesses must not inherit PowerShell history'
+Assert-True (@(Get-InteractiveWin11LaunchArguments -Layout $layout -UseConfiguredCommand) -notcontains '--command=cmd.exe') 'shell-specific fixtures must retain their configured command'
 Assert-True ($launchArgs -contains '--linux-cgroup=always') 'launch args should enable Windows Job Object containment'
 Assert-True ($launchArgs -contains '--linux-cgroup-hard-fail=true') 'launch args should fail when Job Object attachment fails'
 Assert-True ($launchArgs -contains '--windows-job-object-kill-on-close=true') 'launch args should terminate contained descendants when the host exits'
@@ -262,4 +269,74 @@ foreach ($missing in @('conpty.dll', 'OpenConsole.exe')) {
 Assert-InteractiveWin11ExeExists -ExePath $conptyExe
 Remove-Item -LiteralPath $conptyScratch -Recurse -Force -ErrorAction SilentlyContinue
 
+$env:NOCTTY_INTERACTIVE_MEASURE_AUMID = '1'
+Assert-Equal (Get-InteractiveWin11ProcessAumid) 'io.github.amanthanvi.noctty.measure' 'measurement process identity should follow the executable'
+Assert-Equal (Get-InteractiveWin11ToastAumid) 'io.github.amanthanvi.noctty' 'measurement mode must retain the product notifier gate'
+$measureExe = Get-InteractiveWin11ExePath -RepoRoot $repoRoot
+Assert-Equal $measureExe (Get-InteractiveWin11MeasureExePath $repoRoot) 'measurement mode should route the executable'
+Assert-Equal (Get-InteractiveWin11MeasureRepoForExe $measureExe) $repoRoot 'raw measurement executable should recover its repository'
+
+# Mock only the build/receipt boundary. These checks must never run a compiler
+# or require a real measurement executable in the helper self-test.
+$script:measureRoutingBuild = $null
+$script:measureRoutingAssertCount = 0
+function Invoke-InteractiveWin11MeasureBuild {
+    param([string] $RepoRoot, [string] $Optimize)
+    $script:measureRoutingBuild = @($RepoRoot, $Optimize)
+}
+function Get-InteractiveWin11MeasureHead {
+    param([string] $RepoRoot)
+    return '1234567890123456789012345678901234567890'
+}
+function Assert-InteractiveWin11MeasureBuild {
+    param([string] $RepoRoot, [string] $ExePath)
+    Assert-Equal $RepoRoot $measureRoutingRepo 'measurement receipt validation should use the executable repository'
+    Assert-Equal $ExePath $measureRoutingExe 'measurement receipt validation should use the exact raw executable'
+    $script:measureRoutingAssertCount++
+    if ($script:measureRoutingRejectReceipt) { throw 'Synthetic invalid measurement receipt.' }
+}
+$measureRoutingRepo = Join-Path $env:TEMP ('noctty-measure-route-' + [guid]::NewGuid().ToString('N'))
+$measureRoutingExe = Get-InteractiveWin11ExePath $measureRoutingRepo
+Assert-Equal (Join-Path (Split-Path -Parent $measureRoutingExe) 'noctty.com') (Get-InteractiveWin11MeasureLayout $measureRoutingRepo).Cli 'measurement routing must preserve the sibling CLI shim path'
+Assert-Equal (Get-InteractiveWin11LaunchAction -ExePath $measureRoutingExe) 'build' 'missing measurement binary should request a build'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $measureRoutingExe) | Out-Null
+Set-Content -LiteralPath $measureRoutingExe -Value 'synthetic executable'
+$script:measureRoutingRejectReceipt = $false
+Assert-Equal (Get-InteractiveWin11LaunchAction -ExePath $measureRoutingExe -NoBuild) 'launch' 'valid measurement receipt should permit reuse'
+Assert-Equal $script:measureRoutingAssertCount 0 'action selection must defer full validation to admission'
+Assert-InteractiveWin11ExeExists -ExePath $measureRoutingExe -AllowInboxConPty
+Assert-Equal $script:measureRoutingAssertCount 1 'the final executable preflight must validate the receipt exactly once'
+$script:measureRoutingRejectReceipt = $true
+$rejected = $false
+try { Assert-InteractiveWin11ExeExists -ExePath $measureRoutingExe -AllowInboxConPty } catch { $rejected = $true }
+Assert-True $rejected 'an invalid measurement receipt must fail rather than fall back to timestamps or a product build'
+$foreignRejected = $false
+try { Get-InteractiveWin11LaunchAction -ExePath $existingExe | Out-Null } catch { $foreignRejected = $true }
+Assert-True $foreignRejected 'measurement mode must reject product executable paths'
+Invoke-InteractiveWin11Build -RepoRoot $measureRoutingRepo -Optimize ReleaseFast
+Assert-Equal $script:measureRoutingBuild[0] $measureRoutingRepo 'build routing must preserve repository'
+Assert-Equal $script:measureRoutingBuild[1] 'ReleaseFast' 'build routing must preserve optimization'
+Invoke-InteractiveWin11Build -RepoRoot $measureRoutingRepo
+Assert-Equal $script:measureRoutingBuild[1] '' 'unspecified optimization must leave the measurement builder default intact'
+$savedRoutingEnvironment = @{}
+foreach ($name in @('APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TEMP', 'TMP', 'GHOSTTY_RESOURCES_DIR')) {
+    $savedRoutingEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+try {
+    $routingLayout = Get-InteractiveWin11SandboxLayout $measureRoutingRepo -SandboxName 'config-probe'
+    [void] (Set-InteractiveWin11Environment -Layout $routingLayout -IncludeResourcesDir)
+    Assert-Equal $env:LOCALAPPDATA $routingLayout.LocalAppData 'measurement mode must retain per-harness LOCALAPPDATA config semantics'
+    Assert-Equal $env:XDG_CONFIG_HOME $routingLayout.LocalAppData 'measurement mode must retain per-harness config root'
+    Assert-Equal $env:GHOSTTY_RESOURCES_DIR (Join-Path (Get-InteractiveWin11MeasureLayout $measureRoutingRepo).Prefix 'share\ghostty') 'measurement resources must come from the same generation prefix'
+    Assert-Equal $env:NOCTTY_INTERACTIVE_MEASURE_AUMID '1' 'sandbox redirection must retain inherited measurement mode'
+    Assert-True (-not [IO.File]::Exists((Join-Path (Split-Path -Parent $measureRoutingExe) 'noctty.portable'))) 'measurement routing must not add a shared portable config root'
+} finally {
+    foreach ($entry in $savedRoutingEnvironment.GetEnumerator()) { [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process') }
+}
+$env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $null
+Assert-Equal (Get-InteractiveWin11ProcessAumid) 'io.github.amanthanvi.noctty' 'standalone normal mode should retain product process identity'
+Assert-Equal (Get-InteractiveWin11ToastAumid) 'io.github.amanthanvi.noctty' 'standalone normal mode should retain product notifier identity'
 Write-Host 'interactive-win11 helper tests: PASS'
+} finally {
+    $env:NOCTTY_INTERACTIVE_MEASURE_AUMID = $savedMeasureAumid
+}

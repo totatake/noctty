@@ -75,20 +75,22 @@ Every place the code decides by Windows build, with the rows that check it. Add 
 row here and below when a new gate appears; the verification contract fails when a
 gate function named in the source is missing from this page.
 
-| Gate (symbol, file)                                                        | Rule                                                                                | Rows                   |
-| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ---------------------- |
-| `probeWindowsBuild`, `App.os_build` (`win32.zig`)                          | `RtlGetVersion` build, cached; a failed probe reads 0 and takes the Windows 10 path | W10-01                 |
-| `shouldUseIntegratedTitlebar`, `App.use_integrated_titlebar` (`win32.zig`) | Build 22000 (`OS_BUILD_WIN11_21H2`) and `window-show-tab-bar` not `never`           | W10-03, W10-04, W10-05 |
-| `undecoratedKeepsFrame` (`win32.zig`)                                      | Build 22000 and not the quick terminal: `window-decoration = none` keeps the frame  | W10-06 to W10-10       |
-| `supportsDwmSystemBackdropAttribute` (`win32.zig`)                         | Build 22621 (`OS_BUILD_WIN11_22H2`) for `DWMWA_SYSTEMBACKDROP_TYPE`                 | W10-12                 |
-| `OS_BUILD_WIN10_22H2` (`win32/consts.zig`)                                 | 19045, used only by tests that stand in for this machine                            | W10-01                 |
-| DWM attributes 20 and 19, 34 to 36 (`win32_theme.zig`)                     | Dark caption tries 20, then 19; border, caption and text colour need build 22000    | W10-11, W10-12         |
-| Titlebar icon font chain (`createTitlebarIconFont`, `win32.zig`)           | Segoe Fluent Icons, then Segoe MDL2 Assets                                          | W10-16                 |
-| Chrome and Settings fonts (`createChromeFont`, `recreateUiFont`)           | Segoe UI Variable Text where present, else Segoe UI                                 | W10-15                 |
-| `GUID_ENERGY_SAVER_STATUS` (`win32_power.zig`)                             | Windows 11 Energy Saver; the registration may fail elsewhere and is not a warning   | W10-26                 |
-| ConPTY source (`pty.zig`)                                                  | Bundled `conpty.dll` and `OpenConsole.exe`, else the in-box conhost                 | W10-19, W10-02         |
-| Default-terminal delegation (`win32_terminal_handoff.zig`)                 | Needs the console-delegation setting the OS provides                                | W10-22                 |
-| Toasts, AUMID, jump list, Explorer verbs                                   | Shell features that look different on Windows 10                                    | W10-23 to W10-25       |
+| Gate (symbol, file)                                                        | Rule                                                                                                                                                         | Rows                     |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| `probeWindowsBuild` (`win32.zig`), `App.os_build`                          | `RtlGetVersion` build, cached; a failed probe reads 0 and takes the Windows 10 path                                                                          | W10-01                   |
+| `shouldUseIntegratedTitlebar` (`win32.zig`), `App.use_integrated_titlebar` | Build 22000 (`OS_BUILD_WIN11_21H2`) and `window-show-tab-bar` not `never`                                                                                    | W10-03, W10-04, W10-05   |
+| `tabsFlushWithTop` (`win32/host.zig`)                                      | Build 22000, ordinary host and visible strip: maximized app-owned top edge or fullscreen tabs extend upward; Windows 10 and quick terminals retain the inset | W10-03, W10-06 to W10-10 |
+| `undecoratedKeepsFrame` (`win32/window_state.zig`)                         | Build 22000 and not the quick terminal: `window-decoration = none` keeps the frame                                                                           | W10-06 to W10-10         |
+| `supportsDwmSystemBackdropAttribute` (`win32.zig`)                         | Build 22621 (`OS_BUILD_WIN11_22H2`) for `DWMWA_SYSTEMBACKDROP_TYPE`                                                                                          | W10-12                   |
+| `OS_BUILD_WIN10_22H2` (`win32/consts.zig`)                                 | 19045, used only by tests that stand in for this machine                                                                                                     | W10-01                   |
+| DWM attributes 20 and 19, 34 to 36 (`win32_theme.zig`)                     | Dark caption tries 20, then 19; border, caption and text colour need build 22000                                                                             | W10-11, W10-12           |
+| Titlebar icon font chain (`createTitlebarIconFont`, `win32/host.zig`)      | Segoe Fluent Icons, then Segoe MDL2 Assets, by glyph table; else `win32_icons`                                                                               | W10-16                   |
+| Chrome and Settings fonts (`createChromeFont`, `recreateUiFont`)           | Segoe UI Variable Text where present, else Segoe UI                                                                                                          | W10-15                   |
+| `GUID_ENERGY_SAVER_STATUS` (`win32_power.zig`)                             | Windows 11 Energy Saver; the registration may fail elsewhere and is not a warning                                                                            | W10-26                   |
+| ConPTY source (`pty.zig`)                                                  | Bundled `conpty.dll` and `OpenConsole.exe`, else the in-box conhost                                                                                          | W10-19, W10-02           |
+| Default-terminal delegation (`win32_terminal_handoff.zig`)                 | Needs the console-delegation setting the OS provides                                                                                                         | W10-22                   |
+| Toasts, AUMID, jump list, Explorer verbs                                   | Shell features that look different on Windows 10                                                                                                             | W10-23 to W10-25         |
+| `directVolumePath`, `directVolumeDeviceName` (`os/windows.zig`)            | Any build: maps the DOS drive alias before a guarded open; Windows 10 may reject it                                                                          | W10-27, W10-28           |
 
 ## Rows
 
@@ -129,8 +131,10 @@ shell (W10-19).
 bar and its minimise, maximise and close buttons; the tab strip is a separate row
 below it (32 DIP tall at 100%, not the 40 DIP integrated row); noctty draws no
 caption buttons of its own. Open two tabs, maximise, restore, double-click the
-caption. Repeat at 150% scaling (Settings > Display, then start a fresh noctty):
-the row scales and nothing clips.
+caption, then run `toggle_fullscreen` and leave fullscreen. Repeat at 150%
+scaling (Settings > Display, then start a fresh noctty): the row scales and nothing
+clips. The separate tab row keeps its 3 DIP top
+inset when maximized and fullscreen; the flush top edge is a Windows 11 change.
 
 **W10-04 `window-show-tab-bar = never`.** Expected: no strip and no one-pixel
 remnants of tab buttons across the top of the client area (#244, #245), with two
@@ -152,12 +156,14 @@ window is frameless (see [Windows, tabs, and splits](windows.md#windows-tabs-and
 (#270: `CreateWindowEx` adds `WS_CAPTION` to an overlapped style with no frame
 bits, and the host removes it again before the first tab), no border, no shadow.
 The cursor stays an arrow at every window edge (no resize border). `Alt+Space`
-opens no window menu. Dragging the tab strip does not move the window.
+opens no window menu. Dragging the tab strip does not move the window. The
+separate tab row keeps its 3 DIP top inset, including at 150% scaling.
 
 **W10-07 Maximise covers the taskbar.** Run the palette action `toggle_maximize`
 (`Ctrl+Shift+P`) on the undecorated window. Expected, as documented: it covers the
 taskbar. If the window instead stops at the work area, the documentation line is
-out of date; record it.
+out of date; record it. The tab buttons retain their 3 DIP top inset when
+maximized; they do not extend to the client area's top edge as on Windows 11.
 
 **W10-08 Decoration toggle round trip.** From a decorated window run the palette
 action `toggle_window_decorations`, then again. Expected: the caption disappears
@@ -167,19 +173,25 @@ rectangles during the round trip from a normal window. This expectation comes
 from the `SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED` path, not a Windows 10
 measurement. A maximised window is a separate observation:
 the Windows 10 path rewrites the window style without `WS_MAXIMIZE`
-(`AGENTS.md`, 2026-09-24 entry, trap 4), so toggling while maximised is expected
-to leave an un-maximised window inside the maximised rectangle. Record what you
-see; neither outcome is a pass or a fail.
+(`docs/agents/log/window-frame.md`, 2026-09-24 entry, trap 4), so toggling
+while maximised is expected to leave an un-maximised window inside the maximised rectangle. Record what you
+see; neither outcome is a pass or a fail. The separate tab row keeps its 3 DIP
+top inset on both sides of the decoration toggle.
 
 **W10-09 Fullscreen round trip.** Maximise, then `toggle_fullscreen`, leave
 fullscreen, then restore from maximised. Expected: the window returns to its
 normal size and place, not to the maximised rectangle (the 2026-10-06 fullscreen
-entry in `AGENTS.md` describes the Windows 11 failure this guards).
+entry in `docs/agents/log/window-frame.md` describes the Windows 11 failure this
+guards). While fullscreen with tabs shown, the tab buttons retain their 3 DIP
+top inset; after leaving fullscreen, check the same inset when maximized and
+after restoring.
 
 **W10-10 Quick terminal.** There is no default key for it. Put `quick-terminal-position
 = top` and `keybind = global:ctrl+alt+q=toggle_quick_terminal` in the config, reload
 with `Ctrl+Shift+,`, and press `Ctrl+Alt+Q`. Expected: frameless on both Windows
 versions, flush with the top edge, full width, no gap and no shadow.
+The host's outer edge is flush with the screen; its tab buttons keep their
+3 DIP inset from the top of the client area, as quick terminals do on Windows 11.
 
 ### Theme and DWM
 
@@ -201,12 +213,12 @@ theme's own colours. `background-opacity = 0.8` fades the whole window (layered
 alpha, independent of the build); `background-blur = true` changes nothing, as on
 Windows 11.
 
-**W10-13 Accent follows Windows.** Settings > Personalization > Colors, choose a
-custom accent, with `accent-follow-system` at its default. Expected: the active
-tab's underline and border take the accent (made readable against the strip) and
-change live when you pick another. With the default accent where
-`HKCU\Software\Microsoft\Windows\DWM\AccentColor` does not exist, the strip keeps
-the theme accent and nothing is logged.
+**W10-13 Active tab (Core).** Open three tabs. Expected: the active tab takes
+the terminal's background and runs on into the terminal below it, with no border,
+underline or strip above the tab row in any accent colour; its label starts with
+`* `. Picking another Windows accent (Settings > Personalization > Colors)
+changes nothing in the tab row. A config that still sets `accent-follow-system`
+loads without an error.
 
 **W10-14 High Contrast.** Turn on a High Contrast theme (Settings > Ease of
 Access), then off. Expected: chrome switches to system colours with a visible
@@ -222,14 +234,14 @@ Segoe UI (Windows 10 has no Segoe UI Variable), no clipped labels at 100%, 150% 
 
 **W10-16 Tab-row `+` and `▾` glyphs (Core).** Gate: `createTitlebarIconFont`. In the
 separate tab row, look at the new-tab and dropdown buttons, at 100% and 150%.
-Expected: a plus and a chevron. The code asks GDI for "Segoe Fluent Icons" first and
-for "Segoe MDL2 Assets" only if that fails, but `CreateFontIndirectW` can return
-a substitute for a missing face, and Microsoft does not ship
-Segoe Fluent Icons with Windows 10 ([Segoe Fluent Icons font](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font)).
-So the MDL2 fallback may never be reached and these two buttons may draw empty or
-as boxes. This is an inference from the code, not a measurement on Windows 10: if
-the glyphs are missing, record it as a defect with a screenshot; the search bar's
-icons (W10-17) already guard against exactly this by checking the glyph table.
+Expected: a plus and a chevron, never a hollow box. Microsoft does not ship
+Segoe Fluent Icons with Windows 10 ([Segoe Fluent Icons font](https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font)),
+and `CreateFontIndirectW` returns a substitute for a missing face, which draws a
+hollow box for every icon (measured on build 26300 with a face that is not
+installed). So the code takes the first of Segoe Fluent Icons and Segoe MDL2 Assets
+whose glyph table has every titlebar icon, and draws the built-in vector icons when
+neither has; on Windows 10 that should be Segoe MDL2 Assets. A box or an empty
+button is a defect: record it with a screenshot.
 
 **W10-17 Search bar icons.** Open the search bar (`Ctrl+Shift+F`). Expected: six
 buttons, previous, next, regex, case, whole word and close, drawn from the embedded
@@ -295,13 +307,50 @@ Revert to the snapshot afterwards.
 carries the AppUserModelID. Set `notify-on-command-finish = always` and
 `notify-on-command-finish-action = notify`, run `Start-Sleep 12` and switch to
 another window. Expected: a toast named "noctty" with the noctty
-icon, in Action Center afterwards; clicking it focuses the pane. Turn Focus Assist
-to "Alarms only" and repeat. Expected: either the toast, or an in-app banner; never
-nothing. Then revert to the clean snapshot and repeat with the portable copy only:
+icon whose last line reads `Tab 1: <tab title>`, in Action Center afterwards;
+clicking its popup focuses the pane. Run it twice more without looking at the
+tab: Action Center holds one entry for the pane, the newest. Switch to the tab:
+the entry leaves Action Center. The next two checks test closing and
+quitting, so nothing may count as seeing the tab first: from the moment the
+toast is shown until the close or the quit, stay in the noctty window with
+the pane focused. Do not switch windows, open Action Center or click the
+popup in between: bringing noctty forward or focusing the pane counts as
+seeing the tab and removes the entry by itself. With `always` the toast shows
+while the pane is focused. Press `Ctrl+Shift+T`, run `Start-Sleep 12` in the
+new tab, wait for the popup (if none appears, the check does not count), then
+type `exit` there so its pane closes. Open Action Center: the entry is gone.
+Close Action Center, run `Start-Sleep 12` in the remaining tab, wait for the
+popup, then press `Ctrl+Shift+Q` without leaving the window. At an idle prompt
+no confirmation appears; if one does, the check does not count, so run it
+again. Open Action Center: the entry is gone. Start noctty again, turn Focus
+Assist to "Alarms only" and repeat the first toast.
+Expected: either the toast (record whether it pops up or only reaches Action
+Center) or an in-app banner ending in the same tab line; never nothing. Turn
+Focus Assist off again. Action Center clicks: open a second tab, run
+`Start-Sleep 12` in the first, switch to the second tab, minimize noctty and
+wait until the popup is gone. Click the entry in Action Center. Expected:
+noctty restores, shows the first tab with its pane focused, and comes to the
+foreground (record whether it did or only flashed its taskbar button). Click
+a fresh toast's popup once: the pane is focused once. With
+`quit-after-last-window-closed = false`, close every window while a toast is
+in Action Center and click it: one window opens and comes forward. Start a
+portable copy while no installed noctty runs, so that it is the
+single-instance noctty, minimize it, and click one of its entries in Action
+Center: the installed activator hands the click over and the portable window
+restores and comes to the foreground (record whether it only flashed its
+taskbar button); close it. Then end noctty's
+process in Task Manager while one of its toasts is in Action Center, and click
+that entry: one noctty window opens (with the session restored if that is
+on) and comes forward. Uninstall, then check that
+`HKCU\Software\Classes\AppUserModelId\io.github.amanthanvi.noctty` has no
+`CustomActivator` value and `Software\Classes\CLSID\{3E21F05E-C82D-4E45-AA7D-2EC361AD6C3E}`
+exists under neither HKLM nor HKCU. Then revert to the clean snapshot and repeat with the portable copy only:
 it creates the AppUserModelID registration where none exists
 ([App identity](windows.md#app-identity)). Portable toast delivery has not been
 confirmed: record whether the toast appears, its icon and Action Center entry,
 and any banner, rather than treating registration alone as proof of delivery.
+A portable copy registers no toast activator: its popup click focuses the
+pane, and a click on its Action Center entry does nothing.
 
 **W10-24 Jump list (installed).** After `cd` in a few folders, right-click the taskbar
 button. Expected: "Recent" lists the folders, "Profiles" lists the detected shells;
@@ -322,6 +371,46 @@ unavailable` warning (Energy Saver registration may fail on Windows 10; that is
 logged at debug level only and is not a warning). On a laptop, turn on Battery Saver
 with `power-saver-rendering = auto` and watch a streaming command: output is paced
 near 30 fps.
+
+### Default shell and file links
+
+Both rows check the change in #450, which resolves the DOS drive alias (`C:`)
+to its direct volume path before a file is opened with `OBJ_DONT_REPARSE`:
+in shell detection (whose guarded open came with #443), in the link opener and
+in the WSL safety probe. The rows exercise the first two; no row here reaches
+the WSL probe. It was written because an upstream report
+(openai/codex#46290) has Windows 10 22H2 build 19045.6456 rejecting the alias
+itself under that flag. That the same happens to noctty is inferred, and
+neither row has been run on Windows 10. Record the build number with the
+result.
+
+**W10-27 Default shell with `command` unset (Core).** Gate: `directVolumePath`
+(`os/windows.zig`), used by shell detection in `windows_shell.zig`. Install
+PowerShell 7 so that `pwsh.exe` is on `PATH`, for example with the MSI or
+`winget install Microsoft.PowerShell`, after W10-21, which needs the machine
+without it. Open a new console afterwards (a session started before the
+install keeps the old `PATH`, which noctty would inherit) and check that
+`Get-Command pwsh.exe` finds it. Start the portable copy from that console
+with `--single-instance=false` and a
+`config.ghostty` that sets neither `command` nor `default-profile`. In the
+first tab run `$PSVersionTable.PSVersion` and `(Get-Process -Id $PID).Path`.
+Expected: PowerShell 7.x, and a path ending in `pwsh.exe`
+([windows.md](windows.md#shells) gives the order: `pwsh.exe` on `PATH`, then
+Windows PowerShell, then `cmd.exe`). Windows PowerShell 5.1 or Command Prompt
+in that tab, with `pwsh.exe` on `PATH`, is a finding: shell detection opens
+each candidate with `OBJ_DONT_REPARSE`, and a rejected `pwsh.exe` falls through
+to the next shell.
+
+**W10-28 Ctrl+click on a local file path (Core).** Gate: `directVolumePath` and
+`directVolumeDeviceName` (`os/windows.zig`), used by the link opener
+(`os/local_path.zig`). Create a text file on a local drive with
+`Set-Content "$env:TEMP\noctty-link.txt" hello`, print its path with
+`"$env:TEMP\noctty-link.txt"`, and Ctrl+click the printed path. Expected: the
+file opens in the application registered for `.txt` (Notepad on a clean image).
+Then print `C:\no-such-folder\noctty-link.txt` and Ctrl+click it. Expected:
+nothing opens. Nothing opening for the existing file is a finding: the opener
+checks the file with `OBJ_DONT_REPARSE`, and refuses the link if that open
+fails.
 
 ## Results
 
@@ -355,6 +444,8 @@ Copy this table into the release notes' validation section or the release PR.
 | W10-24            |                          |       |                                              |
 | W10-25            |                          |       |                                              |
 | W10-26            |                          |       |                                              |
+| W10-27            |                          |       |                                              |
+| W10-28            |                          |       |                                              |
 | Machine and image |                          |       | `winver`, VM type, display scaling           |
 | Artifact          |                          |       | source SHA, version, SHA-256 of ZIP or setup |
 | Date and tester   |                          |       |                                              |

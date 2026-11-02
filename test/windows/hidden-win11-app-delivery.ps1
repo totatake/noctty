@@ -4,6 +4,8 @@ Portable integration smoke for App HWND delivery on a private desktop.
 Run with -Bin <built bin directory> -Run <new evidence directory>.
 No builds, desktop switching, foreground activation, injected input, clipboard,
 PowerShell profiles, or real shell history. All child processes belong to a job.
+The terminal runs cmd.exe, and the real PSReadLine history files' size and time are
+checked before and after (metadata only).
 The adopted real startup-state hash is checked before and after the run; supply
 ExpectedStartupModified to pin its exact UTC timestamp as well.
 #>
@@ -18,6 +20,7 @@ param(
     [string] $ExpectedStartupModified
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'hidden-win11-local-lib.ps1')
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -47,22 +50,7 @@ public static class AppDeliverySmoke {
     [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes {
         public int length; public IntPtr descriptor; public int inherit;
     }
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long processTime,jobTime; public uint flags;
-        public UIntPtr minWorking,maxWorking; public uint activeProcesses;
-        public UIntPtr affinity; public uint priority,scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong readOps,writeOps,otherOps,readBytes,writeBytes,otherBytes; }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public IoCounters io;
-        public UIntPtr processMemory,jobMemory,peakProcessMemory,peakJobMemory;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
-        public long userTime,kernelTime,periodUserTime,periodKernelTime;
-        public uint pageFaults,totalProcesses,activeProcesses,terminatedProcesses;
-    }
     public delegate bool EnumWindow(IntPtr h,IntPtr p);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateDesktopW(string n,IntPtr dev,IntPtr mode,int flags,uint access,IntPtr sa);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint tid);
     [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
@@ -79,15 +67,9 @@ public static class AppDeliverySmoke {
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref Startup si,out NativeProcessInfo pi);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(string path,uint access,uint share,ref SecurityAttributes sa,uint disposition,uint flags,IntPtr template);
-    [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
-    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job,int type,ref JobLimits limits,uint size);
     [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
-    [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job,int type,out JobAccounting accounting,uint size,IntPtr returned);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job,uint code);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h,uint milliseconds);
-    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h,out uint code);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll")] static extern uint GetProcessId(IntPtr h);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr h,uint flags,StringBuilder path,ref uint length);
@@ -130,28 +112,6 @@ public static class AppDeliverySmoke {
         var info=new GuiInfo { size=(uint)Marshal.SizeOf<GuiInfo>() };
         if(tid==0 || !GetGUIThreadInfo(tid,ref info)) throw new Exception("GUI thread inspection failed");
         return info.flags;
-    }
-    public static IntPtr CreateOwnedJob() {
-        var job=CreateJobObjectW(IntPtr.Zero,null);
-        if(job==IntPtr.Zero) throw new Exception("CreateJobObject failed");
-        var limits=new JobLimits(); limits.basic.flags=0x2000;
-        if(!SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf<JobLimits>())) {
-            CloseHandle(job); throw new Exception("SetInformationJobObject failed");
-        }
-        return job;
-    }
-    public static uint StopOwnedJob(IntPtr job) {
-        try {
-            if(!TerminateJobObject(job,1)) throw new Exception("Terminate owned job failed");
-            var deadline=DateTime.UtcNow.AddSeconds(5);
-            do {
-                JobAccounting accounting;
-                if(!QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf<JobAccounting>(),IntPtr.Zero)) throw new Exception("Query owned job failed");
-                if(accounting.activeProcesses==0) return accounting.totalProcesses;
-                System.Threading.Thread.Sleep(10);
-            } while(DateTime.UtcNow<deadline);
-            throw new Exception("Owned job cleanup exceeded five seconds");
-        } finally { CloseHandle(job); }
     }
     static string Quote(string value) {
         var result=new StringBuilder("\""); int slashes=0;
@@ -212,11 +172,6 @@ public static class AppDeliverySmoke {
     public static void CloseProcess(ProcessInfo pi) { CloseHandle(pi.thread); CloseHandle(pi.process); }
 }
 '@
-function Startup-Fingerprint {
-    $path=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty\startup-attempts.json'
-    if(-not(Test-Path -LiteralPath $path)){return @{Exists=$false}}
-    return @{Exists=$true;Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();Modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.ToString('o')}
-}
 function Capture-Summary([string]$Path){
     $stream=$null;$reader=$null
     try {
@@ -243,9 +198,9 @@ function Capture-Summary([string]$Path){
     finally{if($reader){$reader.Dispose()}elseif($stream){$stream.Dispose()}}
 }
 function Process-Observation($Info){
-    $wait=[AppDeliverySmoke]::WaitForSingleObject($Info.process,0)
+    $wait=[HiddenLocal]::WaitForSingleObject($Info.process,0)
     [uint32]$code=0
-    $available=[AppDeliverySmoke]::GetExitCodeProcess($Info.process,[ref]$code)
+    $available=[HiddenLocal]::GetExitCodeProcess($Info.process,[ref]$code)
     return @{Pid=$Info.pid;Exited=($wait -eq 0);WaitResult=$wait;ExitCodeAvailable=$available;ExitCode=if($available){$code}else{$null};Stdout=(Capture-Summary $Info.stdoutPath);Stderr=(Capture-Summary $Info.stderrPath)}
 }
 if(-not $Driver) {
@@ -254,6 +209,7 @@ if(-not $Driver) {
     if(Test-Path -LiteralPath $Run){throw 'Run directory must be new.'}
     if(-not(Test-Path -LiteralPath (Join-Path $Bin 'noctty.exe'))){throw 'Bin must contain noctty.exe.'}
     $before=Startup-Fingerprint
+    $historyGuard=Start-WindowsHarnessHistoryGuard -Harness 'hidden-win11-app-delivery.ps1'
     if(($ExpectedStartupHash -and $before.Hash -ne $ExpectedStartupHash) -or ($ExpectedStartupModified -and $before.Modified -ne $ExpectedStartupModified)){throw 'Real startup state differs from adopted baseline; no launches performed.'}
     [void](New-Item -ItemType Directory -Path $Run)
     $portableBin=Join-Path $Run 'portable\bin'
@@ -264,12 +220,12 @@ if(-not $Driver) {
     Set-Content -LiteralPath (Join-Path $portableBin 'noctty.portable') -Value '' -NoNewline
     foreach($name in @('localappdata','appdata')){[void](New-Item -ItemType Directory -Path (Join-Path $Run $name))}
     $desktopName='noctty-pkg19-'+[guid]::NewGuid().ToString('N')
-    $desktop=[AppDeliverySmoke]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
+    $desktop=[HiddenLocal]::CreateDesktopW($desktopName,[IntPtr]::Zero,[IntPtr]::Zero,0,0x10000000,[IntPtr]::Zero)
     if($desktop -eq [IntPtr]::Zero){throw 'CreateDesktop failed.'}
     $oldLocal=$env:LOCALAPPDATA;$oldRoaming=$env:APPDATA
     $driverInfo=$null;$job=[IntPtr]::Zero;$driverExe=$null;$code=1
     try {
-        $job=[AppDeliverySmoke]::CreateOwnedJob()
+        $job=[HiddenLocal]::CreateOwnedJob()
         $env:LOCALAPPDATA=Join-Path $Run 'localappdata';$env:APPDATA=Join-Path $Run 'appdata'
         $driverExe=(Get-Command pwsh.exe -CommandType Application).Source
         $driverArgs=@('-NoLogo','-NoProfile','-NonInteractive','-File',$PSCommandPath,'-Bin',$portableBin,'-Run',$Run,'-Driver','-DesktopName',$desktopName)
@@ -278,23 +234,26 @@ if(-not $Driver) {
         @{Pid=$driverInfo.pid;StartTimeUtc=$started;Executable='pwsh.exe';Desktop=$desktopName} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Run 'driver-identity.json')
         Write-Host "Focused App delivery driver PID=$($driverInfo.pid). Results: $Run"
         $deadline=[datetime]::UtcNow.AddSeconds($DriverTimeoutSeconds)
-        while([AppDeliverySmoke]::WaitForSingleObject($driverInfo.process,1000) -eq 258){
+        while([HiddenLocal]::WaitForSingleObject($driverInfo.process,1000) -eq 258){
             if([datetime]::UtcNow -ge $deadline){throw 'Hidden driver timed out; its owned job will be cleaned up.'}
         }
         [uint32]$exitCode=1
-        if(-not[AppDeliverySmoke]::GetExitCodeProcess($driverInfo.process,[ref]$exitCode)){throw 'Driver exit inspection failed.'}
+        if(-not[HiddenLocal]::GetExitCodeProcess($driverInfo.process,[ref]$exitCode)){throw 'Driver exit inspection failed.'}
         $code=$exitCode
     } finally {
         $env:LOCALAPPDATA=$oldLocal;$env:APPDATA=$oldRoaming
         $cleanupError=$null;$identityError=$null;$ownedProcesses=0
         try { if($driverInfo){[void][AppDeliverySmoke]::Verify($driverInfo,$driverExe)} } catch {$identityError=$_}
         $driverObservation=if($driverInfo){Process-Observation $driverInfo}else{$null}
-        if($job -ne [IntPtr]::Zero){try{$ownedProcesses=[AppDeliverySmoke]::StopOwnedJob($job)}catch{$cleanupError=$_}}
+        if($job -ne [IntPtr]::Zero){try{$ownedProcesses=[HiddenLocal]::StopOwnedJob($job)}catch{$cleanupError=$_}}
         if($driverInfo){[AppDeliverySmoke]::CloseProcess($driverInfo)}
         [void][AppDeliverySmoke]::CloseDesktop($desktop)
         $after=Startup-Fingerprint
         $unchanged=$before.Exists -eq $after.Exists -and $before.Hash -eq $after.Hash -and $before.Modified -eq $after.Modified
-        @{Before=$before;After=$after;Unchanged=$unchanged;DriverIdentityVerified=($null -eq $identityError);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses;Driver=$driverObservation} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        $historyFailure=$null
+        try{Assert-WindowsHarnessHistoryGuard -Guard $historyGuard}catch{$historyFailure=$_}
+        @{Before=$before;After=$after;Unchanged=$unchanged;HistoryUnchanged=($null -eq $historyFailure);DriverIdentityVerified=($null -eq $identityError);OwnedJobCleanedUp=($null -eq $cleanupError);OwnedProcessCount=$ownedProcesses;Driver=$driverObservation} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Run 'startup-state.json')
+        if($historyFailure){throw $historyFailure}
         if(-not $unchanged){throw 'Real startup state changed; stop launches.'}
         if($cleanupError){throw $cleanupError}
         if($identityError){throw $identityError}
@@ -341,12 +300,12 @@ try {
     Assert-Check 'headless App message-only HWND exists' $ready $ready
     $hosts=@([AppDeliverySmoke]::Hosts($runtime.pid))
     Assert-Check 'headless launch has no host HWND' ($hosts.Count -eq 0) $hosts.Count
-    Assert-Check 'headless app remains running' ([AppDeliverySmoke]::WaitForSingleObject($runtime.process,0) -eq 258) $runtime.pid
+    Assert-Check 'headless app remains running' ([HiddenLocal]::WaitForSingleObject($runtime.process,0) -eq 258) $runtime.pid
 
     $forward=Launch-Owned @('+new-window',"--class=$instanceClass",'--timeout=10000')
-    Assert-Check 'forwarding CLI exits within deadline' ([AppDeliverySmoke]::WaitForSingleObject($forward.process,15000) -eq 0) $forward.pid
+    Assert-Check 'forwarding CLI exits within deadline' ([HiddenLocal]::WaitForSingleObject($forward.process,15000) -eq 0) $forward.pid
     [uint32]$forwardCode=1
-    if(-not[AppDeliverySmoke]::GetExitCodeProcess($forward.process,[ref]$forwardCode)){throw 'Forwarder exit inspection failed.'}
+    if(-not[HiddenLocal]::GetExitCodeProcess($forward.process,[ref]$forwardCode)){throw 'Forwarder exit inspection failed.'}
     Assert-Check 'forwarded new-window accepted' ($forwardCode -eq 0) $forwardCode
     $ready=Wait-Until {
         $windows=@([AppDeliverySmoke]::Hosts($runtime.pid))
@@ -377,9 +336,9 @@ try {
     $closed=Wait-Until {([AppDeliverySmoke]::MenuFlags($hostWindow) -band 4) -eq 0} 5
     Assert-Check 'caption menu exits after cancellation' $closed $closed
     Assert-Check 'window close request posted' ([AppDeliverySmoke]::PostMessageW($hostWindow,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)) $true
-    Assert-Check 'runtime exits after last window closes' ([AppDeliverySmoke]::WaitForSingleObject($runtime.process,10000) -eq 0) $runtime.pid
+    Assert-Check 'runtime exits after last window closes' ([HiddenLocal]::WaitForSingleObject($runtime.process,10000) -eq 0) $runtime.pid
     [uint32]$runtimeCode=1
-    if(-not[AppDeliverySmoke]::GetExitCodeProcess($runtime.process,[ref]$runtimeCode)){throw 'Runtime exit inspection failed.'}
+    if(-not[HiddenLocal]::GetExitCodeProcess($runtime.process,[ref]$runtimeCode)){throw 'Runtime exit inspection failed.'}
     Assert-Check 'runtime shutdown exits successfully' ($runtimeCode -eq 0) $runtimeCode
     Assert-Check 'terminal host destroyed' (-not[AppDeliverySmoke]::IsWindow($hostWindow)) $hostWindow.ToInt64()
 } catch {

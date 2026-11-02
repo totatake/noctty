@@ -31,6 +31,7 @@ pub const Shaders = struct {
         cell_text: Pipeline = .{ .kind = .cell_text },
         image: Pipeline = .{ .kind = .image },
         bg_image: Pipeline = .{ .kind = .bg_image },
+        split_dim: Pipeline = .{ .kind = .split_dim },
     } = .{},
     post_pipelines: []const Pipeline = &.{},
     defunct: bool = false,

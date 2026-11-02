@@ -14,7 +14,7 @@ const log = std.log.scoped(.discovery);
 
 pub const Discover = Windows;
 
-/// Font discovery for Windows. Fonts are enumerated from three sources:
+/// Font discovery for Windows. Fonts are enumerated from four sources:
 ///
 ///   1. The system font directory (%WINDIR%\Fonts)
 ///   2. The per-user font directory (%LOCALAPPDATA%\Microsoft\Windows\Fonts),
@@ -22,6 +22,8 @@ pub const Discover = Windows;
 ///   3. The per-user font registry key
 ///      (HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts), which
 ///      catches fonts registered at arbitrary paths (e.g. by font managers)
+///   4. The corresponding machine-wide font registry key (HKLM), including
+///      fonts registered outside the system font directory
 ///
 /// Each font file is inspected with FreeType for its family/style names.
 /// A face's codepoint coverage is read the first time a query has to know
@@ -49,6 +51,17 @@ pub const Windows = struct {
     /// Taken before `mutex`, never while holding it.
     scan_mutex: std.Thread.Mutex = .{},
 
+    /// Set by `stopScan` when the owner is going away. Read without a lock
+    /// by a scan in progress before each file.
+    scan_stop: std.atomic.Value(bool) = .init(false),
+
+    /// Tests only: runs just before a scan opens each file, so a test can
+    /// hold a scan inside a file or stop it there.
+    test_scan_hook: if (builtin.is_test) ?TestScanHook else void = if (builtin.is_test) null else {},
+
+    /// Tests can replace registry reads without writing installed font keys.
+    test_registry: if (builtin.is_test) ?TestRegistry else void = if (builtin.is_test) null else {},
+
     /// Snapshot of the font sources at the time of the last successful
     /// scan; used by `refresh` to skip rescanning when nothing changed.
     /// Null means we have never scanned.
@@ -66,6 +79,17 @@ pub const Windows = struct {
     /// Windows would use for a codepoint the loaded fonts lack. Created on
     /// first use and guarded by `mutex`.
     system_fallback: dwrite.SystemFallback = .{},
+
+    pub const TestScanHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, disco: *Windows, path: [:0]const u8) void,
+    };
+
+    const TestRegistry = struct {
+        ctx: *anyopaque,
+        collect: *const fn (*anyopaque, Allocator, winreg.HKEY, *std.ArrayListUnmanaged([:0]const u8), *std.StringHashMapUnmanaged(void)) error{OutOfMemory}!void,
+        last_write: *const fn (*anyopaque, winreg.HKEY) ?u64,
+    };
 
     const Record = struct {
         path: [:0]const u8,
@@ -86,6 +110,9 @@ pub const Windows = struct {
         /// OS/2 table. Nerd Fonts and other weight-split families rely on
         /// this to distinguish faces that share a style name.
         weight: u16,
+        /// OpenType wght axis bounds, in design units. Null for static
+        /// faces and variable faces with no weight axis.
+        weight_axis: ?WeightRange = null,
         monospace: bool,
         bold: bool,
         italic: bool,
@@ -107,6 +134,9 @@ pub const Windows = struct {
             self.* = undefined;
         }
     };
+
+    const WeightRange = struct { minimum: f64, maximum: f64 };
+    const weight_axis_id = Variation.Id.init("wght");
 
     pub fn init() Windows {
         // Not page_allocator: that maps a 4 KiB page per allocation, and
@@ -138,7 +168,7 @@ pub const Windows = struct {
 
     /// Rescan the font sources if they changed since the last scan (or if
     /// we never scanned). Cheap when nothing changed: two directory stats
-    /// and one registry query. A call made while another thread scans
+    /// and two registry queries. A call made while another thread scans
     /// waits for that scan and then finds nothing changed. Concurrent
     /// `discover` calls are safe because the record swap happens under
     /// `mutex` and iterators hold deep copies.
@@ -160,6 +190,19 @@ pub const Windows = struct {
         self.refreshScanLocked();
     }
 
+    /// For an owner that is about to join a thread running `refresh` and
+    /// then free this discovery: a scan in progress stops before its next
+    /// file and publishes nothing, and so does any later scan, before its
+    /// first file. Nothing else may call it, since every lookup after it
+    /// would find no fonts.
+    pub fn stopScan(self: *Windows) void {
+        self.scan_stop.store(true, .release);
+    }
+
+    pub fn scanStopped(self: *const Windows) bool {
+        return self.scan_stop.load(.acquire);
+    }
+
     fn refreshScanLocked(self: *Windows) void {
         const state = self.scanState();
         {
@@ -168,9 +211,15 @@ pub const Windows = struct {
             if (self.state) |prev| if (prev.eql(state)) return;
         }
 
-        const records = self.scanAll() catch |err| {
-            log.warn("windows font discovery scan failed err={}", .{err});
-            return;
+        const records = self.scanAll() catch |err| switch (err) {
+            error.ScanStopped => {
+                log.debug("windows font discovery scan stopped", .{});
+                return;
+            },
+            else => {
+                log.warn("windows font discovery scan failed err={}", .{err});
+                return;
+            },
         };
         if (records.len == 0) {
             log.warn("windows font discovery found no fonts", .{});
@@ -256,6 +305,7 @@ pub const Windows = struct {
             .sources = sources,
             .codepoint = desc.codepoint,
             .variations = desc.variations,
+            .bold = desc.bold,
             .i = 0,
         };
     }
@@ -350,6 +400,7 @@ pub const Windows = struct {
         /// The codepoint every returned face must have, or 0 for none.
         codepoint: u32,
         variations: []const Variation,
+        bold: bool,
         /// FreeType library for the faces `next` opens, made on first use.
         lib: ?freetype.Library = null,
         i: usize,
@@ -384,7 +435,7 @@ pub const Windows = struct {
                     continue;
                 };
                 errdefer self.alloc.free(coverage);
-                const variations = try self.alloc.dupe(Variation, self.variations);
+                const variations = try faceVariations(self.alloc, record.*, self.bold, self.variations);
 
                 // Transfer the record's allocations into the face (same
                 // allocator, no second copy). The typographic subfamily has
@@ -411,6 +462,19 @@ pub const Windows = struct {
             return null;
         }
     };
+
+    /// Each deferred face owns its variations. An explicit wght always
+    /// wins; other axes are retained when supplying the bold default.
+    fn faceVariations(alloc: Allocator, record: Record, bold: bool, requested: []const Variation) Allocator.Error![]Variation {
+        const add_weight = bold and record.weight_axis != null and isBold(record) and missing: {
+            for (requested) |axis| if (@as(u32, @bitCast(axis.id)) == @as(u32, @bitCast(weight_axis_id))) break :missing false;
+            break :missing true;
+        };
+        const result = try alloc.alloc(Variation, requested.len + @intFromBool(add_weight));
+        @memcpy(result[0..requested.len], requested);
+        if (add_weight) result[requested.len] = .{ .id = weight_axis_id, .value = 700 };
+        return result;
+    }
 
     //-------------------------------------------------------------------
     // Font source enumeration
@@ -445,9 +509,9 @@ pub const Windows = struct {
     }
 
     /// Scan all font sources and return the records. Individual files and
-    /// faces that fail to load are skipped; only allocation failure aborts
-    /// the scan.
-    fn scanAll(self: *Windows) ![]Record {
+    /// faces that fail to load are skipped; only allocation failure and
+    /// `stopScan` abort the scan.
+    fn scanAll(self: *Windows) error{ OutOfMemory, ScanStopped }![]Record {
         const alloc = self.alloc;
 
         var paths: std.ArrayListUnmanaged([:0]const u8) = .{};
@@ -464,7 +528,13 @@ pub const Windows = struct {
 
         if (self.system_dir) |dir| try collectDirFontPaths(alloc, dir, &paths, &seen);
         if (self.user_dir) |dir| try collectDirFontPaths(alloc, dir, &paths, &seen);
-        try collectRegistryFontPaths(alloc, self.system_dir, &paths, &seen);
+        for (font_registry_roots) |root| {
+            if (comptime builtin.is_test) if (self.test_registry) |registry| {
+                try registry.collect(registry.ctx, alloc, root, &paths, &seen);
+                continue;
+            };
+            try collectRegistryFontPaths(alloc, root, self.system_dir, &paths, &seen);
+        }
 
         var lib = freetype.Library.init() catch |err| {
             log.warn("windows font discovery freetype init failed err={}", .{err});
@@ -478,7 +548,11 @@ pub const Windows = struct {
             records.deinit(alloc);
         }
 
-        for (paths.items) |path| try scanPath(alloc, lib, path, &records);
+        for (paths.items) |path| {
+            if (self.scanStopped()) return error.ScanStopped;
+            if (comptime builtin.is_test) if (self.test_scan_hook) |hook| hook.call(hook.ctx, self, path);
+            try scanPath(alloc, lib, path, &records);
+        }
 
         return try records.toOwnedSlice(alloc);
     }
@@ -512,18 +586,19 @@ pub const Windows = struct {
         }
     }
 
-    /// Collect font file paths registered under the per-user font registry
-    /// key. This catches fonts registered outside the standard directories
+    /// Collect font file paths registered under a font registry key.
+    /// This catches fonts registered outside the standard directories
     /// (e.g. activated by font managers). Registry errors are non-fatal.
     fn collectRegistryFontPaths(
         alloc: Allocator,
+        root: winreg.HKEY,
         system_dir: ?[:0]const u8,
         paths: *std.ArrayListUnmanaged([:0]const u8),
         seen: *std.StringHashMapUnmanaged(void),
     ) error{OutOfMemory}!void {
         var hkey: winreg.HKEY = 0;
         if (winreg.RegOpenKeyExW(
-            winreg.HKEY_CURRENT_USER,
+            root,
             fonts_subkey,
             0,
             winreg.KEY_READ,
@@ -646,7 +721,7 @@ pub const Windows = struct {
             };
             defer if (i != 0) face.deinit();
 
-            var record = try inspectFace(alloc, path, face, face_index);
+            var record = try inspectFace(alloc, lib, path, face, face_index);
             errdefer record.deinit(alloc);
             try records.append(alloc, record);
         }
@@ -654,6 +729,7 @@ pub const Windows = struct {
 
     fn inspectFace(
         alloc: Allocator,
+        lib: freetype.Library,
         path: [:0]const u8,
         face: freetype.Face,
         face_index: i32,
@@ -693,6 +769,7 @@ pub const Windows = struct {
             .typographic_family = typographic_family,
             .typographic_style = typographic_style,
             .weight = weightClass(face),
+            .weight_axis = weightAxis(lib, face),
             .monospace = face_flags & freetype.c.FT_FACE_FLAG_FIXED_WIDTH != 0,
             .bold = style_flags & freetype.c.FT_STYLE_FLAG_BOLD != 0,
             .italic = style_flags & freetype.c.FT_STYLE_FLAG_ITALIC != 0 or
@@ -701,6 +778,21 @@ pub const Windows = struct {
             .variable = face.hasMultipleMasters(),
             .coverage = null,
         };
+    }
+
+    fn weightAxis(lib: freetype.Library, face: freetype.Face) ?WeightRange {
+        if (!face.hasMultipleMasters()) return null;
+        const mm = face.getMMVar() catch return null;
+        defer lib.doneMMVar(mm);
+        for (0..mm.num_axis) |i| {
+            const axis = mm.axis[i];
+            if (axis.tag != @as(u32, @bitCast(weight_axis_id))) continue;
+            return .{
+                .minimum = @as(f64, @floatFromInt(axis.minimum)) / 65536,
+                .maximum = @as(f64, @floatFromInt(axis.maximum)) / 65536,
+            };
+        }
+        return null;
     }
 
     //-------------------------------------------------------------------
@@ -1047,20 +1139,24 @@ pub const Windows = struct {
     /// OS/2 weight class is the reliable signal. 600 is SemiBold, the
     /// lightest weight worth substituting for a bold request.
     fn isBold(record: Record) bool {
-        return record.bold or record.weight >= 600;
+        return record.bold or record.weight >= 600 or
+            (if (record.weight_axis) |axis| axis.maximum >= 600 else false);
     }
 
     /// Distance from the weight the descriptor asks for, as a small
     /// "higher is better" score. Faces with no OS/2 table fall back to
     /// their style flag.
     fn weightRank(desc: Descriptor, record: Record) u32 {
-        const want: u16 = if (desc.bold) 700 else 400;
-        const have: u16 = if (record.weight != 0)
-            record.weight
+        const want: f64 = if (desc.bold) 700 else 400;
+        var have: f64 = if (record.weight != 0)
+            @floatFromInt(record.weight)
         else if (record.bold) 700 else 400;
-        const diff = if (have > want) have - want else want - have;
-        const steps = diff / 50;
-        return if (steps >= weight_rank_max) 0 else weight_rank_max - steps;
+        if (desc.bold) if (record.weight_axis) |axis| {
+            have = std.math.clamp(want, axis.minimum, axis.maximum);
+        };
+        const diff = @abs(have - want);
+        if (diff >= weight_rank_max * 50) return 0;
+        return weight_rank_max - @as(u32, @intFromFloat(diff / 50));
     }
 
     /// Maximum value of `weightRank`, i.e. an exact weight match. Four
@@ -1076,7 +1172,11 @@ pub const Windows = struct {
                 if (std.ascii.eqlIgnoreCase(typographic, family)) result |= 1 << 19;
                 if (containsIgnoreCase(typographic, family)) result |= 1 << 17;
             }
-            if (std.ascii.eqlIgnoreCase(record.full_name, family)) result |= 1 << 18;
+            // A Regular-named VF is a new bold candidate only because of
+            // its axis. Its default name must not outrank a real Bold.
+            if (std.ascii.eqlIgnoreCase(record.full_name, family) and
+                !(desc.bold and !(record.bold or record.weight >= 600) and isBold(record)))
+                result |= 1 << 18;
             if (containsIgnoreCase(record.family_name, family)) result |= 1 << 17;
         }
 
@@ -1097,7 +1197,10 @@ pub const Windows = struct {
         // one family name (Nerd Fonts v3, where the typographic family is
         // the only name the user is told to configure) ties on the family
         // bits above and the winner is whichever the scan saw first.
-        if (desc.bold == isBold(record)) result |= 1 << 13;
+        // Bold capability must not make a regular-default VF lose the
+        // regular style bucket. A bold request uses its available range.
+        const bold_matches = if (desc.bold) isBold(record) else !(record.bold or record.weight >= 600);
+        if (bold_matches) result |= 1 << 13;
         if (desc.italic == record.italic) result |= 1 << 12;
 
         // Weight proximity breaks ties inside the winning style bucket,
@@ -1105,6 +1208,9 @@ pub const Windows = struct {
         result |= weightRank(desc, record) << 8;
 
         if (desc.variations.len > 0 and record.variable) result |= 1 << 7;
+        // New bold candidates must not displace an otherwise equal static
+        // style. Preserve regular/fallback scan order and explicit axes.
+        if (desc.bold and desc.variations.len == 0 and !record.variable) result |= 1 << 5;
         if (record.color) result |= 1 << 6;
 
         return result;
@@ -1164,7 +1270,7 @@ pub const Windows = struct {
 
     /// Change signal for the font sources. Installing or removing a font
     /// updates the containing directory's mtime (NTFS bumps it when
-    /// direct children are added/removed) and/or the HKCU font key's
+    /// direct children are added/removed) and/or either font registry key's
     /// last-write time, so those events are detected. Overwriting an
     /// existing font file in place changes neither and is deliberately
     /// not detected — the next install/uninstall or app restart picks it
@@ -1174,6 +1280,7 @@ pub const Windows = struct {
         system_mtime: ?i128,
         user_mtime: ?i128,
         registry_write: ?u64,
+        machine_registry_write: ?u64 = null,
 
         fn eql(a: ScanState, b: ScanState) bool {
             return std.meta.eql(a, b);
@@ -1184,8 +1291,15 @@ pub const Windows = struct {
         return .{
             .system_mtime = if (self.system_dir) |dir| dirMtime(dir) else null,
             .user_mtime = if (self.user_dir) |dir| dirMtime(dir) else null,
-            .registry_write = registryLastWrite(),
+            .registry_write = self.registryWrite(winreg.HKEY_CURRENT_USER),
+            .machine_registry_write = self.registryWrite(winreg.HKEY_LOCAL_MACHINE),
         };
+    }
+
+    fn registryWrite(self: *const Windows, root: winreg.HKEY) ?u64 {
+        if (comptime builtin.is_test) if (self.test_registry) |registry|
+            return registry.last_write(registry.ctx, root);
+        return registryLastWrite(root);
     }
 
     fn dirMtime(path: [:0]const u8) ?i128 {
@@ -1195,10 +1309,10 @@ pub const Windows = struct {
         return stat.mtime;
     }
 
-    fn registryLastWrite() ?u64 {
+    fn registryLastWrite(root: winreg.HKEY) ?u64 {
         var hkey: winreg.HKEY = 0;
         if (winreg.RegOpenKeyExW(
-            winreg.HKEY_CURRENT_USER,
+            root,
             fonts_subkey,
             0,
             winreg.KEY_READ,
@@ -1230,10 +1344,12 @@ pub const Windows = struct {
     const fonts_subkey = std.unicode.utf8ToUtf16LeStringLiteral(
         "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
     );
+    const font_registry_roots = [_]winreg.HKEY{ winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE };
 
     const winreg = struct {
         const HKEY = usize;
         const HKEY_CURRENT_USER: HKEY = 0x80000001;
+        const HKEY_LOCAL_MACHINE: HKEY = 0x80000002;
         const KEY_READ: u32 = 0x20019;
         const ERROR_SUCCESS: i32 = 0;
         const ERROR_MORE_DATA: i32 = 234;
@@ -1632,7 +1748,7 @@ test "windowsInspectFaceNerdFontFixture" {
     for (files, 0..) |file, i| {
         const face = try lib.initMemoryFace(file.data, 0);
         defer face.deinit();
-        records[i] = try Windows.inspectFace(alloc, file.path, face, 0);
+        records[i] = try Windows.inspectFace(alloc, lib, file.path, face, 0);
         built += 1;
     }
 
@@ -1839,6 +1955,9 @@ test "windowsScanStateEql" {
     try testing.expect(!a.eql(.{ .system_mtime = 2, .user_mtime = null, .registry_write = 42 }));
     try testing.expect(!a.eql(.{ .system_mtime = 1, .user_mtime = 0, .registry_write = 42 }));
     try testing.expect(!a.eql(.{ .system_mtime = 1, .user_mtime = null, .registry_write = null }));
+    try testing.expect(!a.eql(.{ .system_mtime = 1, .user_mtime = null, .registry_write = 42, .machine_registry_write = 7 }));
+    const machine: Windows.ScanState = .{ .system_mtime = null, .user_mtime = null, .registry_write = null, .machine_registry_write = 7 };
+    try testing.expect(!machine.eql(.{ .system_mtime = null, .user_mtime = null, .registry_write = null }));
 }
 
 test "windows discovery end to end" {
@@ -1914,6 +2033,215 @@ fn fixtureFonts() [3]Fixture {
         // The only fixture with Arabic.
         .{ .name = "c-kawkab-mono.ttf", .data = embedded.arabic },
     };
+}
+
+test "FONTVF HKLM paths and last-write changes reach the scan" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "machine-only.ttf", .data = @import("embedded.zig").regular });
+    const path = try tmp.dir.realpathAlloc(testing.allocator, "machine-only.ttf");
+    defer testing.allocator.free(path);
+    const FixtureRegistry = struct {
+        path: []const u8,
+        machine_write: u64 = 7,
+        user_reads: usize = 0,
+        machine_reads: usize = 0,
+        scanned: usize = 0,
+
+        fn collect(ctx: *anyopaque, alloc: Allocator, root: Windows.winreg.HKEY, paths: *std.ArrayListUnmanaged([:0]const u8), seen: *std.StringHashMapUnmanaged(void)) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (root) {
+                Windows.winreg.HKEY_CURRENT_USER => self.user_reads += 1,
+                Windows.winreg.HKEY_LOCAL_MACHINE => {
+                    self.machine_reads += 1;
+                    try Windows.addUniquePath(alloc, paths, seen, self.path);
+                },
+                else => unreachable,
+            }
+        }
+
+        fn lastWrite(ctx: *anyopaque, root: Windows.winreg.HKEY) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return switch (root) {
+                Windows.winreg.HKEY_CURRENT_USER => 3,
+                Windows.winreg.HKEY_LOCAL_MACHINE => self.machine_write,
+                else => unreachable,
+            };
+        }
+
+        fn scan(ctx: *anyopaque, _: *Windows, scanned_path: [:0]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, self.path, scanned_path)) self.scanned += 1;
+        }
+    };
+    var registry: FixtureRegistry = .{ .path = path };
+    var disco: Windows = .{
+        .alloc = testing.allocator,
+        .system_dir = null,
+        .user_dir = null,
+        .records = try testing.allocator.alloc(Windows.Record, 0),
+        .mutex = .{},
+        .state = null,
+        .test_registry = .{ .ctx = &registry, .collect = FixtureRegistry.collect, .last_write = FixtureRegistry.lastWrite },
+        .test_scan_hook = .{ .ctx = &registry, .call = FixtureRegistry.scan },
+    };
+    defer disco.deinit();
+    disco.refresh();
+    try testing.expectEqual(@as(usize, 1), registry.user_reads);
+    try testing.expectEqual(@as(usize, 1), registry.machine_reads);
+    try testing.expectEqual(@as(usize, 1), registry.scanned);
+    try testing.expectEqual(@as(usize, 1), disco.records.len);
+    try testing.expectEqualStrings(path, disco.records[0].path);
+    const state = disco.state orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?u64, 3), state.registry_write);
+    try testing.expectEqual(@as(?u64, 7), state.machine_registry_write);
+    disco.refresh();
+    try testing.expectEqual(@as(u64, 1), disco.generation);
+    // Only the machine timestamp changes: refresh must rescan, then settle.
+    registry.machine_write = 8;
+    disco.refresh();
+    try testing.expectEqual(@as(u64, 2), disco.generation);
+    try testing.expectEqual(@as(usize, 2), registry.scanned);
+    disco.refresh();
+    try testing.expectEqual(@as(u64, 2), disco.generation);
+}
+
+test "FONTVF Lilex bold discovery applies weight without overriding explicit axes" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var disco = try fixtureDiscovery(tmp.dir, &.{.{
+        .name = "Lilex-VF.ttf",
+        .data = @embedFile("res/Lilex-VF.ttf"),
+    }});
+    defer disco.deinit();
+
+    // A real variable font whose default face is regular, not bold.
+    try testing.expect(disco.records[0].variable);
+    try testing.expect(!disco.records[0].bold);
+    try testing.expect(disco.records[0].weight < 600);
+    const axis = disco.records[0].weight_axis orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(f64, 100), axis.minimum);
+    try testing.expectEqual(@as(f64, 700), axis.maximum);
+    var it = try disco.discover(alloc, .{ .family = "Lilex", .bold = true });
+    defer it.deinit();
+    var bold = (try it.next()) orelse return error.TestUnexpectedResult;
+    defer bold.deinit();
+    try testing.expectEqual(@as(usize, 1), bold.win.variations.len);
+    try testing.expectEqual(Variation.Id.init("wght"), bold.win.variations[0].id);
+    try testing.expectEqual(@as(f64, 700), bold.win.variations[0].value);
+    var lib = try @import("main.zig").Library.init(alloc);
+    defer lib.deinit();
+    const opts: @import("face.zig").Options = .{ .size = .{ .points = 12 } };
+    var loaded = try bold.load(lib, opts);
+    defer loaded.deinit();
+    var coords: [1]freetype.c.FT_Fixed = undefined;
+    try loaded.face.getVarDesignCoordinates(&coords);
+    try testing.expectEqual(@as(freetype.c.FT_Fixed, 700 * 65536), coords[0]);
+
+    const axes = [_]Variation{.{ .id = .init("wght"), .value = 550 }};
+    var explicit = try disco.discover(alloc, .{ .family = "Lilex", .bold = true, .variations = &axes });
+    defer explicit.deinit();
+    var custom = (try explicit.next()) orelse return error.TestUnexpectedResult;
+    defer custom.deinit();
+    try testing.expectEqualSlices(Variation, &axes, custom.win.variations);
+    var loaded_custom = try custom.load(lib, opts);
+    defer loaded_custom.deinit();
+    try loaded_custom.face.getVarDesignCoordinates(&coords);
+    try testing.expectEqual(@as(freetype.c.FT_Fixed, 550 * 65536), coords[0]);
+
+    var regular = try disco.discover(alloc, .{ .family = "Lilex" });
+    defer regular.deinit();
+    var plain = (try regular.next()) orelse return error.TestUnexpectedResult;
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 0), plain.win.variations.len);
+}
+
+test "FONTVF mixed static and variable family preserves real Bold" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const embedded = @import("embedded.zig");
+    const regular: Fixture = .{ .name = "JetBrainsMono-Regular.ttf", .data = embedded.regular };
+    const bold: Fixture = .{ .name = "JetBrainsMono-Bold.ttf", .data = embedded.bold };
+    const variable: Fixture = .{ .name = "JetBrainsMono[wght].ttf", .data = embedded.variable };
+    // Both scan orders: a tie that merely happens to favor the first
+    // static face would conceal a missing static preference.
+    for ([_][3]Fixture{ .{ regular, bold, variable }, .{ variable, bold, regular } }) |fixtures| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var disco = try fixtureDiscovery(tmp.dir, &fixtures);
+        defer disco.deinit();
+        var it = try disco.discover(testing.allocator, .{ .family = "JetBrains Mono", .bold = true });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestUnexpectedResult;
+        defer face.deinit();
+        try testing.expect(std.mem.endsWith(u8, face.win.path, bold.name));
+        try testing.expectEqual(@as(usize, 0), face.win.variations.len);
+    }
+}
+
+test "FONTVF weight range eligibility ranking and other axes" {
+    var vf = nerdFontRecords()[3];
+    vf.variable = true;
+    vf.weight_axis = .{ .minimum = 100, .maximum = 900 };
+    const bold: Descriptor = .{ .bold = true };
+    try testing.expect(Windows.matchesDescriptor(vf, bold));
+    try testing.expectEqual(Windows.weight_rank_max, Windows.weightRank(bold, vf));
+    // A normal request still prefers a regular-default VF to a bold face.
+    var static_bold = vf;
+    static_bold.variable = false;
+    static_bold.weight_axis = null;
+    static_bold.weight = 700;
+    static_bold.bold = true;
+    try testing.expect(Windows.score(.{}, vf) > Windows.score(.{}, static_bold));
+    try testing.expect(Windows.score(bold, static_bold) > Windows.score(bold, vf));
+    // A regular-default VF must keep the regular bucket even though its
+    // axis can also serve bold. A static Medium exposes a lost bucket.
+    var medium = static_bold;
+    medium.weight = 500;
+    medium.bold = false;
+    try testing.expect(Windows.score(.{ .family = vf.family_name }, vf) >
+        Windows.score(.{ .family = vf.family_name }, medium));
+    // Non-bold queries retain their original ties and stable scan order.
+    var static_regular = vf;
+    static_regular.variable = false;
+    static_regular.weight_axis = null;
+    for ([_]Descriptor{ .{}, .{ .family = vf.family_name }, .{ .codepoint = 'A' }, .{ .italic = true } }) |desc| {
+        try testing.expectEqual(Windows.score(desc, vf), Windows.score(desc, static_regular));
+    }
+    // Static preference breaks an otherwise equal score; it must not
+    // override the pre-existing preference for a color-capable face.
+    var color_vf = vf;
+    color_vf.color = true;
+    try testing.expect(Windows.score(bold, color_vf) > Windows.score(bold, static_bold));
+
+    const other = [_]Variation{.{ .id = .init("wdth"), .value = 90 }};
+    const combined = try Windows.faceVariations(testing.allocator, vf, true, &other);
+    defer testing.allocator.free(combined);
+    try testing.expectEqual(@as(usize, 2), combined.len);
+    try testing.expectEqualDeep(other[0], combined[0]);
+    try testing.expectEqualDeep(Variation{ .id = .init("wght"), .value = 700 }, combined[1]);
+    try testing.expect(Windows.score(.{ .bold = true, .variations = &other }, vf) >
+        Windows.score(.{ .bold = true, .variations = &other }, static_bold));
+
+    vf.weight_axis.?.maximum = 599.5;
+    try testing.expect(!Windows.matchesDescriptor(vf, bold));
+    vf.weight_axis.?.maximum = 600;
+    try testing.expect(Windows.matchesDescriptor(vf, bold));
+    const limited = try Windows.faceVariations(testing.allocator, vf, true, &.{});
+    defer testing.allocator.free(limited);
+    // FreeType clamps the requested 700 to the face's supported range.
+    try testing.expectEqual(@as(f64, 700), limited[0].value);
+    try testing.expect(Windows.weightRank(bold, vf) < Windows.weight_rank_max);
+    vf.weight_axis = null;
+    try testing.expect(!Windows.matchesDescriptor(vf, bold));
+    vf.weight_axis = .{ .minimum = 100, .maximum = 700 };
+    vf.italic = true;
+    try testing.expect(Windows.matchesDescriptor(vf, .{ .italic = true }));
+    const italic_only = try Windows.faceVariations(testing.allocator, vf, false, &.{});
+    defer testing.allocator.free(italic_only);
+    try testing.expectEqual(@as(usize, 0), italic_only.len);
 }
 
 fn expectNoFace(disco: *Windows, codepoint: u32) !void {
@@ -2042,6 +2370,52 @@ test "windows refreshExisting never starts or waits for a scan" {
     disco.scan_mutex.lock();
     disco.refreshExisting();
     disco.scan_mutex.unlock();
+    try testing.expectEqual(@as(usize, 3), disco.records.len);
+    try testing.expectEqual(@as(u64, 0), disco.generation);
+}
+
+test "windows discovery scan stopped between files publishes nothing" {
+    // FLAKY-CLIFWD-CLOSE-01: a scan the owner stops ends before its next
+    // file, and what it read so far is dropped rather than published as
+    // if it were every installed font: the record set, state and
+    // generation it would have replaced stay as they were.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A published record set (the fixtures), and a rescan of their folder
+    // alone, which finds it changed since.
+    var disco = try fixtureDiscovery(tmp.dir, &fixtureFonts());
+    defer disco.deinit();
+    const published = disco.state.?;
+    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    if (disco.system_dir) |old| disco.alloc.free(old);
+    disco.system_dir = try disco.alloc.dupeZ(u8, dir);
+    if (disco.user_dir) |old| disco.alloc.free(old);
+    disco.user_dir = null;
+
+    const Stop = struct {
+        calls: usize = 0,
+        fn call(ctx: *anyopaque, d: *Windows, _: [:0]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            d.stopScan();
+        }
+    };
+    var stop: Stop = .{};
+    disco.test_scan_hook = .{ .ctx = &stop, .call = Stop.call };
+
+    // The rescan reads the first fixture, then stops.
+    disco.refresh();
+    try testing.expectEqual(@as(usize, 1), stop.calls);
+    try testing.expectEqual(@as(usize, 3), disco.records.len);
+    try testing.expect(disco.state.?.eql(published));
+    try testing.expectEqual(@as(u64, 0), disco.generation);
+
+    // A later scan stops before its first file.
+    disco.refresh();
+    try testing.expectEqual(@as(usize, 1), stop.calls);
     try testing.expectEqual(@as(usize, 3), disco.records.len);
     try testing.expectEqual(@as(u64, 0), disco.generation);
 }

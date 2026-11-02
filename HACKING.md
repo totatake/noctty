@@ -76,6 +76,11 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-zig-deps.ps1
 The repo also ships `scripts/dev-windows.ps1` and
 `scripts/dev-windows.cmd` to open a Windows-native shell with the
 expected Visual Studio and Zig cache environment already configured.
+They find Visual Studio 2026 or 2022 with the C++ tools through `vswhere`,
+or failing that at the default install paths (where a folder counts only
+if its MSVC toolset has libraries for the requested architecture), and fail
+with exit code 1 when they find none.
+`.github/workflows/dev-shell.yml` runs both on hosted images.
 
 ## Manual validation
 
@@ -122,11 +127,16 @@ manually verify:
 
 ## Project layout (quick map)
 
-- `src/apprt/win32.zig`: Win32 application runtime coordinator containing the
-  coupled App, Host, and Surface behavior.
+- `src/apprt/win32.zig`: Win32 application runtime coordinator: forwarding
+  aliases for App, Host, and Surface, the native window procedures, shared
+  helpers, and the tests that combine owners.
 - `src/apprt/win32_theme.zig`: theme tokens, DWM integration, accent
   helpers, HC handling (extracted from `win32.zig` in `a759eb6`).
-- `src/apprt/win32/`: focused runtime support modules for constants/externs,
+- `src/apprt/win32/`: focused runtime modules. `app.zig` (App), `host.zig`
+  (Host), and `terminal_window.zig` (Surface) hold the three owners; beside
+  them are session capture/restore, the quick terminal host, window state,
+  surface presentation, the docked search controls, overlay and palette
+  orchestration, the chrome scene, and support code for constants/externs,
   labels and input, startup/render tracing, native chrome rectangle math, and
   Host-independent GDI paint primitives.
 - `src/update/github_releases.zig`: release checks plus verified

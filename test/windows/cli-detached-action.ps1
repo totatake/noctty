@@ -6,6 +6,11 @@ param(
     [string] $ExePath
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-detached-action.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -153,3 +158,7 @@ finally {
 
 $argumentSummary = (@($Action) + $ExtraArgs) -join ' '
 Write-Host "detached CLI action validation: PASS (args=$argumentSummary, title=$expectedTitle)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

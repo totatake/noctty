@@ -502,7 +502,7 @@ pub fn decodeLaunchLayoutPayload(
     return .{ .deadline_ms = request_deadline_ms, .name = name };
 }
 
-fn validateLaunchLayoutName(name: []const u8) !void {
+pub fn validateLaunchLayoutName(name: []const u8) !void {
     if (name.len == 0 or name.len > @as(usize, max_layout_name_len)) {
         return error.InvalidAutomationAction;
     }

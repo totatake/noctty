@@ -40,6 +40,15 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
             .step_fn = .per_instance,
             .blending_enabled = true,
         } },
+        // The unfocused-split dim: the background color shader, fed the
+        // fill and its alpha (`splitDimUniforms`), blended over the
+        // finished frame in sRGB space.
+        .{ "split_dim", .{
+            .vertex_fn = loadShaderCode("../shaders/glsl/full_screen.v.glsl"),
+            .fragment_fn = loadShaderCode("../shaders/glsl/bg_color.f.glsl"),
+            .blending_enabled = true,
+            .framebuffer_srgb = false,
+        } },
     };
 
 /// All the comptime-known info about a pipeline, so that
@@ -50,6 +59,7 @@ const PipelineDescription = struct {
     fragment_fn: [:0]const u8,
     step_fn: Pipeline.Options.StepFunction = .per_vertex,
     blending_enabled: bool = true,
+    framebuffer_srgb: bool = true,
 
     fn initPipeline(self: PipelineDescription) !Pipeline {
         return try .init(self.vertex_attributes, .{
@@ -57,6 +67,7 @@ const PipelineDescription = struct {
             .fragment_fn = self.fragment_fn,
             .step_fn = self.step_fn,
             .blending_enabled = self.blending_enabled,
+            .framebuffer_srgb = self.framebuffer_srgb,
         });
     }
 };

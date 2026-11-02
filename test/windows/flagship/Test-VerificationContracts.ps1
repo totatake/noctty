@@ -3,6 +3,11 @@
 [CmdletBinding()]
 param()
 
+. (Join-Path $PSScriptRoot '..\..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'Test-VerificationContracts.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $root))
@@ -72,3 +77,7 @@ if ($script:ContractFailures.Count -gt 0) {
 
 Write-Host "flagship verification contracts: PASS ($($script:FlagshipScenarioIds.Count) scenarios)"
 exit 0
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

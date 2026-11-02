@@ -97,10 +97,9 @@ fn report(
     // The installer registers the same entries for all users, and "Already
     // absent" above is about this user's only.
     if (machine_verbs) {
-        try stdout.print(
+        try stdout.writeAll(
             "Note: the noctty installer also registered \"Open noctty here\" for all users (HKLM\\Software\\Classes). " ++
                 "This action removes only the current user's entries and cannot remove those; uninstalling noctty does.\n",
-            .{},
         );
     }
     return if (failed) 1 else 0;

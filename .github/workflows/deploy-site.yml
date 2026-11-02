@@ -1,5 +1,14 @@
 name: Deploy Site
 
+# The site names the latest release and links its downloads, so production
+# takes a release copy only once GitHub has published that release. Merging
+# the release-copy PR runs this workflow while the release is still unpublished;
+# the release-copy job then holds the deploy. The Release workflow publishes
+# with GITHUB_TOKEN, and an event made with GITHUB_TOKEN starts no workflow
+# run, so `release: published` fires only for a release a person publishes. The
+# Release run's completion (`workflow_run`) deploys the held copy. Both of
+# those events deploy the default branch, never the triggering run's commit or
+# artifacts.
 on:
   push:
     branches:
@@ -7,6 +16,11 @@ on:
   release:
     types:
       - published
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
   workflow_dispatch:
 
 permissions:
@@ -18,9 +32,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-copy:
+    name: Hold a release copy until its release is published
+    if: github.event_name != 'release' || github.event.release.prerelease == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      published: ${{ steps.published.outputs.published }}
+
+    steps:
+      - name: Checkout the deployment README
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ (github.event_name == 'release' || github.event_name == 'workflow_run') && github.event.repository.default_branch || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      # README.md carries the release copy's version: update-release-copy.ps1
+      # writes it and check-release-copy.ps1 checks the rest of the copy
+      # against it. Only a copy newer than GitHub's latest release is held
+      # (published=false). The deploy job skips on that answer alone, so any
+      # other mismatch, or no answer, reaches its release copy check, which
+      # fails the run.
+      - name: Compare the release copy with the latest published release
+        id: published
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $readme = Get-Content -LiteralPath README.md -Raw
+          $copy = [regex]::Match($readme, 'noctty\s+([0-9]+\.[0-9]+\.[0-9]+)\]\(https://github\.com/amanthanvi/noctty/releases/tag/v\1\)')
+          if (-not $copy.Success) {
+            throw 'README.md names no self-consistent latest stable release.'
+          }
+          $tag = gh release view --repo amanthanvi/noctty --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not read the latest GitHub release.'
+          }
+          $tag = ([string]($tag -join "`n")).Trim()
+          $latest = [regex]::Match($tag, '^v([0-9]+\.[0-9]+\.[0-9]+)$')
+          if (-not $latest.Success) {
+            throw "The latest GitHub release tag is not plain semver: $tag"
+          }
+          $copyVersion = [version]$copy.Groups[1].Value
+          $latestVersion = [version]$latest.Groups[1].Value
+          $published = $copyVersion -le $latestVersion
+          if (-not $published) {
+            $message = "README.md names v$copyVersion and the latest GitHub release is v$latestVersion, so production keeps the published copy. The Release run that publishes v$copyVersion deploys this one when it completes."
+            Write-Output "::notice title=Site deploy held::$message"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Site deploy held`n`n$message"
+          }
+          "published=$($published.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
   deploy:
     name: Canary, verify, and publish
-    if: github.event_name != 'release' || github.event.release.prerelease == false
+    needs: release-copy
+    if: needs.release-copy.outputs.published != 'false'
     runs-on: windows-latest
     timeout-minutes: 20
     environment: cloudflare-pages-production
@@ -32,7 +101,7 @@ jobs:
       - name: Checkout exact event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'release' && github.event.repository.default_branch || github.sha }}
+          ref: ${{ (github.event_name == 'release' || github.event_name == 'workflow_run') && github.event.repository.default_branch || github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -50,18 +119,30 @@ jobs:
           }
           "sha=$sha" >> $env:GITHUB_OUTPUT
 
-      - name: Validate committed site bundle and copy
+      # One check per step. A pwsh step ends with
+      # `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+      # which fails it on a script's `exit 1`. Never follow a passing PowerShell
+      # script with `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`: a script
+      # that runs no native command leaves $LASTEXITCODE $null, and `exit $null`
+      # ends the step successfully before the checks after it run.
+      - name: Site copy checks
+        shell: pwsh
+        run: ./scripts/check-site-copy.ps1
+
+      - name: Deterministic site asset check
+        shell: pwsh
+        run: node scripts/build-site-assets.mjs --check
+
+      - name: Site header contract
+        shell: pwsh
+        run: ./scripts/get-site-header-contract.ps1 | Out-Null
+
+      - name: Release copy matches the latest published release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          ./scripts/check-site-copy.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/build-site-assets.mjs --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./scripts/get-site-header-contract.ps1 | Out-Null
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($env:GITHUB_EVENT_NAME -eq 'release') {
             if ($env:RELEASE_TAG -cnotmatch '^v(?<version>\d+\.\d+\.\d+)$') {
               throw 'Published release tag must be plain v<major>.<minor>.<patch> semver.'
@@ -72,7 +153,6 @@ jobs:
           } else {
             ./scripts/check-release-copy.ps1 -CheckRemoteLatest
           }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build deterministic deploy payload twice
         id: payload

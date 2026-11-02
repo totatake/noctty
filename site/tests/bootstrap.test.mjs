@@ -22,7 +22,7 @@ function inlineBootstrap(page) {
   return scripts[0];
 }
 
-function runBootstrap(source, { stored = null, legacy = null } = {}) {
+function runBootstrap(source, { stored = null, legacy = null, prefersLight = null } = {}) {
   const store = new Map();
   if (stored !== null) store.set('nc-theme', stored);
   if (legacy !== null) store.set('wg-theme', legacy);
@@ -54,6 +54,13 @@ function runBootstrap(source, { stored = null, legacy = null } = {}) {
       removeItem: (k) => store.delete(k),
     },
   };
+  if (prefersLight !== null) {
+    context.window = {
+      matchMedia: (query) => ({
+        matches: query === '(prefers-color-scheme: light)' && prefersLight,
+      }),
+    };
+  }
   vm.createContext(context);
   vm.runInContext(source, context);
   return { classes, attributes, store };
@@ -80,9 +87,35 @@ for (const page of PAGES) {
   });
 }
 
-test('bootstrap defaults to the dark theme', () => {
+test('bootstrap falls back to dark when the system preference is unknown', () => {
   const { attributes } = runBootstrap(inlineBootstrap('index.html'));
   assert.equal(attributes.get('data-theme'), 'dark');
+});
+
+test('bootstrap follows the system theme until the visitor picks one', () => {
+  assert.equal(
+    runBootstrap(inlineBootstrap('index.html'), { prefersLight: true }).attributes.get('data-theme'),
+    'light',
+  );
+  assert.equal(
+    runBootstrap(inlineBootstrap('index.html'), { prefersLight: false }).attributes.get('data-theme'),
+    'dark',
+  );
+  assert.equal(
+    runBootstrap(inlineBootstrap('index.html'), { prefersLight: true, stored: 'dark' }).attributes.get(
+      'data-theme',
+    ),
+    'dark',
+    'an explicit choice outranks the system preference',
+  );
+});
+
+test('bootstrap ignores a stored value that is not a theme', () => {
+  const { attributes } = runBootstrap(inlineBootstrap('index.html'), {
+    stored: 'neon',
+    prefersLight: true,
+  });
+  assert.equal(attributes.get('data-theme'), 'light');
 });
 
 test('bootstrap honours an already-migrated preference', () => {

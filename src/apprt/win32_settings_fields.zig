@@ -1,16 +1,19 @@
-//! Technology-neutral Settings ownership and typed field behavior.
+//! Settings ownership, typed field behavior and native form descriptors.
 //! Native HWNDs, layout and UIA providers stay in win32_settings.zig. The
 //! persistence allowlist is checked independently there; this model neither
 //! expands ownership nor changes the config-file patch contract.
 const std = @import("std");
 const Config = @import("../config/Config.zig");
 const formatter = @import("../config/formatter.zig");
+const build_config = @import("../build_config.zig");
 
-pub const Section = enum { appearance, terminal, shell, privacy, updates };
+pub const Section = enum { appearance, terminal, shell, privacy, updates, keybindings, advanced };
 /// When a saved edit reaches its consumer, independently of draft preview.
 pub const ApplyPolicy = enum { live, new_terminals, restart };
 pub const PreviewEffect = enum { none, theme, opacity };
-pub const Kind = enum { integer, number, padding, boolean, choice, blur, notifications, font_families, theme, command };
+/// `profile` is a dropdown whose items are the profiles the app lists
+/// (`AppHandle.profileChoices`), not a fixed `Combo`.
+pub const Kind = enum { integer, number, padding, boolean, choice, blur, notifications, font_families, theme, command, profile };
 /// Platform availability drives native enablement and all reason labels.
 pub const Support = enum {
     available,
@@ -66,7 +69,6 @@ pub const SettingField = enum {
     padding_balance,
     auto_update,
     auto_update_channel,
-    accent_follow_system,
 
     pub fn label(self: SettingField) []const u8 {
         if (projection(self)) |part| return part.label;
@@ -102,11 +104,29 @@ pub const SettingValue = value: {
 };
 
 /// These are the current form and UIA names, which intentionally differ from
-/// palette/conflict labels. Later native generation must preserve these names.
+/// palette/conflict labels. Native generation preserves these names.
 pub const NativeNames = struct {
+    binding: []const u8,
+    id: usize,
+    order: usize,
     form_label: ?[]const u8 = null,
     caption: ?[]const u8 = null,
     accessible_name: []const u8,
+};
+
+/// Display-only rows grant no Config ownership and need no edit adapter.
+/// Action behavior remains explicit; a text row is entirely descriptor-driven.
+pub const DisplayRow = struct {
+    kind: enum { action, text },
+    section: Section,
+    native: NativeNames,
+    help: []const u8 = "",
+    /// More words Settings search finds the row by, besides its names.
+    keywords: []const u8 = "",
+};
+pub const display_rows = [_]DisplayRow{
+    .{ .kind = .action, .section = .keybindings, .native = .{ .binding = "btn_keybindings_editor", .id = 302, .order = 0, .form_label = "Keybind configuration", .caption = "Open config for keybinds", .accessible_name = "Keybind configuration" }, .keywords = "keybind keybinding key binding shortcut hotkey keyboard" },
+    .{ .kind = .action, .section = .advanced, .native = .{ .binding = "btn_open_editor", .id = 101, .order = 0, .form_label = "Full config editor", .caption = "Open in default editor", .accessible_name = "Full config editor" }, .keywords = "config configuration file text editor edit raw" },
 };
 /// A composite Config key can expose multiple typed scalar controls without
 /// claiming that key twice in the persistence allowlist.
@@ -128,6 +148,9 @@ pub const Descriptor = struct {
     projections: []const Projection = &.{},
     native: ?NativeNames = null,
     label: []const u8,
+    help: []const u8,
+    unit: []const u8 = "",
+    placeholder: []const u8 = "",
     section: Section,
     kind: Kind,
     apply: ApplyPolicy,
@@ -135,18 +158,43 @@ pub const Descriptor = struct {
     validation: Validation = .typed,
     keywords: []const u8,
     default_display: DefaultDisplay = .value,
+    /// What an unsaved draft of this field shows in the open windows while it
+    /// is edited; a field with `.none` is not previewed. Do not mistake this
+    /// for ApplyPolicy, which says what a saved value reaches.
     preview: PreviewEffect = .none,
-    /// Historical transaction preview into app.config, including fields with
-    /// no consumer on an open surface. Do not mistake this for ApplyPolicy.
-    preview_draft: bool = false,
 
     pub fn nativeNames(comptime self: Descriptor) ?NativeNames {
         const names = self.native orelse return null;
-        return .{
-            .form_label = if (names.form_label) |text| self.support.name(text) else null,
-            .caption = if (names.caption) |text| self.support.name(text) else null,
-            .accessible_name = self.support.name(names.accessible_name),
+        var result = names;
+        result.form_label = if (names.form_label) |text| self.support.name(text) else null;
+        result.caption = if (names.caption) |text| self.support.name(text) else null;
+        result.accessible_name = self.support.name(names.accessible_name);
+        return result;
+    }
+
+    pub fn rangeText(comptime self: Descriptor) []const u8 {
+        return switch (self.validation) {
+            .unsigned_integer => "0 or a positive integer",
+            .finite_range => |range| std.fmt.comptimePrint("{d} .. {d}", .{ range.min, range.max }),
+            .padding_max => |maximum| std.fmt.comptimePrint("0 .. {d} per side", .{maximum}),
+            else => "",
         };
+    }
+
+    pub fn applyNote(comptime self: Descriptor) []const u8 {
+        if (self.support == .unsupported_on_windows) return "Not supported on Windows.";
+        return switch (self.apply) {
+            .live => "Applies when you save.",
+            .new_terminals => "Applies to new terminals after saving.",
+            .restart => "Applies after restarting noctty.",
+        };
+    }
+
+    /// Static lifetime, safe for native annotations and cross-thread UIA reads.
+    pub fn helpText(comptime self: Descriptor) []const u8 {
+        return self.help ++ (if (self.unit.len != 0) " Unit: " ++ self.unit ++ "." else "") ++
+            (if (self.rangeText().len != 0) " Range: " ++ self.rangeText() ++ "." else "") ++
+            " " ++ self.applyNote();
     }
 
     pub fn Value(comptime self: Descriptor) type {
@@ -167,7 +215,8 @@ pub const Descriptor = struct {
         try formatter.formatEntry(self.Value(), @tagName(self.key), self.read(config), writer);
     }
     /// Defaults come from Config.default for this platform/build, never from
-    /// a second hard-coded set. No native widget or reset behavior is added.
+    /// a second hard-coded set. Settings' per-field reset names the default
+    /// it puts back with this (`FormField.writeDefault`).
     pub fn writeDefault(comptime self: Descriptor, writer: *std.Io.Writer, defaults: *const Config) !void {
         if (self.field) |field| return writeSettingValue(writer, settingValue(defaults, field));
         switch (self.default_display) {
@@ -186,34 +235,85 @@ pub const Descriptor = struct {
 // effect while enabling it but turning it off does not restore plain padding;
 // new_terminals is the guaranteed policy for every value, not an overpromise.
 pub const descriptors = [_]Descriptor{
-    .{ .key = .@"scrollback-limit", .native = .{ .form_label = "Scrollback limit (bytes; 0 = off; new terminals only)", .accessible_name = "Scrollback limit" }, .field = .scrollback_limit, .label = "Scrollback limit", .section = .terminal, .kind = .integer, .apply = .new_terminals, .validation = .unsigned_integer, .keywords = "settings preferences configuration scrollback-limit history lines buffer", .preview = .none, .preview_draft = false },
-    .{ .key = .@"font-size", .native = .{ .form_label = "Font size (pt)", .accessible_name = "Font size" }, .field = .font_size, .label = "Font size", .section = .appearance, .kind = .number, .apply = .live, .validation = .{ .finite_range = .{ .min = 6, .max = 72 } }, .keywords = "settings preferences configuration font-size text zoom", .preview = .none, .preview_draft = true },
-    .{ .key = .@"background-opacity", .native = .{ .form_label = "Background opacity (0.0 .. 1.0)", .accessible_name = "Background opacity" }, .field = .background_opacity, .label = "Background opacity", .section = .appearance, .kind = .number, .apply = .live, .validation = .{ .finite_range = .{ .min = 0, .max = 1 } }, .keywords = "settings preferences configuration background-opacity transparency transparent", .preview = .opacity, .preview_draft = true },
-    .{ .key = .@"window-padding-x", .native = .{ .form_label = "Window padding X (left/right or single value)", .accessible_name = "Window padding X" }, .field = .window_padding_x, .label = "Window padding X", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-x margin", .preview = .none, .preview_draft = true },
-    .{ .key = .@"window-padding-y", .native = .{ .form_label = "Window padding Y (top/bottom or single value)", .accessible_name = "Window padding Y" }, .field = .window_padding_y, .label = "Window padding Y", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-y margin", .preview = .none, .preview_draft = true },
-    .{ .key = .@"clipboard-trim-trailing-spaces", .native = .{ .caption = "Trim trailing spaces on copy", .accessible_name = "Clipboard trimming" }, .field = .trim_trailing_spaces, .label = "Trim trailing spaces on copy", .section = .terminal, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-trim-trailing-spaces whitespace copy", .preview = .none, .preview_draft = false },
-    .{ .key = .@"desktop-notifications", .native = .{ .form_label = "Notifications", .caption = "Allow terminal desktop notifications", .accessible_name = "Terminal notifications" }, .field = .desktop_notifications, .label = "Terminal desktop notifications", .section = .privacy, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration desktop-notifications alerts", .preview = .none, .preview_draft = false },
+    .{ .key = .@"scrollback-limit", .native = .{ .binding = "edit_scrollback", .id = 401, .order = 0, .form_label = "Scrollback limit (bytes; 0 = off; new terminals only)", .accessible_name = "Scrollback limit" }, .field = .scrollback_limit, .label = "Scrollback limit", .help = "Bytes retained for each terminal. Zero disables scrollback.", .unit = "bytes", .section = .terminal, .kind = .integer, .apply = .new_terminals, .validation = .unsigned_integer, .keywords = "settings preferences configuration scrollback-limit history lines buffer" },
+    .{ .key = .@"font-size", .native = .{ .binding = "edit_font_size", .id = 402, .order = 1, .form_label = "Font size (pt)", .accessible_name = "Font size" }, .field = .font_size, .label = "Font size", .help = "Text size in points. Saved changes respect a terminal that was zoomed manually.", .unit = "pt", .section = .appearance, .kind = .number, .apply = .live, .validation = .{ .finite_range = .{ .min = 6, .max = 72 } }, .keywords = "settings preferences configuration font-size text zoom" },
+    .{ .key = .@"background-opacity", .native = .{ .binding = "edit_bg_opacity", .id = 408, .order = 3, .form_label = "Background opacity (0.0 .. 1.0)", .accessible_name = "Background opacity" }, .field = .background_opacity, .label = "Background opacity", .help = "Window opacity. Draft previews have a visibility floor; Save keeps the exact value.", .section = .appearance, .kind = .number, .apply = .live, .validation = .{ .finite_range = .{ .min = 0, .max = 1 } }, .keywords = "settings preferences configuration background-opacity transparency transparent", .preview = .opacity },
+    .{ .key = .@"window-padding-x", .native = .{ .binding = "edit_pad_x", .id = 415, .order = 6, .form_label = "Window padding X (left/right or single value)", .accessible_name = "Window padding X" }, .field = .window_padding_x, .label = "Window padding X", .help = "Left and right terminal padding. Enter one value or a comma-separated pair.", .unit = "pt", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-x margin" },
+    .{ .key = .@"window-padding-y", .native = .{ .binding = "edit_pad_y", .id = 416, .order = 7, .form_label = "Window padding Y (top/bottom or single value)", .accessible_name = "Window padding Y" }, .field = .window_padding_y, .label = "Window padding Y", .help = "Top and bottom terminal padding. Enter one value or a comma-separated pair.", .unit = "pt", .section = .appearance, .kind = .padding, .apply = .new_terminals, .validation = .{ .padding_max = 200 }, .keywords = "settings preferences configuration window-padding-y margin" },
+    .{ .key = .@"clipboard-trim-trailing-spaces", .native = .{ .binding = "chk_trim_trail", .id = 407, .order = 3, .caption = "Trim trailing spaces on copy", .accessible_name = "Clipboard trimming" }, .field = .trim_trailing_spaces, .label = "Trim trailing spaces on copy", .help = "Remove trailing whitespace when copying terminal text.", .section = .terminal, .kind = .boolean, .apply = .live, .keywords = "settings preferences configuration clipboard-trim-trailing-spaces whitespace copy" },
+    .{ .key = .@"desktop-notifications", .native = .{ .binding = "chk_desktop_notifications", .id = 417, .order = 4, .form_label = "Notifications", .caption = "Allow terminal desktop notifications", .accessible_name = "Terminal notifications" }, .field = .desktop_notifications, .label = "Terminal desktop notifications", .help = "Allow terminal programs to request desktop notifications.", .section = .privacy, .kind = .boolean, .apply = .live, .keywords = "settings preferences configuration desktop-notifications alerts" },
     .{ .key = .@"app-notifications", .projections = &.{
-        .{ .field = .app_notify_clipboard, .member = "clipboard-copy", .label = "Clipboard copy notification", .keywords = "settings preferences configuration app-notifications clipboard-copy toast", .default_label = "Clipboard copy", .native = .{ .caption = "Notify when clipboard copy completes", .accessible_name = "Clipboard-copy notification" } },
-        .{ .field = .app_notify_config, .member = "config-reload", .label = "Config reload notification", .keywords = "settings preferences configuration app-notifications config-reload toast", .default_label = "Config reload", .native = .{ .caption = "Notify after config reload", .accessible_name = "Config-reload notification" } },
-    }, .label = "App notifications", .section = .privacy, .kind = .notifications, .apply = .live, .keywords = "settings preferences configuration app-notifications clipboard-copy config-reload toast" },
-    .{ .key = .@"confirm-close-surface", .native = .{ .form_label = "Close confirmation", .accessible_name = "Close confirmation" }, .field = .confirm_close, .label = "Close confirmation", .section = .terminal, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration confirm-close-surface quit exit running", .preview = .none, .preview_draft = false },
-    .{ .key = .@"copy-on-select", .native = .{ .form_label = "Copy on select", .accessible_name = "Copy on select" }, .field = .copy_on_select, .label = "Copy on select", .section = .terminal, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration copy-on-select selection clipboard", .preview = .none, .preview_draft = false },
-    .{ .key = .@"clipboard-read", .native = .{ .form_label = "OSC 52 clipboard read requests", .accessible_name = "OSC 52 clipboard read requests" }, .field = .clipboard_read, .label = "Clipboard read requests (OSC 52)", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-read osc 52 paste", .preview = .none, .preview_draft = false },
-    .{ .key = .@"clipboard-write", .native = .{ .form_label = "OSC 52 clipboard write requests", .accessible_name = "OSC 52 clipboard write requests" }, .field = .clipboard_write, .label = "Clipboard write requests (OSC 52)", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration clipboard-write osc 52 copy", .preview = .none, .preview_draft = false },
-    .{ .key = .@"link-url", .native = .{ .form_label = "Clickable URL opening", .accessible_name = "Clickable URL opening" }, .field = .link_url, .label = "Clickable URL opening", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration link-url url hyperlink", .preview = .none, .preview_draft = false },
-    .{ .key = .@"link-previews", .native = .{ .form_label = "Link preview popups", .accessible_name = "Link preview popups" }, .support = .unsupported_on_windows, .field = .link_previews, .label = "Link preview popups", .section = .privacy, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration link-previews url hyperlink tooltip", .preview = .none, .preview_draft = false },
-    .{ .key = .@"window-theme", .native = .{ .form_label = "Window theme", .accessible_name = "Window theme" }, .field = .window_theme, .label = "Window theme", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration window-theme dark light mode", .preview = .theme, .preview_draft = true },
-    .{ .key = .@"shell-integration", .native = .{ .form_label = "Shell integration", .accessible_name = "Shell integration" }, .field = .shell_integration, .label = "Shell integration", .section = .shell, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration shell-integration powershell bash prompt", .preview = .none, .preview_draft = false },
-    .{ .key = .@"cursor-style", .native = .{ .form_label = "Cursor style", .accessible_name = "Cursor style" }, .field = .cursor_style, .label = "Cursor style", .section = .appearance, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration cursor-style caret block bar underline", .preview = .none, .preview_draft = true },
-    .{ .key = .@"background-blur", .native = .{ .caption = "Background blur", .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .section = .appearance, .kind = .blur, .apply = .live, .support = .unsupported_on_windows, .validation = .typed, .keywords = "settings preferences configuration background-blur", .preview = .none, .preview_draft = true },
-    .{ .key = .@"window-padding-balance", .native = .{ .form_label = "Window padding balance", .accessible_name = "Window padding balance" }, .field = .padding_balance, .label = "Window padding balance", .section = .appearance, .kind = .choice, .apply = .new_terminals, .validation = .typed, .keywords = "settings preferences configuration window-padding-balance margin", .preview = .none, .preview_draft = true },
-    .{ .key = .@"auto-update", .native = .{ .form_label = "Auto-update mode", .accessible_name = "Auto-update mode" }, .field = .auto_update, .label = "Auto-update mode", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update upgrade", .preview = .none, .preview_draft = false },
-    .{ .key = .@"auto-update-channel", .native = .{ .form_label = "Auto-update channel", .accessible_name = "Auto-update channel" }, .field = .auto_update_channel, .label = "Auto-update channel", .section = .updates, .kind = .choice, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration auto-update-channel stable tip release", .preview = .none, .preview_draft = false },
-    .{ .key = .@"accent-follow-system", .native = .{ .caption = "Follow Windows accent color", .accessible_name = "Follow Windows accent color" }, .field = .accent_follow_system, .label = "Follow Windows accent color", .section = .appearance, .kind = .boolean, .apply = .live, .validation = .typed, .keywords = "settings preferences configuration accent-follow-system accent color highlight tab windows personalization", .preview = .theme, .preview_draft = true },
-    .{ .key = .@"font-family", .native = .{ .form_label = "Font family fallbacks (comma-separated)", .accessible_name = "Font family fallbacks" }, .label = "Font family", .section = .appearance, .kind = .font_families, .apply = .live, .validation = .font_families, .keywords = "settings preferences configuration font-family", .default_display = .inherited },
-    .{ .key = .theme, .native = .{ .form_label = "Terminal theme name, absolute path, or light/dark pair", .accessible_name = "Terminal theme" }, .label = "Terminal theme", .section = .appearance, .kind = .theme, .apply = .live, .validation = .theme, .keywords = "settings preferences configuration theme", .default_display = .inherited },
-    .{ .key = .command, .native = .{ .form_label = "Default command (blank = auto-detect)", .accessible_name = "Default command" }, .label = "Default command", .section = .shell, .kind = .command, .apply = .new_terminals, .validation = .command, .keywords = "settings preferences configuration command", .default_display = .automatic },
+        .{ .field = .app_notify_clipboard, .member = "clipboard-copy", .label = "Clipboard copy notification", .keywords = "settings preferences configuration app-notifications clipboard-copy toast", .default_label = "Clipboard copy", .native = .{ .binding = "chk_app_notify_clipboard", .id = 418, .order = 5, .caption = "Notify when clipboard copy completes", .accessible_name = "Clipboard-copy notification" } },
+        .{ .field = .app_notify_config, .member = "config-reload", .label = "Config reload notification", .keywords = "settings preferences configuration app-notifications config-reload toast", .default_label = "Config reload", .native = .{ .binding = "chk_app_notify_config", .id = 419, .order = 6, .caption = "Notify after config reload", .accessible_name = "Config-reload notification" } },
+    }, .label = "App notifications", .help = "Choose which noctty actions show a desktop notification.", .section = .privacy, .kind = .notifications, .apply = .live, .keywords = "settings preferences configuration app-notifications clipboard-copy config-reload toast" },
+    .{ .key = .@"confirm-close-surface", .native = .{ .binding = "combo_confirm_close", .id = 403, .order = 1, .form_label = "Close confirmation", .accessible_name = "Close confirmation" }, .field = .confirm_close, .label = "Close confirmation", .help = "Choose when closing a terminal asks for confirmation. Prompt detection requires shell integration.", .section = .terminal, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration confirm-close-surface quit exit running" },
+    .{ .key = .@"copy-on-select", .native = .{ .binding = "combo_copy_on_select", .id = 404, .order = 2, .form_label = "Copy on select", .accessible_name = "Copy on select" }, .field = .copy_on_select, .label = "Copy on select", .help = "Choose whether selecting terminal text copies it to the clipboard.", .section = .terminal, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration copy-on-select selection clipboard" },
+    .{ .key = .@"clipboard-read", .native = .{ .binding = "combo_clipboard_read", .id = 422, .order = 0, .form_label = "OSC 52 clipboard read requests", .accessible_name = "OSC 52 clipboard read requests" }, .field = .clipboard_read, .label = "Clipboard read requests (OSC 52)", .help = "Control clipboard read requests from terminal programs using OSC 52.", .section = .privacy, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration clipboard-read osc 52 paste" },
+    .{ .key = .@"clipboard-write", .native = .{ .binding = "combo_clipboard_write", .id = 423, .order = 1, .form_label = "OSC 52 clipboard write requests", .accessible_name = "OSC 52 clipboard write requests" }, .field = .clipboard_write, .label = "Clipboard write requests (OSC 52)", .help = "Control clipboard write requests from terminal programs using OSC 52.", .section = .privacy, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration clipboard-write osc 52 copy" },
+    .{ .key = .@"link-url", .native = .{ .binding = "combo_link_url", .id = 424, .order = 2, .form_label = "Clickable URL opening", .accessible_name = "Clickable URL opening" }, .field = .link_url, .label = "Clickable URL opening", .help = "Enable opening URLs detected in terminal output.", .section = .privacy, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration link-url url hyperlink" },
+    .{ .key = .@"link-previews", .native = .{ .binding = "combo_link_previews", .id = 425, .order = 3, .form_label = "Link preview popups", .accessible_name = "Link preview popups" }, .support = .unsupported_on_windows, .field = .link_previews, .label = "Link preview popups", .help = "Choose which links request preview popups.", .section = .privacy, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration link-previews url hyperlink tooltip" },
+    .{ .key = .@"window-theme", .native = .{ .binding = "combo_window_theme", .id = 405, .order = 4, .form_label = "Window theme", .accessible_name = "Window theme" }, .field = .window_theme, .label = "Window theme", .help = "Choose the appearance of window chrome independently of the terminal theme.", .section = .appearance, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration window-theme dark light mode", .preview = .theme },
+    .{ .key = .@"shell-integration", .native = .{ .binding = "combo_shell_integ", .id = 406, .order = 2, .form_label = "Shell integration", .accessible_name = "Shell integration" }, .field = .shell_integration, .label = "Shell integration", .help = "Enable prompt and command tracking for the selected shell. Automatic includes PowerShell and cmd.", .section = .shell, .kind = .choice, .apply = .new_terminals, .keywords = "settings preferences configuration shell-integration powershell bash prompt" },
+    .{ .key = .@"cursor-style", .native = .{ .binding = "combo_cursor_style", .id = 409, .order = 5, .form_label = "Cursor style", .accessible_name = "Cursor style" }, .field = .cursor_style, .label = "Cursor style", .help = "Default cursor shape. A terminal program can choose its own cursor shape.", .section = .appearance, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration cursor-style caret block bar underline" },
+    .{ .key = .@"background-blur", .native = .{ .binding = "chk_bg_blur", .id = 410, .order = 9, .caption = "Background blur", .accessible_name = "Background blur" }, .field = .background_blur, .label = "Background blur", .help = "Request background blur behind the terminal.", .section = .appearance, .kind = .blur, .apply = .live, .support = .unsupported_on_windows, .keywords = "settings preferences configuration background-blur" },
+    .{ .key = .@"window-padding-balance", .native = .{ .binding = "combo_pad_balance", .id = 411, .order = 8, .form_label = "Window padding balance", .accessible_name = "Window padding balance" }, .field = .padding_balance, .label = "Window padding balance", .help = "Distribute remaining cell space across the terminal padding.", .section = .appearance, .kind = .choice, .apply = .new_terminals, .keywords = "settings preferences configuration window-padding-balance margin" },
+    .{ .key = .@"auto-update", .native = .{ .binding = "combo_auto_update", .id = 420, .order = 0, .form_label = "Auto-update mode", .accessible_name = "Auto-update mode" }, .field = .auto_update, .label = "Auto-update mode", .help = "Choose whether noctty checks for updates and prompts to install them.", .section = .updates, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration auto-update upgrade" },
+    .{ .key = .@"auto-update-channel", .native = .{ .binding = "combo_auto_update_channel", .id = 421, .order = 1, .form_label = "Auto-update channel", .accessible_name = "Auto-update channel" }, .field = .auto_update_channel, .label = "Auto-update channel", .help = "Choose stable releases or tip builds for update checks.", .section = .updates, .kind = .choice, .apply = .live, .keywords = "settings preferences configuration auto-update-channel stable tip release" },
+    .{ .key = .@"font-family", .native = .{ .binding = "edit_font_family", .id = 412, .order = 0, .form_label = "Font family fallbacks (comma-separated)", .accessible_name = "Font family fallbacks" }, .label = "Font family", .help = "Comma-separated font fallback families. Leave blank to use the default font.", .placeholder = "Default font", .section = .appearance, .kind = .font_families, .apply = .live, .validation = .font_families, .keywords = "settings preferences configuration font-family", .default_display = .inherited },
+    .{ .key = .theme, .native = .{ .binding = "edit_theme", .id = 413, .order = 2, .form_label = "Terminal theme name, absolute path, or light/dark pair", .accessible_name = "Terminal theme" }, .label = "Terminal theme", .help = "Built-in theme name, absolute path, or a light/dark theme pair. Leave blank for the default.", .placeholder = "Default theme", .section = .appearance, .kind = .theme, .apply = .live, .validation = .theme, .keywords = "settings preferences configuration theme", .default_display = .inherited },
+    .{ .key = .command, .native = .{ .binding = "edit_command", .id = 414, .order = 0, .form_label = "Default command (blank = Default profile or auto-detect)", .accessible_name = "Default command" }, .label = "Default command", .help = "Command for new terminals. It wins over Default profile; leave it blank to start that profile, or to detect a shell when Default profile is Automatic.", .placeholder = "Default profile or automatic shell", .section = .shell, .kind = .command, .apply = .new_terminals, .validation = .command, .keywords = "settings preferences configuration command", .default_display = .automatic },
+    .{ .key = .@"default-profile", .native = .{ .binding = "combo_default_profile", .id = 427, .order = 1, .form_label = "Default profile (Default command wins when set)", .accessible_name = "Default profile" }, .label = "Default profile", .help = "The profile new terminals start when Default command is blank: a detected shell, a Visual Studio shell or a profile from the config file. A Default command wins over it. Automatic removes the setting.", .section = .shell, .kind = .profile, .apply = .new_terminals, .keywords = "settings preferences configuration default-profile profile shell", .default_display = .automatic },
+};
+
+pub const FormField = struct {
+    descriptor: Descriptor,
+    field: ?SettingField,
+    native: NativeNames,
+
+    pub fn kind(self: FormField) Kind {
+        return if (self.descriptor.kind == .notifications) .boolean else self.descriptor.kind;
+    }
+
+    /// Whether Settings offers to put this row back to its default. A field
+    /// Windows does not support is disabled and keeps what the file says.
+    pub fn resettable(self: FormField) bool {
+        return self.descriptor.support == .available;
+    }
+
+    /// This row's default, as `Descriptor.writeDefault` writes it: one
+    /// checkbox of a projected key writes only its own member.
+    pub fn writeDefault(comptime self: FormField, writer: *std.Io.Writer, defaults: *const Config) !void {
+        if (comptime self.descriptor.projections.len != 0) return writeSettingValue(writer, settingValue(defaults, self.field.?));
+        return self.descriptor.writeDefault(writer, defaults);
+    }
+};
+
+pub const form_fields = rows: {
+    var count: usize = 0;
+    for (descriptors) |spec| count += if (spec.native != null) 1 else spec.projections.len;
+    var result: [count]FormField = undefined;
+    var index: usize = 0;
+    for (descriptors) |spec| {
+        if (spec.nativeNames()) |native| {
+            result[index] = .{ .descriptor = spec, .field = spec.field, .native = native };
+            index += 1;
+        }
+        for (spec.projections) |part| {
+            result[index] = .{ .descriptor = spec, .field = part.field, .native = part.native };
+            index += 1;
+        }
+    }
+    for (result, 0..) |row, i| {
+        if (row.native.binding.len == 0 or row.native.id == 0 or row.native.accessible_name.len == 0 or
+            row.descriptor.help.len == 0) @compileError("Incomplete Settings form descriptor");
+        for (result[0..i]) |other| {
+            if (row.native.id == other.native.id or std.mem.eql(u8, row.native.binding, other.native.binding))
+                @compileError("Duplicate Settings form identity");
+            if (row.descriptor.section == other.descriptor.section and row.native.order == other.native.order)
+                @compileError("Duplicate Settings row position");
+        }
+    }
+    break :rows result;
 };
 
 pub fn forKey(key: Config.Key) ?Descriptor {
@@ -265,6 +365,7 @@ pub fn assertCoverage(comptime owned_keys: anytype) void {
             .font_families => T == Config.RepeatableString,
             .theme => T == ?Config.Theme,
             .command => T == ?Config.Command,
+            .profile => T == ?[:0]const u8,
         };
         if (!type_matches) @compileError("Settings editor kind differs from Config type: " ++ @tagName(spec.key));
         if (spec.label.len == 0 or spec.keywords.len == 0) @compileError("Settings metadata must be named");
@@ -303,6 +404,19 @@ pub fn settingValue(config: *const Config, field: SettingField) SettingValue {
     }
     unreachable;
 }
+/// `value` as the running app takes it, for asking whether two values mean
+/// the same: is a field at its default, did a reload override a saved one.
+/// `Config.finalize` gives an unset Auto-update channel this build's channel,
+/// and turns a Window theme of `auto` into `system` for a light/dark theme
+/// pair; `auto` and `system` both follow Windows (`resolveTheme`).
+pub fn effectiveSettingValue(value: SettingValue) SettingValue {
+    return switch (value) {
+        .auto_update_channel => |channel| .{ .auto_update_channel = channel orelse build_config.release_channel },
+        .window_theme => |theme| .{ .window_theme = if (theme == .auto) .system else theme },
+        else => value,
+    };
+}
+
 pub fn setSettingValue(config: *Config, value: SettingValue) void {
     switch (value) {
         inline else => |payload, field| {
@@ -358,7 +472,7 @@ pub fn Combo(comptime field: SettingField) type {
         // detect includes PowerShell and cmd on Windows.
         .shell_integration => &.{
             .{ .value = .none, .label = "Off" },
-            .{ .value = .detect, .label = "Automatic (includes PowerShell and cmd)" },
+            .{ .value = .detect, .label = "Automatic (with PowerShell and cmd)" },
             .{ .value = .bash, .label = "Bash" },
             .{ .value = .elvish, .label = "Elvish" },
             .{ .value = .fish, .label = "Fish" },
@@ -496,6 +610,7 @@ pub fn writeOwnedSettingValue(comptime key: Config.Key, writer: *std.Io.Writer, 
         .command => if (config.command) |command| {
             try writeCommandForEdit(writer, command);
         } else try writer.writeAll("(automatic)"),
+        .@"default-profile" => try writer.writeAll(config.@"default-profile" orelse "(automatic)"),
         else => @compileError("Not an owned Settings edit"),
     }
 }
@@ -553,11 +668,11 @@ pub const round_trip_config =
     \\window-padding-balance = equal
     \\auto-update = off
     \\auto-update-channel = tip
-    \\accent-follow-system = false
     \\font-family = Font #; 🚀
     \\font-family = Second Font
     \\theme = light:Light,dark:Dark
     \\command = direct:pwsh.exe -NoLogo -Command "echo #; literal"
+    \\default-profile = user:py312
 ;
 /// Behavioral round trips use Config's real grammar and formatter, including
 /// composite/owned keys, rather than checking source text or pointer equality.
@@ -638,16 +753,55 @@ test "settings model validates scalar ranges with the form's exact types" {
 
 test "settings model separates saved apply timing from edit previews and Windows support" {
     for (descriptors) |spec| {
-        const new_terminal = spec.key == .@"scrollback-limit" or spec.key == .command or spec.key == .@"shell-integration" or spec.key == .@"window-padding-x" or spec.key == .@"window-padding-y" or spec.key == .@"window-padding-balance";
+        const new_terminal = spec.key == .@"scrollback-limit" or spec.key == .command or spec.key == .@"shell-integration" or spec.key == .@"window-padding-x" or spec.key == .@"window-padding-y" or spec.key == .@"window-padding-balance" or spec.key == .@"default-profile";
         try std.testing.expectEqual(if (new_terminal) ApplyPolicy.new_terminals else ApplyPolicy.live, spec.apply);
         const unavailable = spec.key == .@"background-blur" or spec.key == .@"link-previews";
         try std.testing.expectEqual(if (unavailable) Support.unsupported_on_windows else Support.available, spec.support);
     }
-    try std.testing.expect(descriptor(.font_size).preview_draft);
     try std.testing.expectEqual(PreviewEffect.none, descriptor(.font_size).preview);
     try std.testing.expectEqual(PreviewEffect.opacity, descriptor(.background_opacity).preview);
     try std.testing.expectEqual(PreviewEffect.theme, descriptor(.window_theme).preview);
-    try std.testing.expectEqual(PreviewEffect.theme, descriptor(.accent_follow_system).preview);
+}
+
+test "settings model has a Default profile selector beside Default command" {
+    const spec = forKey(.@"default-profile") orelse return error.TestUnexpectedResult;
+    // A dropdown of the app's profiles, saved as an owned string.
+    try std.testing.expectEqualStrings("profile", @tagName(spec.kind));
+    try std.testing.expect(spec.field == null);
+    try std.testing.expectEqual(Section.shell, spec.section);
+    try std.testing.expectEqual(ApplyPolicy.new_terminals, spec.apply);
+    try std.testing.expectEqual(DefaultDisplay.automatic, spec.default_display);
+    const names = spec.native.?;
+    try std.testing.expectEqualStrings("Default profile", names.accessible_name);
+    // The form says which of the two wins.
+    try std.testing.expect(std.mem.indexOf(u8, names.form_label.?, "Default command wins") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spec.help, "A Default command wins over it.") != null);
+    try std.testing.expectEqual(forKey(.command).?.native.?.order + 1, names.order);
+}
+
+test "settings model names each form row's default from Config.default" {
+    var defaults = try Config.default(std.testing.allocator);
+    defer defaults.deinit();
+    inline for (form_fields) |row| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try row.writeDefault(&out.writer, &defaults);
+        try std.testing.expect(out.written().len != 0);
+        // A row of a projected key names its own member only.
+        if (comptime row.descriptor.projections.len != 0) try std.testing.expectEqualStrings("On", out.written());
+    }
+    // Every row offers a reset but the two Windows does not support.
+    var kept: usize = 0;
+    inline for (form_fields) |row| if (comptime !row.resettable()) {
+        kept += 1;
+        try std.testing.expect(row.descriptor.key == .@"background-blur" or row.descriptor.key == .@"link-previews");
+    };
+    try std.testing.expectEqual(@as(usize, 2), kept);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    inline for (form_fields) |row| if (comptime row.field == .font_size) try row.writeDefault(&out.writer, &defaults);
+    var expected: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d} pt", .{defaults.@"font-size"}), out.written());
 }
 
 test "settings model notification projections preserve their sibling" {

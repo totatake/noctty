@@ -61,6 +61,14 @@ pub const SW_FORCEMINIMIZE = 11;
 pub const SW_RESTORE = 9;
 pub const SW_MAXIMIZE = 3;
 pub const SW_HIDE = 0;
+/// `AssocQueryStringW` flags and the string a link prompt asks for
+/// (`shlwapi.h`).
+pub const ASSOCF_NOTRUNCATE: u32 = 0x00000020;
+pub const ASSOCF_INIT_IGNOREUNKNOWN: u32 = 0x00000400;
+pub const ASSOCSTR_FRIENDLYAPPNAME: u32 = 4;
+/// `HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION)`: no app is set for the
+/// scheme or type `AssocQueryStringW` was asked about.
+pub const HRESULT_NO_ASSOCIATION: i32 = @bitCast(@as(u32, 0x80070483));
 /// `WINDOWPLACEMENT.flags`: a minimized window restores to maximized.
 pub const WPF_RESTORETOMAXIMIZED = 0x0002;
 const WM_APP = 0x8000;
@@ -70,6 +78,7 @@ pub const WM_COMMAND = 0x0111;
 pub const WM_CAPTURECHANGED = 0x0215;
 pub const WM_CLOSE = 0x0010;
 pub const WM_DESTROY = 0x0002;
+pub const WM_NCDESTROY = 0x0082;
 pub const WM_DRAWITEM = 0x002B;
 pub const WM_ERASEBKGND = 0x0014;
 pub const WM_GETMINMAXINFO = 0x0024;
@@ -81,7 +90,16 @@ pub const WM_IME_STARTCOMPOSITION = 0x010D;
 pub const WM_IME_ENDCOMPOSITION = 0x010E;
 pub const WM_IME_COMPOSITION = 0x010F;
 pub const GCS_COMPSTR: u32 = 0x0008;
+pub const GCS_COMPATTR: u32 = 0x0010;
+pub const GCS_CURSORPOS: u32 = 0x0080;
 pub const GCS_RESULTSTR: u32 = 0x0800;
+// GCS_COMPATTR values, one per UTF-16 unit of the composition string.
+pub const ATTR_INPUT: u8 = 0x00;
+pub const ATTR_TARGET_CONVERTED: u8 = 0x01;
+pub const ATTR_CONVERTED: u8 = 0x02;
+pub const ATTR_TARGET_NOTCONVERTED: u8 = 0x03;
+pub const ATTR_INPUT_ERROR: u8 = 0x04;
+pub const ATTR_FIXEDCONVERTED: u8 = 0x05;
 pub const CFS_POINT: u32 = 0x0002;
 pub const CFS_EXCLUDE: u32 = 0x0080;
 pub const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 0x80000000;
@@ -144,10 +162,12 @@ pub const WM_SETCURSOR = 0x0020;
 pub const WM_SETFOCUS = 0x0007;
 pub const WM_SETTINGCHANGE = 0x001A;
 pub const ENDSESSION_CLOSEAPP: usize = 0x00000001;
+pub const WM_QUERYENDSESSION = 0x0011;
 pub const WM_ENDSESSION = 0x0016;
 pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_SIZE = 0x0005;
 pub const WM_SHOWWINDOW = 0x0018;
+pub const WM_WINDOWPOSCHANGING = 0x0046;
 pub const WM_WINDOWPOSCHANGED = 0x0047;
 pub const WM_ENTERSIZEMOVE = 0x0231;
 pub const WM_EXITSIZEMOVE = 0x0232;
@@ -182,9 +202,16 @@ pub const WM_WINHOSTTY_CONSOLE_VISIBILITY = WM_APP + 13;
 pub const WM_WINHOSTTY_PROFILES = WM_APP + 14;
 /// A jump-list commit that ran off the UI thread finished (`App.startJumpListRebuild`).
 pub const WM_WINHOSTTY_JUMP_LIST = WM_APP + 15;
+/// Remove queued panes' toasts from Action Center (`App.flushToastRemovals`).
+pub const WM_WINHOSTTY_TOAST_REMOVALS = WM_APP + 16;
 
 pub const PM_NOREMOVE: UINT = 0x0000;
 pub const PM_REMOVE: UINT = 0x0001;
+/// `MsgWaitForMultipleObjectsEx`: wake for any queued input, and for input
+/// already in the queue when the wait starts.
+pub const QS_ALLINPUT: DWORD = 0x04FF;
+pub const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
+pub const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 pub const WS_OVERLAPPED = 0x00000000;
 pub const WS_CHILD = 0x40000000;
 pub const WS_CLIPCHILDREN = 0x02000000;
@@ -218,6 +245,7 @@ pub const SWP_NOMOVE = 0x0002;
 pub const SWP_NOZORDER = 0x0004;
 pub const SWP_NOACTIVATE = 0x0010;
 pub const SWP_FRAMECHANGED = 0x0020;
+pub const SWP_SHOWWINDOW: UINT = 0x0040;
 pub const RDW_INVALIDATE: UINT = 0x0001;
 pub const RDW_INTERNALPAINT: UINT = 0x0002;
 pub const RDW_ERASE: UINT = 0x0004;
@@ -230,6 +258,7 @@ pub const MONITOR_DEFAULTTOPRIMARY = 0x00000001;
 pub const MONITORINFOF_PRIMARY = 0x00000001;
 pub const COLOR_WINDOW = 5;
 pub const CF_UNICODETEXT = 13;
+pub const CF_HDROP = 15;
 
 pub const GMEM_MOVEABLE = 0x0002;
 pub const GMEM_ZEROINIT = 0x0040;
@@ -292,7 +321,6 @@ pub const GGI_MARK_NONEXISTING_GLYPHS: u32 = 0x0001;
 
 pub const WM_THEMECHANGED = 0x031A;
 pub const WM_SYSCOLORCHANGE = 0x0015;
-pub const WM_DWMCOLORIZATIONCOLORCHANGED: UINT = 0x0320;
 pub const WM_DPICHANGED: UINT = 0x02E0;
 pub const WM_GETDPISCALEDSIZE: UINT = 0x02E4;
 pub const DWMSBT_NONE: u32 = 1;
@@ -301,8 +329,11 @@ pub const DWMSBT_TABBEDWINDOW: u32 = 4;
 pub const OS_BUILD_WIN10_22H2: u32 = 19045;
 pub const OS_BUILD_WIN11_21H2: u32 = 22000;
 pub const OS_BUILD_WIN11_22H2: u32 = 22621;
+pub const NULL_BRUSH: i32 = 5;
+pub const NULL_PEN: i32 = 8;
 pub const DC_BRUSH: i32 = 18;
 pub const DC_PEN: i32 = 19;
+pub const PS_SOLID: i32 = 0;
 
 pub const SPI_GETHIGHCONTRAST: UINT = 0x0042;
 pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;

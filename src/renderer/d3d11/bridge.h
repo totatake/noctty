@@ -59,7 +59,8 @@ int32_t noctty_d3d11_texture_write(NocttyD3DTexture *t, uint32_t x, uint32_t y,
 NocttyD3DTarget *noctty_d3d11_target_create(NocttyD3D *d, uint32_t width, uint32_t height, uint32_t linear);
 void noctty_d3d11_target_destroy(NocttyD3DTarget *t);
 int32_t noctty_d3d11_clear(NocttyD3DTarget *t, const float *color);
-/* pipeline: 0=global background, 1=cell backgrounds, 2=cell text. */
+/* pipeline: 0=global background, 1=cell backgrounds, 2=cell text, 5=split dim
+ * (the background shader blended over the frame in gamma space). */
 int32_t noctty_d3d11_draw(NocttyD3DTarget *target, uint32_t pipeline,
     NocttyD3DBuffer *uniforms, NocttyD3DBuffer *text, NocttyD3DBuffer *backgrounds,
     NocttyD3DTexture *gray, NocttyD3DTexture *color, uint32_t vertices, uint32_t instances);

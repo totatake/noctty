@@ -1,4 +1,5 @@
 const std = @import("std");
+const lib = @import("../../lib.zig");
 const Allocator = std.mem.Allocator;
 
 const DynamicColor = @import("../../color.zig").Dynamic;
@@ -171,7 +172,7 @@ fn parseGetSetAnsiColor(
         const spec_str = it.next() orelse return result;
 
         // Color must be numeric. u9 because that'll fit our palette + special
-        const color: u9 = std.fmt.parseInt(
+        const color: u9 = lib.parseInt(
             u9,
             color_str,
             10,
@@ -244,7 +245,7 @@ fn parseResetAnsiColor(
         if (color_str.len == 0) continue;
 
         // Color must be numeric. u9 because that'll fit our palette + special
-        const color: u9 = std.fmt.parseInt(
+        const color: u9 = lib.parseInt(
             u9,
             color_str,
             10,
@@ -351,6 +352,25 @@ pub const ColoredTarget = struct {
     target: Target,
     color: RGB,
 };
+
+test "OSC color indexes reject digit separators" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    inline for (.{ Operation.osc_4, Operation.osc_5 }) |op| {
+        var list = try parseColor(alloc, op, "1;red;0_3;blue;2;green");
+        defer list.deinit(alloc);
+        // Invalid indexes stop get/set requests at the valid prefix.
+        try testing.expectEqual(1, list.count());
+    }
+
+    inline for (.{ Operation.osc_104, Operation.osc_105 }) |op| {
+        var list = try parseColor(alloc, op, "1;0_3;2");
+        defer list.deinit(alloc);
+        // Invalid indexes are skipped in reset requests.
+        try testing.expectEqual(2, list.count());
+    }
+}
 
 test "OSC 4:" {
     const testing = std.testing;
@@ -560,6 +580,22 @@ test "OSC 4: multiple requests" {
             list.at(1).*,
         );
     }
+}
+
+test "OSC 4: the parser frees requests past the two it holds inline" {
+    const testing = std.testing;
+
+    var p = @import("../../osc.zig").Parser.init(testing.allocator);
+    defer p.deinit();
+
+    // The third request allocates; resetting the parser frees it.
+    for ("4;0;?;1;?;2;?") |ch| p.next(ch);
+    const cmd = p.end('\x1b') orelse return error.NoCommand;
+    try testing.expectEqual(3, cmd.color_operation.requests.count());
+    p.reset();
+
+    for ("104;1;2;3") |ch| p.next(ch);
+    _ = p.end('\x1b') orelse return error.NoCommand;
 }
 
 test "OSC 104:" {

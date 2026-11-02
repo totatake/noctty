@@ -1,9 +1,8 @@
-//! Benchmark-only Win32 tracing.
+//! Opt-in Win32 benchmark and stage tracing.
 //!
-//! Nothing here is a product path. It exists so `test/windows/bench-windows.ps1`
-//! can attribute per-pane memory and startup work to exact lifecycle stages
-//! instead of guessing from process totals. The trace is inert unless the
-//! benchmark environment variables are present.
+//! `test/windows/bench-windows.ps1` attributes per-pane memory and startup work
+//! to exact lifecycle stages. Settings-open diagnostics record only ordered
+//! stage names and timestamps. Traces are inert without their environment flags.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,6 +33,342 @@ extern "kernel32" fn K32GetProcessMemoryInfo(
 
 var process_origin_tick_ms = std.atomic.Value(u64).init(0);
 var memory_stage_trace_write_mutex: std.Thread.Mutex = .{};
+
+pub const SettingsOpenStage = enum {
+    f9_keydown,
+    f9_before_core_initialized,
+    open_config_action,
+    settings_open_enter,
+    settings_open_ok,
+    settings_open_error,
+};
+
+/// The steps `SettingsWindow.open` takes to build the window. A stamp is taken
+/// as a step ends, so the time since the stamp before it is that step's.
+pub const SettingsCreationStage = enum {
+    create_begin,
+    create_config,
+    create_frame,
+    create_theme,
+    create_fonts,
+    create_rail,
+    create_form,
+    create_actions,
+    create_annotate,
+    create_refresh,
+    create_layout,
+    create_show,
+    create_end,
+};
+
+/// Stamps `SettingsWindow.open` takes while it builds the window, kept in
+/// memory and written by the App after the open returns: one file write per
+/// open instead of one per stage, and none inside the work being timed.
+/// Disabled, `mark` reads one flag: no clock, syscall or allocation.
+pub const SettingsCreationStamps = struct {
+    pub const capacity = 32;
+
+    enabled: bool = false,
+    len: usize = 0,
+    stages: [capacity]SettingsCreationStage = undefined,
+    ticks: [capacity]u64 = undefined,
+    counters: [capacity]i64 = undefined,
+
+    pub fn mark(self: *SettingsCreationStamps, stage: SettingsCreationStage) void {
+        if (!self.enabled or self.len == capacity) return;
+        var counter: i64 = 0;
+        _ = QueryPerformanceCounter(&counter);
+        self.stages[self.len] = stage;
+        self.ticks[self.len] = GetTickCount64();
+        self.counters[self.len] = counter;
+        self.len += 1;
+    }
+};
+
+/// Ordered App/UI-thread diagnostics, separate from per-surface memory metrics.
+/// Only static stages and timestamps are accepted; no keys, config, or text.
+pub const SettingsOpenTrace = struct {
+    pub const max_records = 1024;
+    pub const max_record_bytes = 128;
+
+    file: ?std.fs.File = null,
+    records: u16 = 0,
+
+    /// Read the opt-in once per App lifetime. An inherited environment must
+    /// not make unit tests write files; tests exercise initPath explicitly.
+    pub fn init(alloc: Allocator) SettingsOpenTrace {
+        return initEnv(alloc, "NOCTTY_SETTINGS_OPEN_TRACE");
+    }
+
+    fn initEnv(alloc: Allocator, name: []const u8) SettingsOpenTrace {
+        if (builtin.is_test) return .{};
+        const path = std.process.getEnvVarOwned(alloc, name) catch return .{};
+        defer alloc.free(path);
+        return initPath(path) catch .{};
+    }
+
+    fn initPath(path: []const u8) !SettingsOpenTrace {
+        if (builtin.os.tag == .windows and @import("../../os/path.zig").isNetworkOrDevicePath(path))
+            return error.NetworkOrDeviceTracePath;
+        if (!std.fs.path.isAbsolute(path)) return error.RelativeTracePath;
+        // Zig calls a root-relative Windows path (\trace) absolute, too.
+        // Require a drive/share so the destination cannot depend on cwd.
+        if (builtin.os.tag == .windows and std.fs.path.diskDesignatorWindows(path).len == 0)
+            return error.RelativeTracePath;
+        return .{ .file = try std.fs.createFileAbsolute(path, .{ .exclusive = true, .truncate = false }) };
+    }
+
+    pub fn enabled(self: *const SettingsOpenTrace) bool {
+        return self.file != null;
+    }
+
+    pub fn deinit(self: *SettingsOpenTrace) void {
+        if (self.file) |file| file.close();
+        self.file = null;
+    }
+
+    /// App owns the handle and all calls run on its UI thread. Disabled calls
+    /// only check the handle: no allocation, environment read, or syscall.
+    pub fn note(self: *SettingsOpenTrace, stage: SettingsOpenStage) void {
+        const file = self.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = formatRecord(&buf, GetTickCount64(), stage) catch {
+            self.deinit();
+            return;
+        };
+        self.writeRecord(file, line);
+    }
+
+    /// Write the creation stamps one open took, in one write, and empty them.
+    /// Each record keeps its own tick and adds the performance counter in
+    /// microseconds, which resolves what the 15.6 ms tick cannot.
+    pub fn noteCreation(self: *SettingsOpenTrace, stamps: *SettingsCreationStamps) void {
+        defer stamps.len = 0;
+        const file = self.file orelse return;
+        var frequency: i64 = 0;
+        if (QueryPerformanceFrequency(&frequency) == 0 or frequency <= 0) return;
+        var buf: [SettingsCreationStamps.capacity * max_record_bytes]u8 = undefined;
+        var used: usize = 0;
+        var count: u16 = 0;
+        for (stamps.stages[0..stamps.len], stamps.ticks[0..stamps.len], stamps.counters[0..stamps.len]) |stage, tick, counter| {
+            if (self.records + count == max_records) break;
+            const line = formatCreationRecord(buf[used..][0..max_record_bytes], tick, stage, counterMicroseconds(counter, frequency)) catch {
+                self.deinit();
+                return;
+            };
+            used += line.len;
+            count += 1;
+        }
+        if (count == 0) return;
+        file.writeAll(buf[0..used]) catch {
+            self.deinit();
+            return;
+        };
+        self.records += count;
+        if (self.records == max_records) self.deinit();
+    }
+
+    fn writeRecord(self: *SettingsOpenTrace, file: std.fs.File, line: []const u8) void {
+        file.writeAll(line) catch {
+            self.deinit();
+            return;
+        };
+        self.records += 1;
+        if (self.records == max_records) self.deinit();
+    }
+
+    fn formatRecord(buf: []u8, tick_ms: u64, stage: SettingsOpenStage) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\"}}\n", .{ tick_ms, @tagName(stage) });
+    }
+
+    fn formatCreationRecord(buf: []u8, tick_ms: u64, stage: SettingsCreationStage, qpc_us: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\",\"qpc_us\":{d}}}\n", .{ tick_ms, @tagName(stage), qpc_us });
+    }
+
+    fn counterMicroseconds(counter: i64, frequency: i64) u64 {
+        if (counter <= 0) return 0;
+        return @intCast(@divTrunc(@as(i128, counter) * std.time.us_per_s, @as(i128, frequency)));
+    }
+};
+
+/// Opt-in receipts from the Settings HWND thread, immediately around the
+/// subclass's call into the native CB_SHOWDROPDOWN handler. This distinguishes
+/// a UIA request from a message actually delivered to the control. No text,
+/// configuration values, process arguments or input state is recorded.
+pub const SettingsComboTrace = struct {
+    const max_record_bytes = 192;
+    pub const Event = enum { action_received, action_returned, focus_lost, capture_changed, closeup };
+    inner: SettingsOpenTrace = .{},
+
+    pub fn init(alloc: Allocator) SettingsComboTrace {
+        return .{ .inner = SettingsOpenTrace.initEnv(alloc, "NOCTTY_SETTINGS_COMBO_TRACE") };
+    }
+
+    pub fn deinit(self: *SettingsComboTrace) void {
+        self.inner.deinit();
+    }
+
+    pub fn enabled(self: *const SettingsComboTrace) bool {
+        return self.inner.enabled();
+    }
+
+    pub fn note(self: *SettingsComboTrace, control_id: i32, show: bool, dropped: bool, result: ?isize) void {
+        const file = self.inner.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = formatRecord(&buf, GetTickCount64(), control_id, show, dropped, result) catch {
+            self.deinit();
+            return;
+        };
+        self.inner.writeRecord(file, line);
+    }
+
+    pub fn noteEvent(self: *SettingsComboTrace, event: Event, control_id: i32, dropped: bool) void {
+        const file = self.inner.file orelse return;
+        var buf: [max_record_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{{\"tick_ms\":{d},\"stage\":\"{s}\",\"control_id\":{d},\"dropped\":{}}}\n", .{ GetTickCount64(), @tagName(event), control_id, dropped }) catch {
+            self.deinit();
+            return;
+        };
+        self.inner.writeRecord(file, line);
+    }
+
+    fn formatRecord(buf: []u8, tick_ms: u64, control_id: i32, show: bool, dropped: bool, result: ?isize) ![]const u8 {
+        if (result) |value| return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"show_returned\",\"control_id\":{d},\"show\":{},\"dropped\":{},\"result\":{d}}}\n", .{ tick_ms, control_id, show, dropped, value });
+        return std.fmt.bufPrint(buf, "{{\"tick_ms\":{d},\"stage\":\"show_received\",\"control_id\":{d},\"show\":{},\"dropped\":{}}}\n", .{ tick_ms, control_id, show, dropped });
+    }
+};
+
+test "Settings combo trace records native dropdown delivery without control text" {
+    var buf: [SettingsComboTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"show_received\",\"control_id\":405,\"show\":true,\"dropped\":false}\n",
+        try SettingsComboTrace.formatRecord(&buf, 99, 405, true, false, null),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":100,\"stage\":\"show_returned\",\"control_id\":405,\"show\":false,\"dropped\":true,\"result\":0}\n",
+        try SettingsComboTrace.formatRecord(&buf, 100, 405, false, true, 0),
+    );
+    _ = try SettingsComboTrace.formatRecord(&buf, std.math.maxInt(u64), std.math.minInt(i32), false, false, std.math.minInt(isize));
+}
+
+test "Settings open trace formatter emits only stage and timestamp" {
+    var buf: [SettingsOpenTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"f9_keydown\"}\n",
+        try SettingsOpenTrace.formatRecord(&buf, 99, .f9_keydown),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":100,\"stage\":\"settings_open_error\"}\n",
+        try SettingsOpenTrace.formatRecord(&buf, 100, .settings_open_error),
+    );
+    inline for (std.meta.tags(SettingsOpenStage)) |stage| {
+        const line = try SettingsOpenTrace.formatRecord(&buf, std.math.maxInt(u64), stage);
+        try std.testing.expect(line.len < SettingsOpenTrace.max_record_bytes);
+    }
+}
+
+test "Settings open trace refuses relative paths and preserves an existing file" {
+    try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("relative-settings-trace.jsonl"));
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "\\\\server\\share\\trace", "//server/share/trace", "\\/server/share/trace", "/\\server/share/trace", "\\\\.\\pipe\\trace", "\\??\\UNC\\server\\share\\trace" }) |path|
+            try std.testing.expectError(error.NetworkOrDeviceTracePath, SettingsOpenTrace.initPath(path));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("C:relative-settings-trace.jsonl"));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("\\root-relative-settings-trace.jsonl"));
+        try std.testing.expectError(error.RelativeTracePath, SettingsOpenTrace.initPath("/root-relative-settings-trace.jsonl"));
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(.{ .sub_path = "trace.jsonl", .data = "preserve-me" });
+    try std.testing.expectError(error.PathAlreadyExists, SettingsOpenTrace.initPath(path));
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", 100);
+    defer alloc.free(data);
+    try std.testing.expectEqualStrings("preserve-me", data);
+}
+
+test "Settings open trace caps output and closes its owned handle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    var trace = try SettingsOpenTrace.initPath(path);
+    defer trace.deinit();
+    for (0..SettingsOpenTrace.max_records + 10) |_| trace.note(.open_config_action);
+    try std.testing.expectEqual(@as(u16, SettingsOpenTrace.max_records), trace.records);
+    try std.testing.expect(!trace.enabled());
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", SettingsOpenTrace.max_records * SettingsOpenTrace.max_record_bytes);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, SettingsOpenTrace.max_records), std.mem.count(u8, data, "\n"));
+    try std.testing.expectEqual(@as(usize, SettingsOpenTrace.max_records), std.mem.count(u8, data, "\"stage\":\"open_config_action\""));
+    trace.deinit();
+    trace.note(.settings_open_enter);
+}
+
+test "Settings creation stamps cost one flag check while disabled" {
+    var stamps: SettingsCreationStamps = .{};
+    stamps.mark(.create_begin);
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    stamps.enabled = true;
+    for (0..SettingsCreationStamps.capacity + 3) |_| stamps.mark(.create_form);
+    try std.testing.expectEqual(@as(usize, SettingsCreationStamps.capacity), stamps.len);
+    try std.testing.expect(stamps.counters[0] <= stamps.counters[stamps.len - 1]);
+}
+
+test "Settings creation records carry the stage and both clocks" {
+    var buf: [SettingsOpenTrace.max_record_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"tick_ms\":99,\"stage\":\"create_form\",\"qpc_us\":1234567}\n",
+        try SettingsOpenTrace.formatCreationRecord(&buf, 99, .create_form, 1234567),
+    );
+    inline for (std.meta.tags(SettingsCreationStage)) |stage| {
+        const line = try SettingsOpenTrace.formatCreationRecord(&buf, std.math.maxInt(u64), stage, std.math.maxInt(u64));
+        try std.testing.expect(line.len < SettingsOpenTrace.max_record_bytes);
+    }
+    // A 10 MHz counter at 25 s, and a counter that read nothing.
+    try std.testing.expectEqual(@as(u64, 25_000_000), SettingsOpenTrace.counterMicroseconds(250_000_000, 10_000_000));
+    try std.testing.expectEqual(@as(u64, 0), SettingsOpenTrace.counterMicroseconds(0, 10_000_000));
+}
+
+test "Settings creation stamps are written once, in order, within the record cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "trace.jsonl" });
+    defer alloc.free(path);
+    var trace = try SettingsOpenTrace.initPath(path);
+    defer trace.deinit();
+
+    var stamps: SettingsCreationStamps = .{ .enabled = true };
+    stamps.mark(.create_begin);
+    stamps.mark(.create_end);
+    trace.noteCreation(&stamps);
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    try std.testing.expectEqual(@as(u16, 2), trace.records);
+    const data = try tmp.dir.readFileAlloc(alloc, "trace.jsonl", 4096);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data, "\n"));
+    const begin = std.mem.indexOf(u8, data, "\"stage\":\"create_begin\"").?;
+    const end = std.mem.indexOf(u8, data, "\"stage\":\"create_end\"").?;
+    try std.testing.expect(begin < end);
+
+    // The file closes at the cap, part way through a batch.
+    trace.records = SettingsOpenTrace.max_records - 1;
+    stamps.mark(.create_begin);
+    stamps.mark(.create_end);
+    trace.noteCreation(&stamps);
+    try std.testing.expect(!trace.enabled());
+    try std.testing.expectEqual(@as(usize, 0), stamps.len);
+    trace.noteCreation(&stamps);
+}
 
 /// Resolve a trace output path against the current working directory.
 ///

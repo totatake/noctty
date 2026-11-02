@@ -1,6 +1,11 @@
 [CmdletBinding()]
 param()
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'link-opener-pathext-probe.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $startupPath = Join-Path $env:LOCALAPPDATA 'noctty\startup-attempts.json'
@@ -51,3 +56,7 @@ finally {
 }
 Write-Host 'PATHEXT and leading-dot controls executed only owned marker commands; the production gate refused the missing targets and leading-dot handlers before shell dispatch.'
 Write-Host "Completion receipt: $receiptPath"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

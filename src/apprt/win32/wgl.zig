@@ -60,20 +60,13 @@ fn Loader(comptime Backend: type) type {
                 std.unicode.utf8ToUtf16LeStringLiteral("opengl32.dll"),
                 null,
                 0x00000800, // LOAD_LIBRARY_SEARCH_SYSTEM32
-            ) orelse {
-                const err = self.backend.getLastError();
-                self.load_error.store(err, .monotonic);
-                self.backend.setLastError(err);
-                return null;
-            };
+            ) orelse return self.loadFailed(self.backend.getLastError());
             var api: Api = undefined;
             inline for (@typeInfo(Api).@"struct".fields) |field| {
                 const ptr = self.backend.getProcAddress(module, field.name) orelse {
                     const err = self.backend.getLastError();
                     self.backend.freeLibrary(module);
-                    self.load_error.store(err, .monotonic);
-                    self.backend.setLastError(err);
-                    return null;
+                    return self.loadFailed(err);
                 };
                 @field(api, field.name) = @ptrCast(@alignCast(ptr));
             }
@@ -82,6 +75,14 @@ fn Loader(comptime Backend: type) type {
             self.load_error.store(0, .monotonic);
             self.initialized.store(true, .release);
             return &self.api.?;
+        }
+
+        /// Record `err` for `lastLoadError` and leave it as the thread's last
+        /// error for the caller of the wrapper that triggered the load.
+        fn loadFailed(self: *Self, err: u32) ?*const Api {
+            self.load_error.store(err, .monotonic);
+            self.backend.setLastError(err);
+            return null;
         }
 
         fn lastLoadError(self: *Self) u32 {

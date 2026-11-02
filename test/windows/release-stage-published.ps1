@@ -2,6 +2,11 @@
 [CmdletBinding()]
 param()
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'release-stage-published.ps1'
+try {
+
+
 # Runs a copy of scripts/release-stage-published.ps1 next to stand-ins for the
 # scripts and tools it calls (the release verifier, the package generator and
 # `gh`), to show what the real one guarantees: nothing is staged or packaged
@@ -154,4 +159,8 @@ finally {
         (Split-Path -Leaf $root) -like 'release-stage-published-*') {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Ignore
     }
+}
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
 }

@@ -263,6 +263,25 @@ pub fn buildInjectedArgv(
     integration_path: []const u8,
     utf8_console: bool,
 ) InjectError!?[]const [:0]const u8 {
+    return buildInjectedArgvAfter(alloc, pwsh_argv, null, integration_path, utf8_console);
+}
+
+/// `buildInjectedArgv`, with `prelude`, a `-Command` script noctty built
+/// (a Developer PowerShell's: `windows_visual_studio.devShellPrelude`), run
+/// before the integration loads. `pwsh_argv` is the launch without that
+/// script and its `-Command`. The payload is `<prelude>; & { ... }`: the
+/// script runs at the top of `-Command` exactly as it does alone, which is
+/// how the caller runs it when integration is off, and only its own
+/// statements are between the host and the integration. A script that
+/// stops the whole `-Command` (an error under a profile's
+/// `$ErrorActionPreference = 'Stop'`) stops the integration with it.
+pub fn buildInjectedArgvAfter(
+    alloc: Allocator,
+    pwsh_argv: []const []const u8,
+    prelude: ?[]const u8,
+    integration_path: []const u8,
+    utf8_console: bool,
+) InjectError!?[]const [:0]const u8 {
     if (pwsh_argv.len == 0) return InjectError.EmptyCommand;
 
     const mode = analyzeInteractiveMode(pwsh_argv) orelse return null;
@@ -271,8 +290,13 @@ pub fn buildInjectedArgv(
         return InjectError.OutOfMemory;
     defer alloc.free(escaped);
 
-    const cmd_val = buildCommandValue(alloc, escaped, utf8_console) catch
+    const bootstrap = buildCommandValue(alloc, escaped, utf8_console) catch
         return InjectError.OutOfMemory;
+    const cmd_val = if (prelude) |script| joined: {
+        defer alloc.free(bootstrap);
+        break :joined std.mem.concat(alloc, u8, &.{ script, "; ", bootstrap }) catch
+            return InjectError.OutOfMemory;
+    } else bootstrap;
     defer alloc.free(cmd_val);
 
     var result: std.ArrayList([:0]const u8) = .empty;
@@ -1245,6 +1269,22 @@ const TestProcessDeadline = struct {
     }
 };
 
+/// Spawn `child`, which collects no output, and wait for it to exit or be
+/// terminated after `milliseconds`.
+fn runWithDeadline(child: *std.process.Child, milliseconds: u32) !struct { term: std.process.Child.Term, timed_out: bool } {
+    try child.spawn();
+    var running = true;
+    errdefer if (running) {
+        _ = child.kill() catch {};
+    };
+    var deadline: TestProcessDeadline = .{ .handle = child.id, .milliseconds = milliseconds };
+    const watcher = try std.Thread.spawn(.{}, TestProcessDeadline.run, .{&deadline});
+    watcher.join();
+    const term = try child.wait();
+    running = false;
+    return .{ .term = term, .timed_out = deadline.timed_out };
+}
+
 test "PowerShell child deadline terminates and reaps a stalled host" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     var child = std.process.Child.init(&.{ "powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Seconds 300" }, std.testing.allocator);
@@ -1252,18 +1292,9 @@ test "PowerShell child deadline terminates and reaps a stalled host" {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-    try child.spawn();
-    var running = true;
-    errdefer if (running) {
-        _ = child.kill() catch {};
-    };
-    var deadline: TestProcessDeadline = .{ .handle = child.id, .milliseconds = 100 };
-    const watcher = try std.Thread.spawn(.{}, TestProcessDeadline.run, .{&deadline});
-    watcher.join();
-    const term = try child.wait();
-    running = false;
-    try std.testing.expect(deadline.timed_out);
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 124 }, term);
+    const run = try runWithDeadline(&child, 100);
+    try std.testing.expect(run.timed_out);
+    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 124 }, run.term);
 }
 
 test "buildInjectedArgv: policy bootstrap executes in Windows PowerShell hosts" {
@@ -1295,7 +1326,7 @@ test "buildInjectedArgv: policy bootstrap executes in Windows PowerShell hosts" 
         warmup.stdin_behavior = .Ignore;
         warmup.stdout_behavior = .Ignore;
         warmup.stderr_behavior = .Ignore;
-        warmup.spawn() catch |err| switch (err) {
+        const warmup_run = runWithDeadline(&warmup, host_deadline_ms) catch |err| switch (err) {
             // Only an absent optional host is omitted. Startup failures and
             // timeouts must fail rather than turn missing coverage into a pass.
             error.FileNotFound => if (std.mem.eql(u8, host, "pwsh.exe")) {
@@ -1304,20 +1335,11 @@ test "buildInjectedArgv: policy bootstrap executes in Windows PowerShell hosts" 
             } else return err,
             else => return err,
         };
-        var warmup_running = true;
-        errdefer if (warmup_running) {
-            _ = warmup.kill() catch {};
-        };
-        var warmup_deadline: TestProcessDeadline = .{ .handle = warmup.id, .milliseconds = host_deadline_ms };
-        const warmup_watcher = try std.Thread.spawn(.{}, TestProcessDeadline.run, .{&warmup_deadline});
-        warmup_watcher.join();
-        const warmup_term = try warmup.wait();
-        warmup_running = false;
-        if (warmup_deadline.timed_out or !std.meta.eql(warmup_term, std.process.Child.Term{ .Exited = 0 })) {
-            std.debug.print("PowerShell bootstrap fixture: host={s} warmup_timed_out={} warmup_term={any}\n", .{ host, warmup_deadline.timed_out, warmup_term });
+        if (warmup_run.timed_out or !std.meta.eql(warmup_run.term, std.process.Child.Term{ .Exited = 0 })) {
+            std.debug.print("PowerShell bootstrap fixture: host={s} warmup_timed_out={} warmup_term={any}\n", .{ host, warmup_run.timed_out, warmup_run.term });
         }
-        try std.testing.expect(!warmup_deadline.timed_out);
-        try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, warmup_term);
+        try std.testing.expect(!warmup_run.timed_out);
+        try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, warmup_run.term);
 
         for ([_][]const u8{ "Restricted", "RemoteSigned", "AllSigned" }) |policy| {
             const argv = [_][]const u8{ host, "-NoProfile", "-ExecutionPolicy", policy };
@@ -1389,23 +1411,22 @@ test "buildInjectedArgv: policy bootstrap executes in Windows PowerShell hosts" 
                 });
             }
             try std.testing.expect(!deadline.timed_out);
-            const result = .{ .stdout = stdout.items, .stderr = stderr.items, .term = term };
-            try std.testing.expect(std.mem.indexOf(u8, result.stdout, "BOOTSTRAP-PROBE> ") != null);
-            try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ERROR-COUNT=0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, stdout.items, "BOOTSTRAP-PROBE> ") != null);
+            try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ERROR-COUNT=0") != null);
             if (std.mem.eql(u8, policy, "AllSigned")) {
-                try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HELPER-LOADED") == null);
-                try std.testing.expect(std.mem.indexOf(u8, result.stdout, "noctty PowerShell integration could not load") != null);
+                try std.testing.expect(std.mem.indexOf(u8, stdout.items, "HELPER-LOADED") == null);
+                try std.testing.expect(std.mem.indexOf(u8, stdout.items, "noctty PowerShell integration could not load") != null);
             } else {
-                try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HELPER-LOADED") != null);
-                try std.testing.expect(std.mem.indexOf(u8, result.stdout, "]133;A;") != null);
+                try std.testing.expect(std.mem.indexOf(u8, stdout.items, "HELPER-LOADED") != null);
+                try std.testing.expect(std.mem.indexOf(u8, stdout.items, "]133;A;") != null);
             }
             // pwsh tries to autoload PSReadLine BEFORE -Command, which file
             // policy can deny. That host warning is independent of our load.
             // Accept only that exact diagnostic, never an integration error.
-            if (result.stderr.len != 0) {
-                try std.testing.expectEqualStrings("Cannot load PSReadline module.  Console is running without PSReadline.\r\n", result.stderr);
+            if (stderr.items.len != 0) {
+                try std.testing.expectEqualStrings("Cannot load PSReadline module.  Console is running without PSReadline.\r\n", stderr.items);
             }
-            switch (result.term) {
+            switch (term) {
                 .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
                 else => return error.UnexpectedChildTermination,
             }
@@ -1526,6 +1547,27 @@ test "buildInjectedArgv: existing slash noexit is not duplicated" {
     try std.testing.expectEqualStrings("/NoProfile", r[2]);
     try std.testing.expectEqualStrings("-Command", r[3]);
     try std.testing.expectEqualStrings("& { $__ghostty_utf8_console = $false; $__ghostty_integration_path = 'C:\\int.ps1" ++ expected_bootstrap_suffix, r[4]);
+}
+
+test "buildInjectedArgvAfter: a prelude runs at the top of -Command, before the integration" {
+    const alloc = std.testing.allocator;
+    const prelude = "&{Import-Module 'C:\\VS\\m.dll'; Enter-VsDevShell '6bb7cfd9' -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'}";
+    // The Developer PowerShell's own `-NoExit` is kept, not doubled.
+    const argv = [_][]const u8{ "pwsh.exe", "-NoExit" };
+    const r = (try buildInjectedArgvAfter(alloc, &argv, prelude, "C:\\int.ps1", true)).?;
+    defer {
+        for (r) |s| alloc.free(s);
+        alloc.free(r);
+    }
+    try std.testing.expectEqual(@as(usize, 4), r.len);
+    try std.testing.expectEqualStrings("pwsh.exe", r[0]);
+    try std.testing.expectEqualStrings("-NoExit", r[1]);
+    try std.testing.expectEqualStrings("-Command", r[2]);
+    try std.testing.expectEqualStrings(prelude ++ "; & { $__ghostty_utf8_console = $true; $__ghostty_integration_path = 'C:\\int.ps1" ++ expected_bootstrap_suffix, r[3]);
+
+    // A launch the integration would not wrap stays unwrapped with one.
+    const scripted = [_][]const u8{ "pwsh.exe", "-NoExit", "-File", "x.ps1" };
+    try std.testing.expect((try buildInjectedArgvAfter(alloc, &scripted, prelude, "C:\\int.ps1", true)) == null);
 }
 
 test "buildInjectedArgv: path with single quote" {

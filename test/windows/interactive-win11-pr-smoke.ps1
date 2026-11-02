@@ -6,6 +6,10 @@ param(
     [switch] $ResetState
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'interactive-win11-pr-smoke.ps1'
+try {
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if ($Rebuild) {
@@ -76,3 +80,7 @@ foreach ($harness in @(
 }
 
 Write-Host 'interactive Win11 PR smoke: PASS' -ForegroundColor Green
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

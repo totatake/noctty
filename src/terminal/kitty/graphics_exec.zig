@@ -10,6 +10,7 @@ const Response = command.Response;
 const LoadingImage = image.LoadingImage;
 const Image = image.Image;
 const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+const TempDir = @import("../../os/TempDir.zig");
 
 const log = std.log.scoped(.kitty_gfx);
 
@@ -43,17 +44,49 @@ pub fn execute(
     // this can change.
     var quiet = cmd.quiet;
 
+    // The protocol makes i and I mutually exclusive for every action, so this
+    // must happen before dispatch and before an action can mutate storage.
+    // https://sw.kovidgoyal.net/kitty/graphics-protocol/#requesting-image-ids-from-the-terminal
+    const identifiers = cmd.control.identifiers();
+    if (identifiers.image_id > 0 and identifiers.image_number > 0) {
+        const resp: Response = .{
+            .id = identifiers.image_id,
+            .image_number = identifiers.image_number,
+            .placement_id = identifiers.placement_id,
+            .message = "EINVAL: image ID and number are mutually exclusive",
+        };
+        log.warn("erroneous kitty graphics response: {s}", .{resp.message});
+
+        return switch (quiet) {
+            .no => resp,
+            .ok => resp,
+            .failures => null,
+        };
+    }
+
     const resp_: ?Response = switch (cmd.control) {
         .query => query(alloc, cmd),
         .display => display(alloc, terminal, cmd),
         .delete => delete(alloc, terminal, cmd),
 
         .transmit, .transmit_and_display => resp: {
+            const storage = &terminal.screens.active.kitty_images;
+
+            // Only direct (t=d) data can be sent in chunks, so only a
+            // direct command can continue a chunked load. A file, temporary
+            // file, or shared memory command abandons the load and is
+            // handled as a brand new transmission, as Kitty does.
+            if (storage.loading) |loading| {
+                if (cmd.transmission().?.medium != .direct) {
+                    loading.destroy(alloc);
+                    storage.loading = null;
+                }
+            }
+
             // If we're transmitting, then our `q` setting value is complicated.
             // The `q` setting inherits the value from the starting command
             // unless `q` is set >= 1 on this command. If it is, then we save
             // that as the new `q` setting.
-            const storage = &terminal.screens.active.kitty_images;
             if (storage.loading) |loading| switch (cmd.quiet) {
                 // q=0 we use whatever the start command value is
                 .no => quiet = loading.quiet,
@@ -89,6 +122,7 @@ pub fn execute(
 
     return null;
 }
+
 /// Execute a "query" command.
 ///
 /// This command is used to attempt to load an image and respond with
@@ -111,12 +145,20 @@ fn query(alloc: Allocator, cmd: *const Command) Response {
         .placement_id = t.placement_id,
     };
 
-    // Attempt to load the image. If we cannot, then set an appropriate error.
+    // A query must attempt a complete load, then discard the result without
+    // changing image storage.
+    // https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-and-available-transmission-mediums
     var loading = LoadingImage.init(alloc, cmd) catch |err| {
         encodeError(&result, err);
         return result;
     };
-    loading.deinit(alloc);
+    defer loading.deinit(alloc);
+
+    var img = loading.complete(alloc) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+    img.deinit(alloc);
 
     return result;
 }
@@ -131,14 +173,15 @@ fn transmit(
     cmd: *const Command,
 ) Response {
     const t = cmd.transmission().?;
-    var result: Response = .{
-        .id = t.image_id,
-        .image_number = t.image_number,
-        .placement_id = t.placement_id,
-    };
-    if (t.image_id > 0 and t.image_number > 0) {
-        return .{ .message = "EINVAL: image ID and number are mutually exclusive" };
-    }
+    const storage = &terminal.screens.active.kitty_images;
+    var result: Response = if (storage.loading) |loading|
+        loading.response
+    else
+        .{
+            .id = t.image_id,
+            .image_number = t.image_number,
+            .placement_id = t.placement_id,
+        };
 
     const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
         encodeError(&result, err);
@@ -232,20 +275,29 @@ fn display(
     };
 
     // Add the placement
-    const p: ImageStorage.Placement = .{
-        .location = location,
-        .x_offset = d.x_offset,
-        .y_offset = d.y_offset,
-        .source_x = d.x,
-        .source_y = d.y,
-        .source_width = d.width,
-        .source_height = d.height,
-        .columns = d.columns,
-        .rows = d.rows,
-        .z = d.z,
+    const p: ImageStorage.Placement = placement: {
+        var p: ImageStorage.Placement = .{
+            .location = location,
+            .x_offset = d.x_offset,
+            .y_offset = d.y_offset,
+            .source_x = d.x,
+            .source_y = d.y,
+            .source_width = d.width,
+            .source_height = d.height,
+            .columns = d.columns,
+            .rows = d.rows,
+            .z = d.z,
+        };
+
+        const cell_offset = p.cellOffset(terminal);
+        if (terminal.width_px / terminal.cols > 0) p.x_offset = cell_offset.x;
+        if (terminal.height_px / terminal.rows > 0) p.y_offset = cell_offset.y;
+
+        break :placement p;
     };
     storage.addPlacement(
         alloc,
+        terminal.screens.active,
         img.id,
         result.placement_id,
         p,
@@ -262,15 +314,47 @@ fn display(
             .none => {},
             .after => {
                 // We use terminal.index to properly handle scroll regions.
+                const screen = terminal.screens.active;
                 const size = p.gridSize(img, terminal);
-                for (0..size.rows) |_| terminal.index() catch |err| {
+
+                // A scroll below can move this placement off the screen,
+                // which deletes it and frees its pin, so read the column
+                // first.
+                const target_x = @as(usize, pin.x) +| @as(usize, size.cols);
+                const wraps = target_x >= @as(usize, terminal.cols);
+                const requested_rows =
+                    (@as(usize, size.rows) -| 1) +| @intFromBool(wraps);
+
+                // The row count comes from the application and can be as
+                // large as u32, and one terminal.index call per row would
+                // keep this thread busy for a very long time. A cursor at or
+                // above the bottom of the scroll region (above the region
+                // too) moves down to that bottom, and each call after that
+                // scrolls the region. So allow the calls that reach the
+                // bottom, then one screen of scrolling: past that the region
+                // is blank and the protocol leaves the position undefined.
+                // A cursor below the region or outside its left and right
+                // margins never scrolls, so the budget only bounds moves.
+                const region = terminal.scrolling_region;
+                const rows_before_scroll: usize = if (screen.cursor.y <= region.bottom)
+                    @as(usize, region.bottom - screen.cursor.y)
+                else
+                    0;
+                const rows_to_move: usize = @min(
+                    requested_rows,
+                    rows_before_scroll +| @as(usize, terminal.rows),
+                );
+                for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
                     break;
                 };
 
-                terminal.setCursorPos(
-                    terminal.screens.active.cursor.y,
-                    pin.x + size.cols + 1,
+                // Kitty wraps once when the movement reaches the right edge;
+                // otherwise it leaves the cursor immediately to the right of
+                // the placement.
+                screen.cursor.pending_wrap = false;
+                screen.cursorHorizontalAbsolute(
+                    if (wraps) 0 else @intCast(target_x),
                 );
             },
         },
@@ -286,7 +370,15 @@ fn delete(
     cmd: *const Command,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
-    storage.delete(alloc, terminal, cmd.control.delete);
+
+    // Every delete command aborts an incomplete chunked upload.
+    if (storage.loading) |loading| {
+        loading.destroy(alloc);
+        storage.loading = null;
+    }
+
+    // Then perform the actual deletion request, too.
+    storage.delete(alloc, terminal, cmd.control.delete.action);
 
     // Delete never responds on success
     return .{};
@@ -322,7 +414,18 @@ fn loadAndAddImage(
         }
 
         break :loading loading.*;
-    } else try .init(alloc, cmd);
+    } else loading: {
+        // Reusing a specific image ID deletes the old image and all of its
+        // placements when the new transmission begins, not when it completes.
+        if (t.image_id > 0) {
+            storage.delete(alloc, terminal, .{ .id = .{
+                .image_id = t.image_id,
+                .delete = true,
+            } });
+        }
+
+        break :loading try .init(alloc, cmd);
+    };
 
     // We only want to deinit on error. If we're chunking, then we don't
     // want to deinit at all. If we're not chunking, then we'll deinit
@@ -331,12 +434,12 @@ fn loadAndAddImage(
 
     // If the image has no ID, we assign one
     if (loading.image.id == 0) {
-        loading.image.id = storage.next_image_id;
-        storage.next_image_id +%= 1;
-
-        // If the image also has no number then its auto-ID is "implicit".
-        // See the doc comment on the Image.implicit_id field for more detail.
-        if (loading.image.number == 0) loading.image.implicit_id = true;
+        if (loading.image.number > 0) {
+            loading.image.id = storage.nextImageId(.explicit);
+        } else {
+            loading.image.id = storage.nextImageId(.implicit);
+            loading.image.implicit_id = true;
+        }
     }
 
     // If this is chunked, this is the beginning of a new chunked transmission.
@@ -357,7 +460,7 @@ fn loadAndAddImage(
     // Validate and store our image
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
-    try storage.addImage(alloc, img);
+    try storage.addImage(alloc, terminal.screens.active, img);
 
     // Get our display settings
     const display_ = loading.display;
@@ -386,6 +489,250 @@ fn encodeError(r: *Response, err: EncodeableError) void {
         error.UnsupportedDepth => r.message = "EINVAL: unsupported pixel depth",
         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
+    }
+}
+
+test "kittygfx query validates image data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var terminal = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer terminal.deinit(alloc);
+
+    var cmd: Command = .{
+        .control = .{ .query = .{
+            .format = .rgb,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        // A 1x1 RGB image requires three bytes.
+        .data = try alloc.dupe(u8, &.{ 0, 0 }),
+    };
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &terminal, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(!resp.ok());
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: invalid data", resp.message);
+    try testing.expectEqual(
+        @as(usize, 0),
+        terminal.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx valid query does not replace or store image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var terminal = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer terminal.deinit(alloc);
+    const storage = &terminal.screens.active.kitty_images;
+
+    // Store a red pixel under the same ID used by the query.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=1,i=31;/wAA",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &terminal, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+    }
+
+    // Successfully validate a black pixel without replacing the red one.
+    var cmd: Command = .{
+        .control = .{ .query = .{
+            .format = .rgb,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, &.{ 0, 0, 0 }),
+    };
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &terminal, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+    const img = storage.imageById(31) orelse return error.TestExpectedImage;
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, img.data);
+}
+
+test "kittygfx image id and number are mutually exclusive for every action" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const inputs = [_][]const u8{
+        "a=q,f=24,s=1,v=1,i=1,I=2,p=3;AAAA",
+        "a=t,f=24,s=1,v=1,i=1,I=2,p=3;AAAA",
+        "a=T,f=24,s=1,v=1,i=1,I=2,p=3;AAAA",
+        "a=p,i=1,I=2,p=3",
+        "a=d,d=a,i=1,I=2,p=3",
+        "a=f,i=1,I=2,p=3;AAAA",
+        "a=a,i=1,I=2,p=3",
+        "a=c,i=1,I=2,p=3",
+    };
+
+    for (inputs) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(!resp.ok());
+        try testing.expectEqual(@as(u32, 1), resp.id);
+        try testing.expectEqual(@as(u32, 2), resp.image_number);
+        try testing.expectEqual(@as(u32, 3), resp.placement_id);
+        try testing.expectEqualStrings(
+            "EINVAL: image ID and number are mutually exclusive",
+            resp.message,
+        );
+
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try resp.encode(&writer);
+        try testing.expectEqualStrings(
+            "\x1b_Gi=1,I=2,p=3;EINVAL: image ID and number are mutually exclusive\x1b\\",
+            writer.buffered(),
+        );
+    }
+
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.images.count());
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.placements.count());
+}
+
+test "kittygfx conflicting identifiers are rejected before mutation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Store an image so a buggy put would succeed and mutate placement state.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=1,i=1;/wAA",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+    }
+
+    // Directly constructed commands must receive the same validation as
+    // commands produced by the parser.
+    {
+        const cmd: Command = .{ .control = .{ .display = .{
+            .image_id = 1,
+            .image_number = 2,
+            .placement_id = 7,
+            .cursor_movement = .none,
+        } } };
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(!resp.ok());
+        try testing.expectEqual(@as(u32, 1), resp.id);
+        try testing.expectEqual(@as(u32, 2), resp.image_number);
+        try testing.expectEqual(@as(u32, 7), resp.placement_id);
+        try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    }
+
+    // Add a real placement so a buggy delete would remove it.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=p,i=1,p=7,C=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    }
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=d,d=i,i=1,I=2,p=7",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(!resp.ok());
+        try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    }
+
+    // q=2 suppresses the required error response but not the validation.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=d,d=i,i=1,I=2,p=7,q=2",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    }
+}
+
+test "kittygfx chunked success response uses initial identifiers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=2,I=93,p=7,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    {
+        const cmd = try command.Parser.parseString(alloc, "m=0;AAAA");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 1), resp.id);
+        try testing.expectEqual(@as(u32, 93), resp.image_number);
+        try testing.expectEqual(@as(u32, 7), resp.placement_id);
+
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try resp.encode(&writer);
+        try testing.expectEqualStrings(
+            "\x1b_Gi=1,I=93,p=7;OK\x1b\\",
+            writer.buffered(),
+        );
+    }
+}
+
+test "kittygfx chunked error response uses initial identifiers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=1,i=41,p=7,m=1;AA==",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    {
+        const cmd = try command.Parser.parseString(alloc, "m=0;AA==");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+
+        try testing.expect(!resp.ok());
+        try testing.expectEqual(@as(u32, 41), resp.id);
+        try testing.expectEqual(@as(u32, 7), resp.placement_id);
+        try testing.expectEqualStrings("EINVAL: invalid data", resp.message);
     }
 }
 
@@ -479,6 +826,166 @@ test "kittygfx more chunks with chunk increasing q" {
     }
 }
 
+test "kittygfx delete aborts chunked image load" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Begin a two-chunk RGB image, then interrupt it with a delete.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=2,i=1,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading != null);
+
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=d");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading == null);
+
+    // A fresh chunked upload must start from empty state after the delete.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=2,i=1,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "m=0;AAAA");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+    }
+    const img = storage.imageById(1) orelse return error.TestExpectedImage;
+    try testing.expectEqual(@as(usize, 6), img.data.len);
+}
+
+test "kittygfx non-direct transmission abandons chunked image load" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Write a 1x1 RGB image file for a file (t=f) transmission.
+    var tmp_dir = try TempDir.init();
+    defer tmp_dir.deinit();
+    const payload = try testFilePayload(alloc, tmp_dir.dir, &.{ 1, 2, 3 });
+    defer alloc.free(payload);
+
+    // Begin a two-chunk RGB image.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=2,i=1,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading != null);
+
+    // A file transmission can't be a continuation chunk, so it abandons
+    // the load and transmits a new image from the file.
+    {
+        const str = try std.fmt.allocPrint(
+            alloc,
+            "a=t,t=f,f=24,s=1,v=1,i=2;{s}",
+            .{payload},
+        );
+        defer alloc.free(str);
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 2), resp.id);
+    }
+    try testing.expect(storage.loading == null);
+    try testing.expect(storage.imageById(1) == null);
+    const img = storage.imageById(2) orelse return error.TestExpectedImage;
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, img.data);
+}
+
+/// Writes `data` to a file in `dir` and returns the file's absolute path,
+/// base64 encoded. The result is ready to use as the payload of a file
+/// (t=f) transmission. The caller owns the returned memory.
+fn testFilePayload(
+    alloc: Allocator,
+    dir: std.fs.Dir,
+    data: []const u8,
+) ![]u8 {
+    try dir.writeFile(.{ .sub_path = "image.data", .data = data });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try dir.realpath("image.data", &path_buf);
+    const encoder = std.base64.standard.Encoder;
+    const result = try alloc.alloc(u8, encoder.calcSize(path.len));
+    _ = encoder.encode(result, path);
+    return result;
+}
+
+test "kittygfx uppercase id delete preserves image when placement does not match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Store an unplaced 1x1 RGB image.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=1,i=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+    }
+
+    // Uppercase deletion may free data only if the named placement matched.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=d,d=I,i=1,p=7",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    try testing.expect(storage.imageById(1) != null);
+}
+
+test "kittygfx query of an over-long file path answers file path too long" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const path = try alloc.alloc(u8, 40000);
+    @memset(path, 'a');
+    var cmd: Command = .{
+        .control = .{ .query = .{ .medium = .file, .image_id = 31 } },
+        .data = path,
+    };
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: file path too long", resp.message);
+}
+
 test "kittygfx default format is rgba" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -567,4 +1074,632 @@ test "kittygfx no response with no image ID or number load and display" {
         const resp = execute(alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
+}
+
+test "kittygfx placement at the cursor after a full reset is drawn and kept" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // RIS: the page reset marks every tracked pin garbage, the cursor's
+    // included, and display() tracks a copy of the cursor pin.
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    const cmds = [_][]const u8{
+        // Transmit and display at the home position. C=1 keeps the cursor
+        // there, so the second placement copies the same cursor pin.
+        "a=T,f=24,t=d,i=1,p=1,s=1,v=2,c=1,r=1,C=1,q=2;////////",
+        "a=p,i=1,p=2,c=1,r=1,C=1,q=2",
+    };
+    for (cmds, 1..) |str, expected| {
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+
+        // Every placement so far must have a rect (be drawn) and survive
+        // the garbage sweep in the next addPlacement.
+        try testing.expectEqual(expected, storage.placements.count());
+        const img = storage.imageById(1).?;
+        var it = storage.placements.iterator();
+        while (it.next()) |entry| {
+            try testing.expect(entry.value_ptr.rect(img, &t) != null);
+        }
+    }
+}
+
+test "kittygfx display clamps cell offsets" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50; // 10 px per col
+    t.height_px = 100; // 20 px per row
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=2,r=1,X=99,Y=99,C=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(resp.ok());
+
+    const storage = &t.screens.active.kitty_images;
+    var it = storage.placements.iterator();
+    const placement = (it.next() orelse return error.TestExpectedPlacement).value_ptr;
+    try testing.expectEqual(@as(u32, 9), placement.x_offset);
+    try testing.expectEqual(@as(u32, 19), placement.y_offset);
+
+    const actual = placement.calculatedSize(storage.imageById(1).?, &t);
+    try testing.expectEqual(@as(u32, 11), actual.width);
+    try testing.expectEqual(@as(u32, 1), actual.height);
+}
+
+test "kittygfx placement bounds cursor movement for untrusted dimensions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // q=2 keeps the response null, so nothing below unwraps an optional.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=4294967295,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
+
+    // Reaching the bottom takes four rows, then scrolling is capped at one
+    // screen (five rows), and the image reaches the right edge, so the
+    // cursor wraps to the first column.
+    try testing.expectEqual(@as(usize, 10), t.screens.active.pages.scrollbar().total);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+}
+
+test "kittygfx placement moves cursor past a tall image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Load a one-pixel RGB image, then place it over the full width and eight
+    // rows. Eight rows are taller than the screen but still within Kitty's
+    // scroll budget. q=2 keeps every response null.
+    const cmds = [_][]const u8{
+        "a=t,t=d,f=24,i=1,s=1,v=1,q=2;////",
+        "a=p,i=1,p=1,c=5,r=8,q=2",
+
+        // A subsequent placement begins immediately after the first one
+        // instead of overlapping its last row.
+        "a=p,i=1,p=2,C=1,q=2",
+    };
+    for (cmds) |str| {
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    const first = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }) orelse return error.TestExpectedPlacement;
+    const second = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 2 },
+    }) orelse return error.TestExpectedPlacement;
+    const pages = &t.screens.active.pages;
+    const first_y = pages.pointFromPin(.screen, first.location.pin.*).?.screen.y;
+    const second_y = pages.pointFromPin(.screen, second.location.pin.*).?.screen.y;
+    try testing.expectEqual(first_y + 8, second_y);
+    try testing.expectEqual(@as(usize, 0), second.location.pin.x);
+}
+
+test "kittygfx placement scrolls at most one screen past a tall image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_]struct {
+        cmd: []const u8,
+        total: usize,
+        // The row after the image's last row the cursor ends on, if it
+        // reaches it: 0 for the last row, 1 when the image wraps.
+        after: ?usize,
+    }{
+        // Eight full-width rows on a five-row screen: seven moves down and
+        // the wrap make four moves to the bottom and four scrolls. That is
+        // within the bound, and the cursor ends below the image.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=5,r=8,q=2;////", .total = 9, .after = 1 },
+
+        // The tallest one-column image the bound leaves alone: four moves
+        // and five scrolls end on its last row.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=10,q=2;////", .total = 10, .after = 0 },
+
+        // A thousand rows stop at the same nine calls.
+        .{ .cmd = "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1000,q=2;////", .total = 10, .after = null },
+    };
+
+    for (cases) |case| {
+        var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+
+        const cmd = try command.Parser.parseString(alloc, case.cmd);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        const screen = t.screens.active;
+        try testing.expectEqual(@as(usize, 1), screen.kitty_images.placements.count());
+        try testing.expectEqual(case.total, screen.pages.scrollbar().total);
+
+        if (case.after) |after| {
+            var it = screen.kitty_images.placements.iterator();
+            const placement = it.next().?.value_ptr;
+            const img = screen.kitty_images.imageById(1).?;
+            const top = screen.pages.pointFromPin(.screen, placement.location.pin.*).?.screen.y;
+            const cursor = screen.pages.pointFromPin(.screen, screen.cursor.page_pin.*).?.screen.y;
+            try testing.expectEqual(top + placement.gridSize(img, &t).rows - 1 + after, cursor);
+        }
+    }
+}
+
+test "kittygfx cursor movement after its own placement scrolled away" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A one-row screen without scrollback: a full-width image wraps the
+    // cursor to the next row, which scrolls the image's only row off the
+    // screen, deletes the placement and releases its pin.
+    var t = try Terminal.init(alloc, .{ .rows = 1, .cols = 5 });
+    defer t.deinit(alloc);
+    try t.switchScreenMode(.@"1049", true);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=5,r=1,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+}
+
+test "kittygfx a one-row image leaves the cursor on its row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Kitty moves the cursor down rows minus one, so an image on the bottom
+    // row scrolls nothing.
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    t.setCursorPos(5, 1);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=2,r=1,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.pages.scrollbar().total);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+}
+
+test "kittygfx placement above the scroll region scrolls the region" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Text in a scroll region on the last two rows. Setting the margins
+    // homes the cursor, above the region.
+    t.setCursorPos(4, 1);
+    try t.printString("AAAAA");
+    t.setCursorPos(5, 1);
+    try t.printString("BBBBB");
+    t.setTopAndBottomMargin(4, 5);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+
+    // An eight-row image: the cursor moves down into the region and on to
+    // its bottom, and the rest scrolls the region empty.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=8,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("", str);
+}
+
+test "kittygfx cursor movement after a placement with the maximum column count" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=1,q=2;////",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
+
+    // The image reaches the right edge, so the cursor wraps to the next
+    // row's first column.
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+}
+
+test "kittygfx stays disabled after a full reset with a zero storage limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // `image-storage-limit = 0`, applied to every screen as Termio does.
+    var it = t.screens.all.iterator();
+    while (it.next()) |entry| {
+        const screen = entry.value.*;
+        try screen.kitty_images.setLimit(alloc, screen, 0);
+    }
+
+    // RIS (`ESC c`).
+    t.fullReset();
+
+    // A disabled protocol answers nothing and stores nothing.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1;////",
+    );
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.kitty_images.images.count());
+}
+
+test "kittygfx retransmit same id removes existing placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    // q=1 answers only failures, so every command below returns null.
+    const Run = struct {
+        fn run(term: *Terminal, str: []const u8) !void {
+            const a = std.testing.allocator;
+            const cmd = try command.Parser.parseString(a, str);
+            defer cmd.deinit(a);
+            try std.testing.expect(execute(a, term, &cmd) == null);
+        }
+    };
+
+    // Transmit and display an image, then add an anonymous and a named
+    // placement. Several anonymous placements of one image are valid.
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;////////");
+    try Run.run(&t, "a=p,i=1,C=1,q=1");
+    try Run.run(&t, "a=p,i=1,p=7,C=1,q=1");
+    try testing.expectEqual(@as(usize, 3), storage.placements.count());
+    try testing.expectEqual(tracked + 3, t.screens.active.pages.countTrackedPins());
+
+    // Retransmitting replaces the image and deletes every placement it
+    // had. a=t creates none of its own.
+    try Run.run(&t, "a=t,t=d,f=24,i=1,s=1,v=2,q=1;AAAAAAAA");
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expect(storage.imageById(1) != null);
+
+    // a=T deletes the previous image and its placements before it adds
+    // one, so a program that draws every frame this way keeps one.
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;////////");
+    try Run.run(&t, "a=T,t=d,f=24,i=1,s=1,v=2,C=1,q=1;AAAAAAAA");
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+}
+
+test "kittygfx retransmit same id removes image on first chunk" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    // Store and display the old image.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,t=d,f=24,i=1,s=1,v=2,C=1;////////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+    }
+    try testing.expect(storage.imageById(1) != null);
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    try testing.expectEqual(
+        tracked + 1,
+        t.screens.active.pages.countTrackedPins(),
+    );
+
+    // Starting a replacement for the same explicit ID removes the old image
+    // and placements before the replacement's final chunk arrives.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,i=1,s=1,v=2,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading != null);
+    try testing.expect(storage.imageById(1) == null);
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "kittygfx unknown format responds with EINVAL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=42,t=d,i=31,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(!resp.ok());
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: unsupported format", resp.message);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx unknown format on query responds with EINVAL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=q,f=42,t=d,i=31,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(!resp.ok());
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: unsupported format", resp.message);
+}
+
+test "kittygfx zero format is rgba" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Kitty treats f=0 as an absent f, i.e. RGBA.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=0,t=d,i=1,s=1,v=2,c=10,r=1;///////////",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+    try testing.expect(resp.ok());
+
+    const img = t.screens.active.kitty_images.imageById(1) orelse return error.TestExpectedImage;
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+}
+
+test "kittygfx unknown format with q=3 has no response" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // q above 2 is out of range in the spec but Kitty suppresses
+    // everything for anything above 1, so we must still parse it.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=42,t=d,i=31,q=3,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+}
+
+test "kittygfx out of range display keys are tolerated" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,f=24,t=d,i=31,s=1,v=1,C=2,U=2;AAAA",
+        );
+        defer cmd.deinit(alloc);
+
+        const resp = execute(alloc, &t, &cmd) orelse return error.TestExpectedResponse;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 31), resp.id);
+    }
+
+    // U=2 must behave like U=1, so the placement is virtual.
+    const storage = &t.screens.active.kitty_images;
+    var it = storage.placements.iterator();
+    const entry = it.next() orelse return error.TestExpectedPlacement;
+    try testing.expect(entry.value_ptr.location == .virtual);
+}
+
+/// Executes each command and expects the response it gives: an OK response
+/// with `id`, or none for null.
+fn testExecuteIds(
+    t: *Terminal,
+    cases: []const struct { []const u8, ?u32 },
+) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    for (cases) |case| {
+        const cmd = try command.Parser.parseString(alloc, case[0]);
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, t, &cmd);
+        const id = case[1] orelse {
+            try testing.expect(resp == null);
+            continue;
+        };
+        const r = resp orelse return error.TestExpectedResponse;
+        try testing.expect(r.ok());
+        try testing.expectEqual(id, r.id);
+    }
+}
+
+test "kittygfx number-based transmission assigns smallest free id" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    try testExecuteIds(&t, &.{
+        // Empty storage: the first free ID is 1, as in Kitty.
+        .{ "a=t,f=24,s=1,v=1,I=42;/wAA", 1 },
+
+        // Occupy ID 2 explicitly; the next number gets 3.
+        .{ "a=t,f=24,s=1,v=1,i=2;/wAA", 2 },
+        .{ "a=t,f=24,s=1,v=1,I=43;/wAA", 3 },
+
+        // Deleting ID 1 opens a gap that the next number fills.
+        .{ "a=d,d=I,i=1", null },
+        .{ "a=t,f=24,s=1,v=1,I=44;/wAA", 1 },
+    });
+
+    try testing.expectEqual(@as(usize, 3), storage.images.count());
+    try testing.expectEqual(@as(u32, 44), storage.imageById(1).?.number);
+    try testing.expectEqual(@as(u32, 0), storage.imageById(2).?.number);
+    try testing.expectEqual(@as(u32, 43), storage.imageById(3).?.number);
+}
+
+test "kittygfx number-based id assignment does not replace client image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    try testExecuteIds(&t, &.{
+        // A client stores and places a red pixel on the ID the old wrapping
+        // counter would assign first.
+        .{ "a=t,f=24,s=1,v=1,i=2147483647;/wAA", 2147483647 },
+        .{ "a=p,i=2147483647,C=1", 2147483647 },
+
+        // A number-based transmission must not collide with it.
+        .{ "a=t,f=24,s=1,v=1,I=42;AAD/", 1 },
+    });
+
+    // The client's image and placement are untouched.
+    try testing.expectEqual(@as(usize, 2), storage.images.count());
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    const img = storage.imageById(2147483647) orelse return error.TestExpectedImage;
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, img.data);
+}
+
+test "kittygfx implicit id assignment does not replace client image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    try testExecuteIds(&t, &.{
+        // A client stores and places a red pixel on the ID the implicit
+        // counter assigns first.
+        .{ "a=t,f=24,s=1,v=1,i=2147483647;/wAA", 2147483647 },
+        .{ "a=p,i=2147483647,C=1", 2147483647 },
+
+        // Transmit without an ID or number: no response, and the counter
+        // skips over the in-use ID instead of replacing that image.
+        .{ "a=t,f=24,s=1,v=1;AAD/", null },
+    });
+
+    try testing.expectEqual(@as(usize, 2), storage.images.count());
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    const img = storage.imageById(2147483647) orelse return error.TestExpectedImage;
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, img.data);
+    const implicit = storage.imageById(2147483648) orelse return error.TestExpectedImage;
+    try testing.expect(implicit.implicit_id);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, implicit.data);
+}
+
+test "kittygfx jpeg format f=101 transmit and display" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AP7//2Q==";
+    const cmd_str = "a=T,t=d,f=101,i=1,q=0;" ++ b64;
+    const cmd = try command.Parser.parseString(alloc, cmd_str);
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+
+    const storage = &t.screens.active.kitty_images;
+    const img = storage.imageById(1).?;
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+    try testing.expectEqual(@as(u32, 1), img.width);
+    try testing.expectEqual(@as(u32, 1), img.height);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, img.data);
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+}
+
+test "kittygfx jpeg format f=101 query" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=q,t=d,f=101,i=42,q=0;AAAA");
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(u32, 42), resp.id);
 }

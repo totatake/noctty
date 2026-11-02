@@ -50,6 +50,74 @@ pub fn childRect(x: i32, y: i32, width: i32, height: i32) RECT {
     };
 }
 
+pub fn rectInset(rect: RECT, inset_x: i32, inset_y: i32) RECT {
+    return .{
+        .left = rect.left + inset_x,
+        .top = rect.top + inset_y,
+        .right = rect.right - inset_x,
+        .bottom = rect.bottom - inset_y,
+    };
+}
+
+pub fn rectUnion(a: RECT, b: RECT) RECT {
+    return .{
+        .left = @min(a.left, b.left),
+        .top = @min(a.top, b.top),
+        .right = @max(a.right, b.right),
+        .bottom = @max(a.bottom, b.bottom),
+    };
+}
+
+pub fn rectOffset(rect: RECT, dx: i32, dy: i32) RECT {
+    return .{
+        .left = rect.left + dx,
+        .top = rect.top + dy,
+        .right = rect.right + dx,
+        .bottom = rect.bottom + dy,
+    };
+}
+
+pub const TabButtonPlacement = struct { top: i32, height: i32 };
+
+/// Keep the restored truncation and bottom edge exact: the parent owns the
+/// underline below the buttons, including any fractional-DPI remainder.
+pub fn tabButtonPlacement(tab_height: i32, dpi: u32, flush_top: bool) TabButtonPlacement {
+    const inset = scaledBy(3, dpi);
+    const height = @max(1, tab_height - scaledBy(6, dpi));
+    return if (flush_top)
+        .{ .top = 0, .height = inset + height }
+    else
+        .{ .top = inset, .height = height };
+}
+
+test "TABGAP placement preserves restored pixels and the underline lane" {
+    const Case = struct { dpi: u32, row: i32, top: i32, height: i32, bottom: i32, underline: i32 };
+    const cases = [_]Case{
+        .{ .dpi = 96, .row = 40, .top = 3, .height = 34, .bottom = 37, .underline = 37 },
+        .{ .dpi = 110, .row = 45, .top = 3, .height = 39, .bottom = 42, .underline = 42 },
+        .{ .dpi = 120, .row = 50, .top = 3, .height = 43, .bottom = 46, .underline = 47 },
+        .{ .dpi = 137, .row = 57, .top = 4, .height = 49, .bottom = 53, .underline = 53 },
+        .{ .dpi = 144, .row = 60, .top = 4, .height = 51, .bottom = 55, .underline = 56 },
+        .{ .dpi = 168, .row = 70, .top = 5, .height = 60, .bottom = 65, .underline = 65 },
+        .{ .dpi = 192, .row = 80, .top = 6, .height = 68, .bottom = 74, .underline = 74 },
+        .{ .dpi = 288, .row = 120, .top = 9, .height = 102, .bottom = 111, .underline = 111 },
+    };
+    for (cases) |case| {
+        const restored = tabButtonPlacement(case.row, case.dpi, false);
+        try std.testing.expectEqual(case.top, restored.top);
+        try std.testing.expectEqual(case.height, restored.height);
+        const maximized = tabButtonPlacement(case.row, case.dpi, true);
+        try std.testing.expectEqual(@as(i32, 0), maximized.top);
+        try std.testing.expectEqual(case.bottom, maximized.height);
+        try std.testing.expect(maximized.top + maximized.height <= case.underline);
+        // The undecorated Win11 row is 8 DIP shorter; identical insets.
+        const compact_row = @divTrunc(32 * @as(i32, @intCast(case.dpi)), 96);
+        const compact = tabButtonPlacement(compact_row, case.dpi, true);
+        try std.testing.expectEqual(@as(i32, 0), compact.top);
+        try std.testing.expectEqual(case.top + compact_row - @divTrunc(6 * @as(i32, @intCast(case.dpi)), 96), compact.height);
+    }
+}
+
 pub fn layoutRectToWin32(rect: win32_layout.Rect) RECT {
     return .{
         .left = rect.left,
@@ -439,16 +507,27 @@ pub const banner_dismiss_width_base: i32 = 72;
 pub const banner_open_release_width_base: i32 = 102;
 pub const banner_install_width_base: i32 = 86;
 
+/// The widths at 96 DPI of a banner's buttons (see `HostBannerParts`), or
+/// null for a button it does not have.
+const BannerButtonWidths = struct { dismiss: ?i32 = null, primary: ?i32 = null };
+
+fn bannerButtonWidths(actions: BannerActions) BannerButtonWidths {
+    return switch (actions) {
+        .mode => .{},
+        .close => .{ .dismiss = banner_close_width_base },
+        .update => .{ .dismiss = banner_dismiss_width_base, .primary = banner_open_release_width_base },
+        .update_staged => .{ .dismiss = banner_dismiss_width_base, .primary = banner_install_width_base },
+    };
+}
+
 /// The width a banner needs for a line `text_width` pixels wide and its
 /// buttons, before the content area bounds it.
 pub fn hostBannerWidth(text_width: i32, actions: BannerActions, dpi: u32) i32 {
     const gap = scaledBy(banner_button_gap_base, dpi);
-    const buttons = switch (actions) {
-        .mode => 0,
-        .close => scaledBy(banner_close_width_base, dpi),
-        .update => scaledBy(banner_open_release_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
-        .update_staged => scaledBy(banner_install_width_base, dpi) + gap + scaledBy(banner_dismiss_width_base, dpi),
-    };
+    const widths = bannerButtonWidths(actions);
+    var buttons: i32 = 0;
+    if (widths.dismiss) |base| buttons += scaledBy(base, dpi);
+    if (widths.primary) |base| buttons += scaledBy(base, dpi) + gap;
     return scaledBy(banner_text_left_base, dpi) + @max(0, text_width) + gap + buttons + gap;
 }
 
@@ -487,17 +566,15 @@ pub fn hostBannerParts(width: i32, height: i32, actions: BannerActions, dpi: u32
     const gap = scaledBy(banner_button_gap_base, dpi);
 
     var right = w - gap;
-    const dismiss_w = scaledBy(switch (actions) {
-        .mode => 0,
-        .close => banner_close_width_base,
-        .update, .update_staged => banner_dismiss_width_base,
-    }, dpi);
-    const dismiss = if (actions == .mode) null else bannerButtonRect(&right, dismiss_w, button_top, button_h, gap);
-    const primary: ?RECT = switch (actions) {
-        .close, .mode => null,
-        .update => bannerButtonRect(&right, scaledBy(banner_open_release_width_base, dpi), button_top, button_h, gap),
-        .update_staged => bannerButtonRect(&right, scaledBy(banner_install_width_base, dpi), button_top, button_h, gap),
-    };
+    const widths = bannerButtonWidths(actions);
+    const dismiss: ?RECT = if (widths.dismiss) |base|
+        bannerButtonRect(&right, scaledBy(base, dpi), button_top, button_h, gap)
+    else
+        null;
+    const primary: ?RECT = if (widths.primary) |base|
+        bannerButtonRect(&right, scaledBy(base, dpi), button_top, button_h, gap)
+    else
+        null;
     const text_left = @min(w, scaledBy(banner_text_left_base, dpi));
     return .{
         .stripe = .{ .left = 0, .top = 0, .right = @min(w, scaledBy(banner_stripe_width_base, dpi)), .bottom = h },

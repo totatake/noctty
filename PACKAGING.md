@@ -333,7 +333,8 @@ Recommended order:
 9. Confirm follow-on publishes:
    - Scoop manifest update
    - WinGet submission
-   - Chocolatey package push
+   - Chocolatey package push (the step is skipped while the repository
+     variable `CHOCOLATEY_PUBLISH` is `off`)
 
 If a tag already exists and the workflow failed before publish, configure
 the missing signing secrets and then rerun the failed `Release` workflow or
@@ -378,18 +379,28 @@ to `bucket/noctty.json` when `SCOOP_BUCKET_MANIFEST_PATH` is unset.
 
 ### Chocolatey
 
-- Secret: `CHOCO_API_KEY`
+- Secret: `CHOCO_API_KEY` (in the `release` environment)
+- Optional repo variable: `CHOCOLATEY_PUBLISH` (`off` skips the push; it is
+  unset, so the push runs)
 - Package id: `noctty`
 
-The release workflow always generates the Chocolatey package metadata, and
-its Chocolatey step runs after Scoop and WinGet, so a refusal there cannot hold
-them back. It skips `choco pack` and `choco push` cleanly when
-`CHOCO_API_KEY` is absent. Until a first version is approved, which can take
-weeks, chocolatey.org refuses further pushes with `403`, and that step fails
-after everything else has published.
-[docs/chocolatey-publishing.md](docs/chocolatey-publishing.md) has the
-maintainer's steps for the first submission and for resubmitting a version
-during moderation; do not rerun a published Release for that. To push a
+The package is published: users install with `choco install noctty`
+(chocolatey.org approved 1.3.134 on 2026-10-23, and the `CHOCOLATEY_PUBLISH`
+variable was deleted that day). The release workflow always generates the
+Chocolatey package metadata, and its Chocolatey step runs after Scoop and
+WinGet, so a refusal there cannot hold them back. It skips `choco pack` and
+`choco push` cleanly when `CHOCO_API_KEY` is absent, and the step does not run
+while `CHOCOLATEY_PUBLISH` is `off`. The package carries both installers, and
+its install script picks one by asking the CPU, because Chocolatey runs as an
+emulated x64 process on ARM64 Windows. chocolatey.org reviews each version
+before listing it, so a release can reach Chocolatey after the other channels,
+and it refuses the push with `403` while another account owns the id, or while
+a version is in moderation and none is approved; the step then fails after
+the GitHub Release and the Scoop update are published and the WinGet manifest
+update is submitted; the release does not wait for WinGet to accept it.
+[docs/chocolatey-publishing.md](docs/chocolatey-publishing.md) has the id's
+state, how to turn the push off and back on, and the steps for resubmitting a
+version during moderation; do not rerun a published Release for that. To push a
 version that is already released, dispatch the **Chocolatey Publish**
 workflow (`.github/workflows/chocolatey-publish.yml`, `version` input; `push`
 off is a dry run that verifies the release and packs); it verifies the
@@ -401,8 +412,9 @@ choco pack .\noctty.nuspec --output-directory .\out
 choco push .\out\noctty.<version>.nupkg --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
 ```
 
-Creating the chocolatey.org account and configuring its API key remain
-maintainer steps outside this repository.
+The chocolatey.org account and its API key (stored on 2026-10-17) are the
+maintainer's, outside this repository. `virtualex`, who created the package,
+stays a co-maintainer of the id.
 
 ## Zig version
 

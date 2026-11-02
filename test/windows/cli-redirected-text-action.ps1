@@ -10,6 +10,11 @@ param(
     [int] $TimeoutSeconds = 5
 )
 
+. (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
+$windowsHarnessHistoryGuard = Start-WindowsHarnessHistoryGuard -Harness 'cli-redirected-text-action.ps1'
+try {
+
+
 $ErrorActionPreference = 'Stop'
 
 if ($TimeoutSeconds -le 0) {
@@ -78,3 +83,7 @@ finally {
 }
 
 Write-Host "redirected CLI action validation: PASS (action=$Action, expected=$ExpectedText)"
+
+} finally {
+    Assert-WindowsHarnessHistoryGuard -Guard $windowsHarnessHistoryGuard
+}

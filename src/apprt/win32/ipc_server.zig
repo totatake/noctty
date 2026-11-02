@@ -101,12 +101,6 @@ pub fn resolveIpcPipeNameForTarget(
     };
 }
 
-/// Connect to the single-instance IPC pipe as a client.
-///
-/// `error.FileNotFound` and `error.PipeUnreachable` both mean "there is no
-/// instance we can talk to"; callers must treat them the same and fall back
-/// to running locally. They are kept distinct only so the unreachable case
-/// can be logged differently.
 /// Backing store for a copied SID. `SECURITY_MAX_SID_SIZE` is 68 bytes, so
 /// 256 is ample. The alignment is required, not cosmetic: a `SID` ends in an
 /// array of `DWORD` sub-authorities, and `EqualSid` reads them as such.
@@ -149,12 +143,9 @@ fn tokenUserSidBytes(
     return buf[0..sid_len];
 }
 
-/// Mandatory integrity level of a token, as an `S-1-16-<rid>` RID.
-///
-/// Unlike `allocIpcPipeIntegritySid` this reports EVERY level including
-/// medium and below, because the comparison below needs the actual value
-/// rather than "is it above medium".
-fn tokenIntegrityRid(token: windows.HANDLE) ?u32 {
+/// The token's mandatory integrity label SID as a string, or null when the
+/// token or the conversion fails. OS-allocated; free it with `sys.LocalFree`.
+fn tokenIntegritySidString(token: windows.HANDLE) ?[*:0]u16 {
     var label_buf: [256]u8 align(@alignOf(sys.TOKEN_MANDATORY_LABEL)) = undefined;
     var label_len: u32 = 0;
     if (sys.GetTokenInformation(
@@ -168,9 +159,14 @@ fn tokenIntegrityRid(token: windows.HANDLE) ?u32 {
 
     var sid_string: ?[*:0]u16 = null;
     if (sys.ConvertSidToStringSidW(label.Label.Sid, &sid_string) == 0) return null;
-    const sid = sid_string orelse return null;
-    defer _ = sys.LocalFree(@ptrCast(sid));
+    return sid_string;
+}
 
+/// Mandatory integrity level of a token, as an `S-1-16-<rid>` RID: the
+/// numeric value, which the comparison below needs.
+fn tokenIntegrityRid(token: windows.HANDLE) ?u32 {
+    const sid = tokenIntegritySidString(token) orelse return null;
+    defer _ = sys.LocalFree(@ptrCast(sid));
     return integrityRidFromSidString(std.mem.span(sid));
 }
 
@@ -293,12 +289,15 @@ fn descriptorIntegrityRidFromSddl(sddl: []const u16) error{InvalidSecurityDescri
     // The producer always emits an explicit label. Missing or unknown labels
     // must fail closed; otherwise a low-integrity same-user squatter can rely
     // on Windows' implicit-medium interpretation and impersonate our server.
-    if (std.mem.indexOf(u16, sddl, std.unicode.utf8ToUtf16LeStringLiteral("(ML;")) != null) {
-        return error.InvalidSecurityDescriptor;
-    }
     return error.InvalidSecurityDescriptor;
 }
 
+/// Connect to the single-instance IPC pipe as a client.
+///
+/// `error.FileNotFound` and `error.PipeUnreachable` both mean "there is no
+/// instance we can talk to"; callers must treat them the same and fall back
+/// to running locally. They are kept distinct only so the unreachable case
+/// can be logged differently.
 fn connectToIpcPipe(
     alloc: Allocator,
     pipe_name: [:0]const u16,
@@ -393,6 +392,42 @@ pub fn sendNewWindowIpc(
     arguments: ?[]const [:0]const u8,
     response_timeout_ms: u64,
 ) !bool {
+    return sendNewWindowIpcGranting(alloc, pipe_name, elevated, arguments, response_timeout_ms, null);
+}
+
+/// Lets a process take the foreground (`AllowSetForegroundWindow`); false
+/// when Windows refused.
+const ForegroundGrant = *const fn (process_id: windows.DWORD) bool;
+
+fn allowSetForegroundWindow(process_id: windows.DWORD) bool {
+    return sys.AllowSetForegroundWindow(process_id) != 0;
+}
+
+/// Pass this process's foreground right to the server at the far end of
+/// `pipe`, which `connectToIpcPipe` has authenticated (same user, at least
+/// this integrity level). Best effort: without it the receiver still selects
+/// the tab, and Windows only flashes its taskbar button.
+fn grantForegroundToPipeServer(pipe: windows.HANDLE, grant: ForegroundGrant) void {
+    var server_process_id: windows.DWORD = 0;
+    if (sys.GetNamedPipeServerProcessId(pipe, &server_process_id) == 0 or server_process_id == 0) {
+        log.info("forwarded toast click: could not read the receiving process id", .{});
+        return;
+    }
+    if (!grant(server_process_id))
+        log.info("forwarded toast click: Windows did not let pid={d} take the foreground", .{server_process_id});
+}
+
+/// `sendNewWindowIpc`, first granting the receiver the foreground when
+/// `grant` is set (a forwarded toast click: COM gave the foreground right to
+/// this process, which is about to exit, not to the one that shows the tab).
+fn sendNewWindowIpcGranting(
+    alloc: Allocator,
+    pipe_name: [:0]const u16,
+    elevated: bool,
+    arguments: ?[]const [:0]const u8,
+    response_timeout_ms: u64,
+    grant: ?ForegroundGrant,
+) !bool {
     const pipe = connectToIpcPipe(alloc, pipe_name, elevated) catch |err| switch (err) {
         error.FileNotFound, error.UntrustedIpcServer => return false,
         // No instance we are allowed to talk to. Report "not forwarded" so
@@ -408,6 +443,10 @@ pub fn sendNewWindowIpc(
         else => return err,
     };
     defer _ = windows.CloseHandle(pipe);
+
+    // Before the request: the receiver presents the window as soon as it
+    // reads it.
+    if (grant) |allow| grantForegroundToPipeServer(pipe, allow);
 
     const request = try win32_ipc.encodeNewWindowRequest(alloc, arguments);
     defer alloc.free(request);
@@ -613,6 +652,9 @@ pub fn automationTextAllowed(text: []const u8) bool {
 ///     are resolved by font discovery. Excluded on the admission rule rather
 ///     than because a concrete exploit is known.
 ///
+/// A key the runtime reads from the app's config for every window is not
+/// admitted either (`forwarded_argv_app_wide_keys`).
+///
 /// `working-directory` is handled separately: it is admitted, but its VALUE
 /// is constrained by `forwardedWorkingDirectoryAllowed`.
 const forwarded_argv_allowed_keys = [_][]const u8{
@@ -626,14 +668,8 @@ const forwarded_argv_allowed_keys = [_][]const u8{
     "window-padding-balance",
     "window-padding-color",
     "window-decoration",
-    "window-theme",
-    "accent-follow-system",
     "window-colorspace",
     "window-subtitle",
-    "window-titlebar-background",
-    "window-titlebar-foreground",
-    "window-show-tab-bar",
-    "window-new-tab-position",
     "window-step-resize",
     "window-vsync",
     "maximize",
@@ -663,7 +699,6 @@ const forwarded_argv_allowed_keys = [_][]const u8{
     "background-blur",
     "unfocused-split-opacity",
     "unfocused-split-fill",
-    "split-divider-color",
     "bold-color",
     "faint-opacity",
     "minimum-contrast",
@@ -687,6 +722,15 @@ fn forwardedArgumentKey(arg: []const u8) ?[]const u8 {
     return if (std.mem.indexOfScalar(u8, body, '=')) |idx| body[0..idx] else body;
 }
 
+/// True when a forwarded argv sets config `key`, whatever its value.
+pub fn forwardedArgvSetsKey(argv: []const [:0]const u8, key: []const u8) bool {
+    for (argv) |arg| {
+        const set = forwardedArgumentKey(arg) orelse continue;
+        if (std.mem.eql(u8, set, key)) return true;
+    }
+    return false;
+}
+
 /// True when a forwarded config key is on the allowlist. `working-directory`
 /// is included here; its value is checked separately.
 pub fn forwardedKeyAllowed(key: []const u8) bool {
@@ -695,6 +739,52 @@ pub fn forwardedKeyAllowed(key: []const u8) bool {
         if (std.mem.eql(u8, key, allowed)) return true;
     }
     return false;
+}
+
+/// Presentation keys the Win32 runtime reads from the app's config for every
+/// window, so a forwarded value would be accepted and ignored: the theme and
+/// split divider (`resolveTheme`), `accent-follow-system` (which no longer
+/// has any effect but still parses), the titlebar colors
+/// (`clientTitlebarTheme`, `applyDwmThemeWithBuild`), the tab bar
+/// (`Host.shouldShowTabBar`, `App.tab_bar_visible`) and where a new tab goes
+/// (`windowNewTabInsertIndex`). They stay off the allowlist until a window
+/// can have its own, and the senders leave them out instead of having the
+/// whole request refused (`withoutAppWideArguments`,
+/// `normalizeForwardedStartupArg`).
+const forwarded_argv_app_wide_keys = [_][]const u8{
+    "window-theme",
+    "accent-follow-system",
+    "window-titlebar-background",
+    "window-titlebar-foreground",
+    "split-divider-color",
+    "window-show-tab-bar",
+    "window-new-tab-position",
+};
+
+fn forwardedKeyAppWide(key: []const u8) bool {
+    for (forwarded_argv_app_wide_keys) |app_wide| {
+        if (std.mem.eql(u8, key, app_wide)) return true;
+    }
+    return false;
+}
+
+/// `arguments` without the keys of `forwarded_argv_app_wide_keys`, each named
+/// in a warning, so `+new-window` with one still opens its window, as a
+/// second launch does. Allocated with `alloc`.
+pub fn withoutAppWideArguments(
+    alloc: Allocator,
+    arguments: ?[]const [:0]const u8,
+) Allocator.Error!?[]const [:0]const u8 {
+    const argv = arguments orelse return null;
+    var kept: std.ArrayList([:0]const u8) = try .initCapacity(alloc, argv.len);
+    for (argv) |arg| {
+        if (forwardedArgumentKey(arg)) |key| if (forwardedKeyAppWide(key)) {
+            log.warn("not forwarding --{s}: the running instance applies it to all of its windows", .{key});
+            continue;
+        };
+        kept.appendAssumeCapacity(arg);
+    }
+    return try kept.toOwnedSlice(alloc);
 }
 
 /// True when a key is safe to echo into a log line.
@@ -717,7 +807,7 @@ fn forwardedKeyLoggable(key: []const u8) bool {
 /// Returns true when a forwarded `--working-directory` value is one the
 /// server is willing to honor.
 ///
-/// The startup forwarder always sends the launching process's realpath'd cwd
+/// The startup forwarder sends the launching process's realpath'd cwd
 /// (`collectStartupForwardArguments`), so this key cannot be rejected
 /// outright without breaking every single-instance launch. It is instead
 /// constrained to the symbolic values, a home-relative path, or a local
@@ -843,29 +933,26 @@ pub fn sendLaunchLayoutIpc(
         0,
     );
     defer alloc.free(request);
-
-    const pipe = connectToIpcPipe(alloc, pipe_name, elevated) catch |err| switch (err) {
-        error.FileNotFound, error.PipeUnreachable, error.UntrustedIpcServer => return false,
-        error.PipeBusy => return error.IPCFailed,
-        else => return err,
-    };
-    defer _ = windows.CloseHandle(pipe);
-
-    try win32_ipc.setAutomationRequestDeadline(
-        request,
-        automationRequestDeadline(response_timeout_ms),
-    );
-    try win32_ipc.writeAll(.{ .handle = pipe }, request);
-    return try win32_ipc.readAckWithTimeout(pipe, std.math.maxInt(u64));
+    return sendAutomationAckRequest(alloc, pipe_name, elevated, request, response_timeout_ms);
 }
 
 fn trySendStartupLaunchLayoutIpc(
     alloc: Allocator,
     pipe_name: [:0]const u16,
     elevated: bool,
-    name: ?[]const u8,
+    request: App.StartupLaunchLayout,
 ) !?bool {
-    const layout_name = name orelse return null;
+    // A request this one cannot carry (its name lost, or one the layout
+    // request refuses) is not forwarded, and not handed to the generic argv
+    // forward either, which opens a plain window: this process opens it, and
+    // `run` reports the failure in its first window. An error here would end
+    // the launch in a failure dialog, its startup attempt unresolved.
+    const layout_name = switch (request) {
+        .none => return null,
+        .lost => return false,
+        .name => |name| name,
+    };
+    win32_ipc.validateLaunchLayoutName(layout_name) catch return false;
     return try sendLaunchLayoutIpc(
         alloc,
         pipe_name,
@@ -903,15 +990,6 @@ pub fn scanLaunchLayoutIpcArgument(
     return .none;
 }
 
-/// Apply a forwarded `new_window` argv to `config`.
-///
-/// Returns `error.ForbiddenForwardedArgument` for the whole request if any
-/// argument is rejected. Dropping individual keys silently would leave the
-/// caller with a window that does not match what was asked for, and would
-/// make an attacker's probe indistinguishable from a normal launch.
-///
-/// This function does not log, so that it stays a pure predicate over argv
-/// and can be unit tested; every caller logs the rejection it handles.
 fn automationWorkingDirectoryValue(value: []const u8) []const u8 {
     var result = std.mem.trim(u8, value, &std.ascii.whitespace);
     if (result.len >= 2 and result[0] == '"' and result[result.len - 1] == '"') {
@@ -951,6 +1029,15 @@ pub fn applyAutomationWorkingDirectory(config: *configpkg.Config, value: []const
     config.@"working-directory" = working_directory;
 }
 
+/// Apply a forwarded `new_window` argv to `config`.
+///
+/// Returns `error.ForbiddenForwardedArgument` for the whole request if any
+/// argument is rejected. Dropping individual keys silently would leave the
+/// caller with a window that does not match what was asked for, and would
+/// make an attacker's probe indistinguishable from a normal launch.
+///
+/// This function does not log, so that it stays a pure predicate over argv
+/// and can be unit tested; every caller logs the rejection it handles.
 pub fn applyNewWindowArguments(
     alloc_gpa: Allocator,
     config: *configpkg.Config,
@@ -1057,7 +1144,22 @@ fn allocForwardedWorkingDirectoryArg(
     );
 }
 
-fn collectStartupForwardArguments(alloc: Allocator) !?[]const [:0]const u8 {
+/// Whether a launch that names no `--working-directory=` forwards the
+/// directory it was started in, which a plain new window then starts in.
+/// Not when the launch's `default-profile` (from a config file, which the
+/// running instance reads too; a command-line one is not forwarded) pins a
+/// directory: that instance's default launch puts it there, as this launch's
+/// own first window would. The launcher's directory (System32 from Win+R,
+/// whatever a shortcut names) is nothing the user asked for, and a forwarded
+/// directory wins over the pinned one (`pane_launch.Origin.Fresh`).
+pub fn forwardsLauncherDirectory(config: *const configpkg.Config) bool {
+    if (configpkg.pane_launch.commandLineNamesProfile(config)) return true;
+    const profile = configpkg.pane_launch.defaultProfile(config) orelse return true;
+    const directory = profile.working_directory orelse return true;
+    return directory == .inherit;
+}
+
+fn collectStartupForwardArguments(alloc: Allocator, forward_cwd: bool) !?[]const [:0]const u8 {
     var iter = try cli_args.argsIterator(alloc);
     defer iter.deinit();
 
@@ -1077,7 +1179,7 @@ fn collectStartupForwardArguments(alloc: Allocator) !?[]const [:0]const u8 {
         }
     }
 
-    if (!working_directory_seen) {
+    if (forward_cwd and !working_directory_seen) {
         const cwd = std.fs.cwd();
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const wd = try cwd.realpath(".", &cwd_buf);
@@ -1192,24 +1294,7 @@ fn buildIpcPipeSddl(
 ///
 /// The returned string is OS-allocated; free it with `sys.LocalFree`.
 fn allocIpcPipeIntegritySid(token: windows.HANDLE) ![*:0]u16 {
-    var label_buf: [256]u8 align(@alignOf(sys.TOKEN_MANDATORY_LABEL)) = undefined;
-    var label_len: u32 = 0;
-    if (sys.GetTokenInformation(
-        token,
-        c.TokenIntegrityLevel,
-        &label_buf,
-        label_buf.len,
-        &label_len,
-    ) == 0) return error.IpcSecurityDescriptorFailed;
-    const label: *const sys.TOKEN_MANDATORY_LABEL = @ptrCast(&label_buf);
-
-    var sid_string: ?[*:0]u16 = null;
-    if (sys.ConvertSidToStringSidW(
-        label.Label.Sid,
-        &sid_string,
-    ) == 0) return error.IpcSecurityDescriptorFailed;
-    const sid = sid_string orelse return error.IpcSecurityDescriptorFailed;
-
+    const sid = tokenIntegritySidString(token) orelse return error.IpcSecurityDescriptorFailed;
     _ = integrityRidFromSidString(std.mem.span(sid)) orelse {
         _ = sys.LocalFree(@ptrCast(sid));
         return error.IpcSecurityDescriptorFailed;
@@ -1329,13 +1414,13 @@ fn ipcServerMain(
     while (true) {
         if (connectIpcClient(pipe, io_event, stop_event)) |connected| {
             if (!connected) return;
-            if (handleIpcClient(app, .{
+            handleIpcClient(app, .{
                 .handle = pipe,
                 .event = io_event,
                 .stop_event = stop_event,
-            })) |_| {} else |err| if (err != error.IpcStopped) {
+            }) catch |err| if (err != error.IpcStopped) {
                 log.warn("failed to process win32 IPC client err={}", .{err});
-            }
+            };
         } else |err| {
             // Includes a client that connected and left before this instance
             // was picked up; the instance cannot serve anyone else, so it is
@@ -1400,7 +1485,7 @@ fn createIpcServerEvent() ?windows.HANDLE {
     };
 }
 
-fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !win32_ipc.RequestKind {
+fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
     const kind = win32_ipc.decodeRequestKind(pipe) catch |err| {
         win32_ipc.writeAck(pipe, false) catch {};
         return err;
@@ -1468,7 +1553,6 @@ fn handleIpcClient(app: *App, pipe: win32_ipc.Pipe) !win32_ipc.RequestKind {
             try win32_ipc.writeAck(pipe, false);
         },
     }
-    return kind;
 }
 
 fn handleNewWindowIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
@@ -1485,13 +1569,7 @@ fn handleNewWindowIpcClient(app: *App, pipe: win32_ipc.Pipe) !void {
         return;
     }
 
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .new_window = .{
-        .arguments = arguments,
-    } }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .new_window = .{ .arguments = arguments } })) {
         return error.IPCFailed;
     }
 
@@ -1527,13 +1605,19 @@ fn handlePerformActionIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !v
         else => return err,
     };
     defer app.core_app.alloc.free(payload.action_text);
+    try ackAutomationAction(app, pipe, payload.target, payload.action_text, payload.deadline_ms);
+}
 
-    requestAutomationAction(
-        app,
-        payload.target,
-        payload.action_text,
-        payload.deadline_ms,
-    ) catch |err| {
+/// Run an automation action and answer the client: success, the status for
+/// a refusal it can act on, or the error for `handleIpcClient` to report.
+fn ackAutomationAction(
+    app: *App,
+    pipe: win32_ipc.Pipe,
+    target: apprt.ipc.AutomationActionTarget,
+    action_text: []const u8,
+    deadline_ms: u64,
+) !void {
+    requestAutomationAction(app, target, action_text, deadline_ms) catch |err| {
         const status: u8 = switch (err) {
             error.InvalidAutomationAction => win32_ipc.ack_invalid_automation_action,
             error.UnsafeAutomationAction => win32_ipc.ack_unsafe_automation_action,
@@ -1541,8 +1625,7 @@ fn handlePerformActionIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !v
             error.NoAutomationTarget => win32_ipc.ack_no_automation_target,
             else => return err,
         };
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+        return win32_ipc.writeAckStatus(pipe, status);
     };
     try win32_ipc.writeAck(pipe, true);
 }
@@ -1562,24 +1645,7 @@ fn handleLaunchLayoutIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !vo
         .{payload.name},
     );
     defer app.core_app.alloc.free(action_text);
-
-    requestAutomationAction(
-        app,
-        .focused,
-        action_text,
-        payload.deadline_ms,
-    ) catch |err| {
-        const status: u8 = switch (err) {
-            error.InvalidAutomationAction => win32_ipc.ack_invalid_automation_action,
-            error.UnsafeAutomationAction => win32_ipc.ack_unsafe_automation_action,
-            error.InvalidAutomationTarget => win32_ipc.ack_invalid_automation_target,
-            error.NoAutomationTarget => win32_ipc.ack_no_automation_target,
-            else => return err,
-        };
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationAction(app, pipe, .focused, action_text, payload.deadline_ms);
 }
 
 fn handleFocusIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1590,16 +1656,7 @@ fn handleFocusIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         },
         else => return err,
     };
-    requestAutomationCommand(
-        app,
-        .{ .focus = payload.target },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationCommand(app, pipe, .{ .focus = payload.target }, payload.deadline_ms);
 }
 
 fn handleSendTextIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1615,17 +1672,23 @@ fn handleSendTextIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         else => return err,
     };
     defer payload.deinit(app.core_app.alloc);
-    requestAutomationCommand(
-        app,
-        .{ .send_text = .{
-            .target = payload.target,
-            .text = payload.text,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
+    try ackAutomationCommand(app, pipe, .{ .send_text = .{
+        .target = payload.target,
+        .text = payload.text,
+    } }, payload.deadline_ms);
+}
+
+/// Run an automation command and answer the client: success, the status
+/// for a refusal it can act on, or the error for `handleIpcClient` to report.
+fn ackAutomationCommand(
+    app: *App,
+    pipe: win32_ipc.Pipe,
+    command: apprt.ipc.AutomationCommand,
+    deadline_ms: u64,
+) !void {
+    requestAutomationCommand(app, command, deadline_ms) catch |err| {
         const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+        return win32_ipc.writeAckStatus(pipe, status);
     };
     try win32_ipc.writeAck(pipe, true);
 }
@@ -1650,19 +1713,10 @@ fn handleNewTabIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_automation_policy_refused);
         return;
     };
-    requestAutomationCommand(
-        app,
-        .{ .new_tab = .{
-            .target = payload.target,
-            .working_directory = payload.working_directory,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
-    };
-    try win32_ipc.writeAck(pipe, true);
+    try ackAutomationCommand(app, pipe, .{ .new_tab = .{
+        .target = payload.target,
+        .working_directory = payload.working_directory,
+    } }, payload.deadline_ms);
 }
 
 fn handleNewSplitIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
@@ -1676,20 +1730,20 @@ fn handleNewSplitIpcClient(app: *App, pipe: win32_ipc.Pipe, timed: bool) !void {
         try win32_ipc.writeAckStatus(pipe, win32_ipc.ack_automation_policy_refused);
         return;
     };
-    requestAutomationCommand(
-        app,
-        .{ .new_split = .{
-            .target = payload.target,
-            .direction = payload.direction,
-            .working_directory = payload.working_directory,
-        } },
-        payload.deadline_ms,
-    ) catch |err| {
-        const status = automationCommandAckStatus(err) orelse return err;
-        try win32_ipc.writeAckStatus(pipe, status);
-        return;
+    try ackAutomationCommand(app, pipe, .{ .new_split = .{
+        .target = payload.target,
+        .direction = payload.direction,
+        .working_directory = payload.working_directory,
+    } }, payload.deadline_ms);
+}
+
+/// Hand `message` to the App's mailbox, giving up after the IPC I/O timeout.
+fn pushIpcMailboxMessage(app: *App, message: CoreApp.Message) bool {
+    const mailbox: CoreApp.Mailbox = .{
+        .rt_app = app,
+        .mailbox = &app.core_app.mailbox,
     };
-    try win32_ipc.writeAck(pipe, true);
+    return mailbox.push(message, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) != 0;
 }
 
 fn requestAutomationWindowListJson(
@@ -1704,11 +1758,7 @@ fn requestAutomationWindowListJson(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_window_list = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_window_list = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -1737,11 +1787,7 @@ fn requestAutomationAction(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_action = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_action = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -1763,11 +1809,7 @@ fn requestAutomationCommand(
     );
     defer request.release();
     request.retain(); // Mailbox-consumer ownership.
-    const mailbox: CoreApp.Mailbox = .{
-        .rt_app = app,
-        .mailbox = &app.core_app.mailbox,
-    };
-    if (mailbox.push(.{ .automation_command = request }, .{ .ns = win32_ipc.io_timeout_ms * std.time.ns_per_ms }) == 0) {
+    if (!pushIpcMailboxMessage(app, .{ .automation_command = request })) {
         request.release();
         return error.IPCFailed;
     }
@@ -1811,6 +1853,35 @@ fn serverAutomationDeadline(client_deadline_ms: u64) u64 {
     );
 }
 
+/// The one argument a cold toast activation start forwards: the click's
+/// launch string, rebuilt from what `Activate` delivered (the empty target
+/// when nothing readable came, which the receiver presents as its primary
+/// window). Caller owns the result.
+fn coldToastForwardArgument(alloc: Allocator, activation: ?win32_toast_activation.ActivationTarget) ![:0]u8 {
+    const launch = try win32_toast_activation.buildLaunchArg(alloc, activation orelse .{});
+    defer alloc.free(launch);
+    return alloc.dupeZ(u8, launch);
+}
+
+test "a cold toast activation start forwards the click, not its argv" {
+    const alloc = std.testing.allocator;
+    const target: win32_toast_activation.ActivationTarget = .{ .surface_id = 9, .tab_id = 2, .window_id = 1, .pid = 77, .action = .focus };
+    for ([_]?win32_toast_activation.ActivationTarget{ target, .{}, null }) |sent| {
+        const arg = try coldToastForwardArgument(alloc, sent);
+        defer alloc.free(arg);
+        // The receiver's new_window arm reads exactly this target, with
+        // nothing else to drop or apply.
+        const forwarded = [_][:0]const u8{arg};
+        const received = win32.scanForwardedToastActivation(&forwarded);
+        try std.testing.expect(received == .activation);
+        try std.testing.expect((sent orelse win32_toast_activation.ActivationTarget{}).eql(received.activation));
+        // It survives the sender's own normalization too.
+        const normalized = (try normalizeForwardedStartupArg(alloc, arg)).?;
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings(arg, normalized);
+    }
+}
+
 pub fn tryForwardStartupToExistingInstance(self: *App) !bool {
     if (self.config.@"single-instance" != .true) return false;
 
@@ -1821,10 +1892,28 @@ pub fn tryForwardStartupToExistingInstance(self: *App) !bool {
         self.core_app.alloc,
         pipe_name,
         self.is_elevated,
-        self.config.@"launch-layout",
+        self.startup_launch_layout,
     )) |forwarded| return forwarded;
 
-    const arguments = try collectStartupForwardArguments(self.core_app.alloc);
+    // A cold start by the toast activator forwards the click, never its own
+    // argv (`-ToastActivated -Embedding`), which would open a window there.
+    if (self.toast_activated) {
+        const launch_z = try coldToastForwardArgument(self.core_app.alloc, self.cold_toast_activation);
+        defer self.core_app.alloc.free(launch_z);
+        return try sendNewWindowIpcGranting(
+            self.core_app.alloc,
+            pipe_name,
+            self.is_elevated,
+            &.{launch_z},
+            win32_ipc.automation_response_timeout_ms,
+            allowSetForegroundWindow,
+        );
+    }
+
+    const arguments = try collectStartupForwardArguments(
+        self.core_app.alloc,
+        forwardsLauncherDirectory(&self.config),
+    );
     defer win32_ipc.freeOwnedArguments(self.core_app.alloc, arguments);
 
     return try sendNewWindowIpc(
@@ -1994,6 +2083,9 @@ test "win32 normalizeForwardedStartupArg drops class and normalizes working dire
 
     try std.testing.expect(try normalizeForwardedStartupArg(std.testing.allocator, "--class=dev") == null);
     try std.testing.expect(try normalizeForwardedStartupArg(std.testing.allocator, "--safe-mode") == null);
+    // A key the running instance would refuse is left out, so the launch
+    // still opens a window there: here one the app reads for every window.
+    try std.testing.expect(try normalizeForwardedStartupArg(std.testing.allocator, "--window-theme=light") == null);
 
     const inherit = (try normalizeForwardedStartupArg(std.testing.allocator, "--working-directory=inherit")).?;
     defer std.testing.allocator.free(inherit);
@@ -2037,6 +2129,25 @@ test "win32 new-window IPC rejects policy failures before acknowledgement" {
     try std.testing.expect(!newWindowIpcArgumentsAccepted(&.{
         "--working-directory=\\\\host\\share",
     }));
+}
+
+test "win32 new-window IPC refuses the user profile keys" {
+    // A profile is a command, a directory and environment variables: a
+    // forwarded argv must not define or change one in the running instance.
+    for ([_][:0]const u8{
+        "--profile-command=x: calc.exe",
+        "--profile-name=x: Calculator",
+        "--profile-working-directory=x: C:\\",
+        "--profile-env=x: PATH=C:\\evil",
+        "--elevated-profile-env=PATH=C:\\evil",
+        // Which profile a new window runs, and which ones the lists show.
+        "--default-profile=x",
+        "--profile-order=x",
+        "--profile-hidden=pwsh.exe",
+        "--visual-studio-profiles=all",
+    }) |arg| {
+        try std.testing.expect(!newWindowIpcArgumentsAccepted(&.{arg}));
+    }
 }
 
 test "win32 timed out automation request stays owned and cannot be claimed" {
@@ -2184,34 +2295,23 @@ test "win32 SDDL auto-inherit normalization keeps every access-bearing field" {
     }
 }
 
-test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+/// A pipe name no other test uses: `\\.\pipe\noctty-ipc-<tag>-<tick>`.
+fn testUniquePipeName(alloc: Allocator, comptime tag: []const u8) ![:0]u16 {
+    const name = try std.fmt.allocPrint(alloc, "\\\\.\\pipe\\noctty-ipc-" ++ tag ++ "-{d}", .{sys.GetTickCount64()});
+    defer alloc.free(name);
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, name);
+}
 
-    const alloc = std.testing.allocator;
-    const requested = try allocIpcPipeSecurityDescriptor();
-    defer _ = sys.LocalFree(requested);
-
+/// A non-blocking byte pipe that rejects remote clients, with `descriptor`
+/// attached.
+fn testCreateSecuredPipe(name: [:0]const u16, descriptor: *anyopaque) windows.HANDLE {
     var security_attributes: windows.SECURITY_ATTRIBUTES = .{
         .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = requested,
+        .lpSecurityDescriptor = descriptor,
         .bInheritHandle = windows.FALSE,
     };
-
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        alloc,
-        "\\\\.\\pipe\\noctty-ipc-sddl-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer alloc.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pipe_name_utf8);
-    defer alloc.free(pipe_name);
-
-    // Assert against the descriptor Windows ACTUALLY ATTACHED, not against the
-    // string we handed in. Only the live object shows the generic-rights
-    // mapping, and only the live object proves the label survived creation.
-    const pipe = sys.CreateNamedPipeW(
-        pipe_name.ptr,
+    return sys.CreateNamedPipeW(
+        name.ptr,
         c.PIPE_ACCESS_DUPLEX,
         windows.PIPE_TYPE_BYTE |
             c.PIPE_READMODE_BYTE |
@@ -2223,6 +2323,22 @@ test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
         0,
         &security_attributes,
     );
+}
+
+test "win32 IPC pipe descriptor attaches the expected owner DACL and label" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const requested = try allocIpcPipeSecurityDescriptor();
+    defer _ = sys.LocalFree(requested);
+
+    const pipe_name = try testUniquePipeName(alloc, "sddl");
+    defer alloc.free(pipe_name);
+
+    // Assert against the descriptor Windows ACTUALLY ATTACHED, not against the
+    // string we handed in. Only the live object shows the generic-rights
+    // mapping, and only the live object proves the label survived creation.
+    const pipe = testCreateSecuredPipe(pipe_name, requested);
     try std.testing.expect(pipe != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(pipe);
 
@@ -2355,38 +2471,10 @@ test "win32 IPC pipe DACL still admits a same-user client" {
     const descriptor = try allocIpcPipeSecurityDescriptor();
     defer _ = sys.LocalFree(descriptor);
 
-    var security_attributes: windows.SECURITY_ATTRIBUTES = .{
-        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = descriptor,
-        .bInheritHandle = windows.FALSE,
-    };
-
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        std.testing.allocator,
-        "\\\\.\\pipe\\noctty-ipc-dacl-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer std.testing.allocator.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(
-        std.testing.allocator,
-        pipe_name_utf8,
-    );
+    const pipe_name = try testUniquePipeName(std.testing.allocator, "dacl");
     defer std.testing.allocator.free(pipe_name);
 
-    const server = sys.CreateNamedPipeW(
-        pipe_name.ptr,
-        c.PIPE_ACCESS_DUPLEX,
-        windows.PIPE_TYPE_BYTE |
-            c.PIPE_READMODE_BYTE |
-            win32_ipc.pipe_nowait |
-            c.PIPE_REJECT_REMOTE_CLIENTS,
-        1,
-        1024,
-        1024,
-        0,
-        &security_attributes,
-    );
+    const server = testCreateSecuredPipe(pipe_name, descriptor);
     try std.testing.expect(server != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(server);
 
@@ -2449,6 +2537,22 @@ test "win32 forwarded new-window argv refuses everything off the allowlist" {
         try expect(!forwardedKeyAllowed(key));
     }
 
+    // Read from the app's config for every window: a forwarded value would
+    // be accepted and do nothing.
+    for ([_][]const u8{
+        "window-theme",
+        "accent-follow-system",
+        "window-titlebar-background",
+        "window-titlebar-foreground",
+        "split-divider-color",
+        "window-show-tab-bar",
+        "window-new-tab-position",
+    }) |key| {
+        try expect(!forwardedKeyAllowed(key));
+        try expect(forwardedKeyAppWide(key));
+    }
+    for (forwarded_argv_app_wide_keys) |key| try expect(!forwardedKeyAllowed(key));
+
     // Prefix confusion must not admit anything: `windows-...` is a different
     // key from `window-...`.
     try expect(!forwardedKeyAllowed("windows-job-object-kill-on-close"));
@@ -2470,6 +2574,36 @@ test "win32 forwarded new-window argv refuses everything off the allowlist" {
     }
 }
 
+test "win32 +new-window leaves out the keys the instance applies to every window" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try withoutAppWideArguments(alloc, null) == null);
+
+    // Before, the instance accepted these and ignored them; refused now, they
+    // would cost the whole request its window.
+    const argv = [_][:0]const u8{
+        "--working-directory=C:\\work",
+        "--window-theme=light",
+        "--title=Inbox",
+        "--window-show-tab-bar=never",
+        "--font-size=14",
+    };
+    try std.testing.expect(forwardedArgvRejection(&argv) != null);
+    const sent = (try withoutAppWideArguments(alloc, &argv)).?;
+    defer alloc.free(sent);
+    try std.testing.expectEqual(@as(usize, 3), sent.len);
+    try std.testing.expectEqualStrings("--working-directory=C:\\work", sent[0]);
+    try std.testing.expectEqualStrings("--title=Inbox", sent[1]);
+    try std.testing.expectEqualStrings("--font-size=14", sent[2]);
+    try std.testing.expect(forwardedArgvRejection(sent) == null);
+
+    // Anything else the instance refuses is still sent, and refused.
+    const command = [_][:0]const u8{ "--window-theme=light", "--command=cmd.exe" };
+    const kept = (try withoutAppWideArguments(alloc, &command)).?;
+    defer alloc.free(kept);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expect(forwardedArgvRejection(kept) != null);
+}
+
 test "win32 forwarded argv key extraction matches the config loader" {
     const expect = std.testing.expect;
 
@@ -2485,6 +2619,15 @@ test "win32 forwarded argv key extraction matches the config loader" {
     try expect(forwardedArgumentKey("-e") == null);
     try expect(forwardedArgumentKey("powershell") == null);
     try expect(forwardedArgumentKey("-") == null);
+
+    // The keys a new window keeps over the state it copies: the exact key,
+    // never a prefix or a value that happens to contain it.
+    const argv: []const [:0]const u8 = &.{ "--window-width=80", "--title=--window-height=3", "--maximize" };
+    try expect(forwardedArgvSetsKey(argv, "window-width"));
+    try expect(forwardedArgvSetsKey(argv, "maximize"));
+    try expect(!forwardedArgvSetsKey(argv, "window-height"));
+    try expect(!forwardedArgvSetsKey(argv, "window"));
+    try expect(!forwardedArgvSetsKey(&.{}, "window-width"));
 }
 
 test "win32 forwarded rejection reasons are classified and safe to log" {
@@ -2661,37 +2804,13 @@ test "win32 IPC client authenticates the connected pipe descriptor" {
 
     const alloc = std.testing.allocator;
 
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        alloc,
-        "\\\\.\\pipe\\noctty-ipc-serverauth-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer alloc.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(alloc, pipe_name_utf8);
+    const pipe_name = try testUniquePipeName(alloc, "serverauth");
     defer alloc.free(pipe_name);
 
     const descriptor = try allocIpcPipeSecurityDescriptor();
     defer _ = sys.LocalFree(descriptor);
-    var security_attributes: windows.SECURITY_ATTRIBUTES = .{
-        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = descriptor,
-        .bInheritHandle = windows.FALSE,
-    };
 
-    const server = sys.CreateNamedPipeW(
-        pipe_name.ptr,
-        c.PIPE_ACCESS_DUPLEX,
-        windows.PIPE_TYPE_BYTE |
-            c.PIPE_READMODE_BYTE |
-            win32_ipc.pipe_nowait |
-            c.PIPE_REJECT_REMOTE_CLIENTS,
-        1,
-        1024,
-        1024,
-        0,
-        &security_attributes,
-    );
+    const server = testCreateSecuredPipe(pipe_name, descriptor);
     try std.testing.expect(server != windows.INVALID_HANDLE_VALUE);
     defer _ = windows.CloseHandle(server);
 
@@ -2736,6 +2855,48 @@ test "win32 IPC client authenticates the connected pipe descriptor" {
     // final comparison is `server_rid >= own_rid`), not observed.
 }
 
+test "a forwarded toast click passes the foreground to the authenticated receiver before it is sent" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const pipe_name = try testUniquePipeName(alloc, "toastfg");
+    defer alloc.free(pipe_name);
+    const descriptor = try allocIpcPipeSecurityDescriptor();
+    defer _ = sys.LocalFree(descriptor);
+    const server = testCreateSecuredPipe(pipe_name, descriptor);
+    try std.testing.expect(server != windows.INVALID_HANDLE_VALUE);
+    defer _ = windows.CloseHandle(server);
+
+    const Grant = struct {
+        var server_pipe: windows.HANDLE = undefined;
+        var granted: ?windows.DWORD = null;
+        var queued_at_grant: windows.DWORD = 0;
+
+        fn allow(process_id: windows.DWORD) bool {
+            granted = process_id;
+            _ = sys.PeekNamedPipe(server_pipe, null, 0, null, &queued_at_grant, null);
+            return true;
+        }
+    };
+    Grant.server_pipe = server;
+    Grant.granted = null;
+    Grant.queued_at_grant = 0;
+
+    const launch: [:0]const u8 = "wgh://activate?surface=9&pid=77&action=focus";
+    // The test server never answers, so the send ends at its ack timeout.
+    _ = sendNewWindowIpcGranting(alloc, pipe_name, false, &.{launch}, 50, Grant.allow) catch |err| {
+        try std.testing.expectEqual(error.IpcTimeout, err);
+    };
+    // The grant went to the process at the far end of the authenticated
+    // pipe (this one, which owns the server end), and nothing had been
+    // sent yet.
+    try std.testing.expectEqual(@as(?windows.DWORD, sys.GetCurrentProcessId()), Grant.granted);
+    try std.testing.expectEqual(@as(windows.DWORD, 0), Grant.queued_at_grant);
+    var queued_after: windows.DWORD = 0;
+    try std.testing.expect(sys.PeekNamedPipe(server, null, 0, null, &queued_after, null) != 0);
+    try std.testing.expect(queued_after > 0);
+}
+
 test "automation working directory receiver policy mirrors forwarded syntax" {
     for ([_][]const u8{ "home", "inherit", "~", "~/x", "~\\x", "C:\\x" }) |value| {
         try std.testing.expect(automationWorkingDirectoryAllowed(value));
@@ -2748,17 +2909,7 @@ test "automation working directory receiver policy mirrors forwarded syntax" {
 test "win32 IPC silent synchronous client read is bounded" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const pipe_name_utf8 = try std.fmt.allocPrintSentinel(
-        std.testing.allocator,
-        "\\\\.\\pipe\\noctty-ipc-timeout-{d}",
-        .{sys.GetTickCount64()},
-        0,
-    );
-    defer std.testing.allocator.free(pipe_name_utf8);
-    const pipe_name = try std.unicode.utf8ToUtf16LeAllocZ(
-        std.testing.allocator,
-        pipe_name_utf8,
-    );
+    const pipe_name = try testUniquePipeName(std.testing.allocator, "timeout");
     defer std.testing.allocator.free(pipe_name);
 
     const server = sys.CreateNamedPipeW(
@@ -3002,6 +3153,32 @@ test "win32 IPC server start and stop cycles leak no handles" {
     try std.testing.expectEqual(before, try testProcessHandleCount());
 }
 
+test "win32 a launch forwards its own directory unless default-profile pins one" {
+    const alloc = std.testing.allocator;
+    const load = configpkg.pane_launch.fixtures.load;
+    const py = "profile-command = py: cmd.exe /k py\n";
+    const default = "default-profile = py\n";
+    inline for (.{
+        .{ "", true },
+        .{ py ++ default, true },
+        .{ py ++ "profile-working-directory = py: inherit\n" ++ default, true },
+        .{ py ++ "profile-working-directory = py: D:\\pinned\n" ++ default, false },
+        .{ py ++ "profile-working-directory = py: home\n" ++ default, false },
+        // A command runs instead of the profile, so nothing is pinned.
+        .{ py ++ "profile-working-directory = py: D:\\pinned\n" ++ default ++ "command = cmd.exe\n", true },
+    }) |case| {
+        // The files set it: the running instance reads them too.
+        var config = try load(alloc, .{ .file = case[0] });
+        defer config.deinit();
+        try std.testing.expectEqual(case[1], forwardsLauncherDirectory(&config));
+        // It does not read a launch's command-line `default-profile`, so
+        // such a launch says where it was started.
+        var named = try load(alloc, .{ .file = case[0], .argv = &.{"--default-profile=py"} });
+        defer named.deinit();
+        try std.testing.expect(forwardsLauncherDirectory(&named));
+    }
+}
+
 test "win32 launch-layout IPC argument scan isolates the layout name" {
     const launch = try scanLaunchLayoutIpcArgument(&.{"--launch-layout=Project Alpha"});
     try std.testing.expectEqualStrings("Project Alpha", launch.name);
@@ -3057,11 +3234,20 @@ test "win32 startup layout forwarding intercepts before generic argv" {
 
     try std.testing.expectEqual(
         @as(?bool, null),
-        try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, null),
+        try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, .none),
     );
-    try std.testing.expectError(
-        error.InvalidAutomationAction,
-        trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, "CON"),
+    // Not forwarded, and not passed on to the generic argv either: this
+    // process opens it, and `run` reports the failure in its own window.
+    var invalid = "CON".*;
+    try std.testing.expectEqual(
+        @as(?bool, false),
+        try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, .{ .name = &invalid }),
+    );
+    // A request whose name was lost is still one: the generic argv forward
+    // would open a plain window in the running instance.
+    try std.testing.expectEqual(
+        @as(?bool, false),
+        try trySendStartupLaunchLayoutIpc(std.testing.allocator, pipe_name, false, .lost),
     );
 }
 
