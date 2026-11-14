@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-jpeg"
   workflow_dispatch:
     inputs:
       version:

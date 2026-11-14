@@ -1,0 +1,170 @@
+name: Release (JPEG)
+
+on:
+  push:
+    tags:
+      - "v*-jpeg"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Base noctty version to build without leading v or -jpeg suffix (e.g. 1.3.138)
+        required: true
+        type: string
+      prerelease:
+        description: Publish the release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Windows Release (JPEG)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_PRERELEASE_INPUT: ${{ inputs.prerelease }}
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_EVENT_NAME -eq "push") {
+            $tag = $env:RELEASE_REF_NAME
+            if ($tag -notmatch '^v(\d+\.\d+\.\d+)-jpeg$') {
+              throw "Unsupported tag format '$tag'. Expected v<major>.<minor>.<patch>-jpeg."
+            }
+            $version = $Matches[1]
+            $prerelease = "false"
+          } else {
+            $version = $env:RELEASE_VERSION_INPUT.Trim().TrimStart('v')
+            if ($version -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Unsupported version input '$version'. Expected <major>.<minor>.<patch>."
+            }
+            $tag = "v$version-jpeg"
+            $prerelease = $env:RELEASE_PRERELEASE_INPUT
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          "title=noctty-jpeg $version" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      - name: Run Kitty JPEG tests
+        shell: pwsh
+        run: zig build test -Demit-test-exe=true -Dcustom-shaders=true -Dtest-filter=jpeg --summary all
+
+      - name: Build and package x64 portable archive
+        shell: pwsh
+        timeout-minutes: 35
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: >
+          ./scripts/build-package-windows.ps1
+          -Version $env:RELEASE_VERSION
+          -Architecture x64
+          -Optimize ReleaseFast
+          -RequireConPty
+
+      - name: Build and package ARM64 portable archive
+        shell: pwsh
+        timeout-minutes: 35
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: >
+          ./scripts/build-package-windows.ps1
+          -Version $env:RELEASE_VERSION
+          -Architecture arm64
+          -Optimize ReleaseFast
+          -RequireConPty
+
+      - name: Stage release assets
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ver = $env:RELEASE_VERSION
+          $stageDir = Join-Path $PWD "dist/jpeg-release"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+          $checksumLines = @()
+          foreach ($arch in @("x64", "arm64")) {
+            $srcZip = Join-Path $PWD "dist/artifacts/noctty-$ver-windows-$arch/noctty-$ver-windows-$arch-portable.zip"
+            if (-not (Test-Path -LiteralPath $srcZip -PathType Leaf)) {
+              throw "Expected portable archive not found: $srcZip"
+            }
+            $dstName = "noctty-jpeg-$ver-windows-$arch-portable.zip"
+            $dstZip = Join-Path $stageDir $dstName
+            Copy-Item -LiteralPath $srcZip -Destination $dstZip -Force
+            $hash = (Get-FileHash -LiteralPath $dstZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            $checksumLines += "$hash  $dstName"
+          }
+
+          $checksumsPath = Join-Path $stageDir "SHA256SUMS.txt"
+          Set-Content -LiteralPath $checksumsPath -Value ($checksumLines -join "`n") -Encoding utf8NoBOM
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.title }}
+          RELEASE_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        shell: pwsh
+        run: |
+          $stageDir = Join-Path $PWD "dist/jpeg-release"
+          $ver = $env:RELEASE_VERSION
+          $assets = @(
+            (Join-Path $stageDir "noctty-jpeg-$ver-windows-x64-portable.zip"),
+            (Join-Path $stageDir "noctty-jpeg-$ver-windows-arm64-portable.zip"),
+            (Join-Path $stageDir "SHA256SUMS.txt")
+          )
+
+          $notes = "noctty $ver with Kitty Graphics Protocol JPEG (f=101) support.`n`nPortable archives (unsigned fork build)."
+
+          $exists = $true
+          gh release view $env:RELEASE_TAG --repo $env:GH_REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $exists = $false
+          }
+
+          if ($exists) {
+            gh release upload $env:RELEASE_TAG @assets --repo $env:GH_REPO --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets." }
+          } else {
+            $createArgs = @(
+              "release", "create", $env:RELEASE_TAG
+            ) + $assets + @(
+              "--repo", $env:GH_REPO,
+              "--title", $env:RELEASE_TITLE,
+              "--notes", $notes
+            )
+            if ($env:RELEASE_PRERELEASE -eq "true") {
+              $createArgs += "--prerelease"
+            }
+            & gh @createArgs
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release." }
+          }
